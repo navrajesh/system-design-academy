@@ -1,0 +1,226 @@
+---
+title: "Kafka Internals"
+description: "Trace partition segments, replica fetch, high-watermark, controller metadata, and retention so durability claims stay inside named operational bounds."
+module: 3
+moduleTitle: "Kafka & Fault Tolerance"
+order: 2
+duration: 38
+difficulty: "Intermediate"
+tags:
+  - Kafka
+  - partitions
+  - ISR
+  - retention
+  - controller
+objectives:
+  - Trace a record from the active segment through replica fetch to the high-watermark
+  - Separate durable log bytes and rebuilt indexes from cluster metadata authority
+  - Choose time, size, or compaction retention without treating compaction as a second source of truth
+  - State page-cache, fsync, and replica-lag bounds as operational assumptions
+---
+
+<BigPicture title="A partition is an ordered log, not a magic bus">
+
+Kafka stores each partition as an append-only, offset-addressed log. Producers append; followers copy; consumers read a prefix that the cluster is willing to treat as stable enough to expose. That prefix is not “everything the leader has ever seen,” and the disk files are not immortal.
+
+The properties to name first: **one ordered log per partition**, **one leader replica that accepts writes**, **followers that pull to catch up**, **one cluster metadata authority** that assigns leadership and records membership, and **finite retention**. Kafka Raft (KRaft) versus ZooKeeper is an implementation of that metadata authority, not a different storage model.
+
+This lesson stays on the broker’s log, replica, and metadata machinery. Acknowledgement policy, `min.insync.replicas`, unclean leader election, and producer idempotence are the durability envelope taught in [Kafka delivery semantics and failure](/learn/kafka-delivery-and-failure). Internals explain *what those knobs sit on*: segments, indexes, log-end offset, high-watermark, in-sync replicas, and page-cache behavior.
+
+TokenX should key ledger-ish streams by wallet or account so one account’s transfers share append order. The Ad Click Aggregator should key ingest by campaign or collector and expect skew: a viral campaign is a hot partition, not a balanced average.
+
+</BigPicture>
+
+<UnderTheHood title="Segments, replicas, watermark, controller, retention">
+
+### The partition is a chain of segments
+
+A partition log is a sequence of **segments**. One **active segment** receives new appends. When it hits a configured size or roll interval—**planning default: 1 GiB** per segment, not a protocol law—the broker seals it. Sealed segments are **immutable** byte files. They are still the authoritative record bytes until retention or compaction deletes them.
+
+Each segment typically has:
+
+- the **log file** (authoritative record batches and offsets)
+- an **offset index** mapping a sparse set of offsets to byte positions
+- a **time index** mapping timestamps to offsets
+
+Indexes are **derived**. After an unclean process crash, recovery may truncate a torn last batch, then **rebuild indexes from the log**. If the log file and the index disagree, trust the log and reconstruct the index—not the other way around.
+
+<ExecutionTimeline
+  title="One TokenX transfer through log, replica, and watermark"
+  steps={[
+    { title: "Append", detail: "The partition leader writes the 800-byte transfer batch into the active segment, usually via the operating-system page cache, and advances its log-end offset.", state: "The leader owns the latest append. The record is not yet in the consumer-visible prefix.", failure: "A crash here can leave a torn batch that recovery truncates; the producer sees an ambiguous result and must retry with a stable business ID." },
+    { title: "Fetch", detail: "Followers pull from the leader (replica fetch, not a leader push) and append to their own logs, advancing each follower log-end offset.", state: "Replication is asynchronous relative to the leader’s local append.", failure: "A follower that stops fetching beyond the replica-lag time bound leaves the in-sync set; remaining members define the next watermark." },
+    { title: "Watermark", detail: "The high-watermark advances to the exclusive offset that every current in-sync replica has in its log. Consumers may fetch only offsets below that watermark.", state: "High-watermark is the read gate; log-end offset can sit ahead of it on the leader.", failure: "Offsets above HW were never a consumer-visible prefix. On failover the new ISR leader usually keeps its local log; a diverged former leader truncates using leader-epoch end offsets, not a blind HW rewind." },
+    { title: "Recover", detail: "On broker restart, the process loads sealed segments, repairs the active segment, and rebuilds offset and time indexes from log bytes. Cluster metadata still comes from the controller, not from local segment files.", state: "Log bytes plus metadata authority restore the replica. Indexes are reconstructed views.", failure: "Corrupt indexes without a readable log strand the replica until it is restored from another replica or a backup." }
+  ]}
+/>
+
+### Leader, followers, log-end offset, high-watermark, ISR
+
+Each partition has **one leader**. Producers append to it. Followers are not independent writers; they **fetch** the leader’s log and append locally.
+
+- **Log-end offset (LEO)** is how far a replica has locally written (the next offset it would assign).
+- **High-watermark (HW)** is how far **every replica currently in the in-sync replica set (ISR)** has that log. Kafka treats HW as **exclusive**: consumers may fetch offsets **strictly below** it.
+- **ISR** is the set of replicas the leader currently treats as caught up under a **replica-lag time bound** (commonly configured as `replica.lag.time.max.ms`). Membership is an operational lag SLA, not a proof of fsync.
+
+A follower can remain in the ISR while its latest bytes still sit in page cache. If the leader’s LEO is 1,004,000 and a slow ISR member’s LEO is 1,003,940, consumers must not be served 1,003,940–1,003,999 yet. When that follower catches up, HW can move. When it exceeds the lag bound, it leaves the ISR and HW can move without it—**which shrinks the failure domain**. Pair that fact with `min.insync.replicas` in the [delivery lesson](/learn/kafka-delivery-and-failure); internals only tell you the ISR can shrink.
+
+### Leader failover uses epochs, not “truncate to HW”
+
+HW is a **read gate**, not a prediction that the next leader will delete everything above it.
+
+On **clean** failover the controller elects a **current ISR member**. That replica typically **keeps** the log it already has, including some offsets that sat **above the previous leader’s HW**. Those offsets can become the new committed prefix as the new ISR catches up. Consumers still must not have read past the old HW: those bytes were never a committed prefix under the old leader.
+
+When the **old leader** (or any replica whose log diverged) becomes a follower, it truncates a suffix using **leader-epoch end offsets** (KIP-101): it asks the current leader for the last offset of each epoch and cuts local bytes that disagree. That is more precise than “the new leader truncates to the old HW,” which can delete valid data the new leader still holds. **Unclean** election (a non-ISR replica) can still drop offsets producers treated as durable; that envelope stays in the [delivery lesson](/learn/kafka-delivery-and-failure).
+
+### Page cache, fsync, and lag are operational, not magic durability
+
+Brokers usually append through the **OS page cache**. A produce acknowledgement that waits for ISR copies typically means those replicas **accepted the batch into their logs**, not that every disk platter has completed `fsync`. Flush interval, filesystem barriers, volume type, and battery-backed controllers are **operator choices**.
+
+**Planning assumption, not a measured guarantee:** if all ISR members lose power with dirty pages, acknowledged offsets can vanish even though producers received success. Replication across failure domains reduces that window; it does not delete physics. Treat `replica.lag.*` as “how long we still call you in sync,” not “how durable your last fetch was.”
+
+### Controller: one metadata authority
+
+Cluster membership, topic configuration, partition-to-leader assignment, and ISR snapshots live in **cluster metadata**. The required property is **one metadata/controller authority** at a time: brokers and clients must not invent a competing leader map.
+
+KRaft implements that authority as a Raft-replicated metadata log. ZooKeeper plus a controller broker was an earlier implementation of the same property. Name the property first; name the store second. A controller failover loads that metadata and pauses **metadata changes** (new partitions, preferred-leader elections, ISR updates that need the controller) until a successor is active. Existing **partition** leaders keep serving the data plane on the last known assignment. Controller failover does **not** reassign every partition or fence every leader. Fence and reassignment happen when **partition** leadership changes. Stale client metadata yields `NOT_LEADER_OR_FOLLOWER`; recovery is a metadata refresh, not a second write path.
+
+See [consensus and leader election](/learn/consensus-and-leader-election) for quorum safety; Kafka’s data plane is still per-partition leader replication, not one global Raft log of all transfers.
+
+### Retention versus compaction
+
+**Time and size retention** delete whole segments that are older than a horizon or that push the partition past a byte cap. An acknowledged offset is still gone after expiry. That is the replay bound, not a surprise.
+
+**Log compaction** is a **different retention policy**: keep the latest record per key (and a tombstone long enough for consumers to see deletes). It is not a second database, not a lossless history, and not a ledger. Intermediate values disappear. If TokenX needs every transfer, do not compact the fact log; compact only a derived changelog that you can rebuild from facts.
+
+<Calculation label="Planning numbers: TokenX transfer topic">
+
+2,000 transfers/s × 800 B/record = 1.6 MB/s encoded produce payload (before protocol headers and compression).<br />
+Replication factor 3 → 4.8 MB/s replicated payload across brokers.<br />
+Skew: if 20% of transfers hit one hot-wallet partition, that partition sees 400 transfers/s = 320 KB/s.<br />
+1 GiB segment ÷ 320,000 B/s ≈ 3,355 s ≈ 56 minutes to seal that active segment (planning).<br />
+Seven-day time retention at 1.6 MB/s ≈ 1.6e6 × 86,400 × 7 ≈ 968 GB raw topic bytes; ×3 replicas ≈ 2.9 TB before indexes and slack.
+
+</Calculation>
+
+Ad Click Aggregator peak: **80,000 clicks/s** on one campaign if the topic key is `campaign_id` during a viral spike, versus the same 80,000 clicks/s spread across collectors. Collector keys flatten ingest and **move skew into aggregation**; campaign keys keep per-campaign order and **concentrate** the hot log.
+
+</UnderTheHood>
+
+<MentalModel title="A numbered ledger with photocopiers and a clerk">
+
+Picture a bound ledger (the partition) whose current page is still being written (the active segment). Finished books go on the shelf (immutable segments). A clerk stamps “safe to read” only up to the page every on-duty copyist has photocopied (high-watermark versus log-end offset). Copyists who wander off the job are taken off the duty roster (ISR lag bound). A separate registrar keeps the list of who is clerk (controller metadata). Indexes are the table of contents: useful, rebuilt from the pages, never the original.
+
+Compaction is the clerk throwing away yesterday’s drafts of the same account line and leaving the latest scribble. That saves shelf space. It is not a second vault.
+
+Retain: **LEO is local length, HW is the exclusive ISR-agreed read gate, failover truncates diverged followers by leader epoch not by blindly rewinding HW, ISR is a lag roster, metadata has one authority, retention deletes, compaction forgets keys’ pasts, page cache is not a disk.**
+
+</MentalModel>
+
+<ArchitectureDiagram
+  title="Partition log authority, replica fetch, watermark, and metadata control"
+  chart={"flowchart LR\n  P[Producer] --> L[Partition leader]\n  L --> A[(Active segment)]\n  A --> X[(Offset index)]\n  A --> S[(Immutable segments)]\n  L --> E[Leader log-end offset]\n  L -->|async replica fetch| F[Followers]\n  F --> I[ISR]\n  I --> H[High watermark]\n  E --> H\n  H --> C[Consumer prefix]\n  M[Metadata controller] --> L\n  M --> Q[(Cluster metadata)]\n  S --> R[Time or size retention]\n  S --> K[Key compaction]\n  F -. failure: lag leaves ISR .-> I\n  L -. recovery: leader election .-> M\n  A -. recovery: rebuild index from log .-> X"}
+>
+
+The **active and sealed log segments** are the authoritative partition bytes until retention or compaction removes them. **Offset indexes** are derived and rebuildable. **Cluster metadata** (leaders, ISR snapshots, topic config) is a separate authority owned by the **single controller**; KRaft or ZooKeeper is how that log is stored. Replica fetch is **asynchronous**. The **high-watermark** is the exclusive consistency boundary for consumer reads: it trails the leader’s log-end offset until every current ISR member has the bytes. Dashed edges are failure and recovery: lag drops a follower from the ISR, controller-driven **partition** election replaces a dead data-plane leader, and crash recovery rebuilds indexes from log files. Controller process failover is metadata recovery, not a cluster-wide reassignment.
+
+<ArchitectureWalkthrough
+  title="Trace ownership on one partition"
+  stages={[
+    { name: "Log bytes", owner: "Partition leader disk plus followers", state: "Active segment and sealed segments", boundary: "Append order per partition; sealed segments are immutable until deleted.", failure: "Torn active segment or disk loss on a replica.", recovery: "Truncate the torn batch, rebuild indexes from the log, and catch up from the current leader." },
+    { name: "Replica fetch", owner: "Followers", state: "Follower log-end offset", boundary: "Pull replication; ISR is a time-lag roster.", failure: "Follower stalls past the replica-lag bound.", recovery: "Remove it from ISR, continue with remaining members, then fetch and rejoin." },
+    { name: "Readable prefix", owner: "Leader high-watermark", state: "Consumer-fetchable offsets below HW", boundary: "HW is exclusive min ISR coverage, not leader LEO.", failure: "Leader crash with LEO ahead of HW.", recovery: "Elect an ISR member. That new leader keeps its local log; diverged former leaders truncate using leader-epoch end offsets." },
+    { name: "Metadata", owner: "Single controller", state: "Leader map and ISR snapshot", boundary: "One metadata authority; KRaft or ZooKeeper is the implementation.", failure: "Controller loss or stale client metadata.", recovery: "Elect a new controller from the metadata log so metadata writes resume; existing partition leaders keep serving unless a partition election also occurs. Clients refresh and retry on NOT_LEADER." },
+    { name: "Retention", owner: "Broker cleanup", state: "Time, size, or compacted key surface", boundary: "Deletion is a policy on the same log, not a second store.", failure: "Compacted fact log or expired replay window.", recovery: "Rebuild derived views from a longer-retained fact topic or a backup; do not invent missing offsets." }
+  ]}
+/>
+
+</ArchitectureDiagram>
+
+<RealExamples title="TokenX ledgers and hot ad campaigns">
+
+**TokenX.** Partition transfer facts by `wallet_id` (or account) so debit/credit order for that wallet is the partition’s offset order. A celebrity wallet is a hot key: 400 of 2,000 transfers/s can land on one partition while others idle. Do not compact the fact log; you need history, compensating entries, and replay. A compacted **balance changelog** is a derived view you can rebuild. Cross-wallet settlement still needs an application protocol; two partitions are two logs. Delivery, retries, and sink idempotency remain in [Kafka delivery semantics and failure](/learn/kafka-delivery-and-failure).
+
+**Ad Click Aggregator.** Keying by `campaign_id` preserves per-campaign append order and puts a viral campaign on one leader: **80,000 clicks/s × 800 B = 64 MB/s** into that partition before compression—enough to saturate a single replica path. Keying by `collector_id` spreads ingest and **defers** skew to the aggregator, which must then shuffle by campaign. Click facts need time/size retention for replay and dispute windows. Compaction belongs on **campaign config** (latest budget, latest pause flag), not on the click stream.
+
+<FailureScenario
+  title="Inspect a Kafka internals failure"
+  prompt="A replication-factor-three partition is running with a 30-second replica-lag bound, page-cache appends, and time-based retention. Pick a failure and name the actual boundary."
+  choices={[
+    { label: "Leader crash, LEO ahead of HW", impact: "Offsets the old leader held only locally sit above the high-watermark. Consumers never should have read them. The elected ISR leader usually keeps the log it already has; some of those offsets can become the new prefix.", recovery: "Elect from the ISR. The recovering former leader truncates a diverged suffix using leader-epoch end offsets. Treat in-flight produces as unknown until the producer retries." },
+    { label: "Follower exceeds lag bound", impact: "The follower leaves the ISR. The watermark can advance with a smaller in-sync set, shrinking the disk-failure domain until it catches up.", recovery: "Restore fetch, let it rejoin the ISR, and do not confuse ‘connected’ with ‘in sync.’ Tighten min.insync.replicas in the delivery envelope if this shrink is unacceptable." },
+    { label: "Controller process dies", impact: "Leadership maps and ISR metadata cannot change until a new controller loads the metadata log. Existing leaders usually keep serving the data plane on the last assignment.", recovery: "Wait for controller election; refresh metadata on NOT_LEADER. This is not a reason to write to a follower." },
+    { label: "Correlated power loss of the whole ISR", impact: "Batches that lived only in page cache can disappear even if producers saw acknowledgements. ISR membership did not mean fsync.", recovery: "Restore from the surviving durable copy or backup; treat missing offsets as unknown. Spread ISR members across power and disk domains and decide fsync policy explicitly." },
+    { label: "Compaction on TokenX transfer facts", impact: "Only the latest record per wallet_id remains. Intermediate transfers are not in the log. This is not a ledger.", recovery: "Stop compacting facts. Keep a time-retained fact topic and, if needed, a separate compacted changelog rebuilt from facts." }
+  ]}
+/>
+
+</RealExamples>
+
+<InterviewTraps title="Internals slogans that fail at IC6">
+
+1. **“Followers are synchronously mirrored, so LEO equals HW.”** Replica fetch is pull and can lag. Consumers are gated on the high-watermark.
+2. **“In-sync means fsynced.”** ISR is a fetch-lag roster plus operator flush policy. Page cache is an operational durability assumption.
+3. **“ZooKeeper (or KRaft) is what makes Kafka correct.”** The property is one metadata authority and per-partition ISR replication. The store is an implementation.
+4. **“Compaction keeps a lossless latest-state database.”** Compaction drops prior values for a key. Tombstones expire. It is retention, not a second source of truth.
+5. **“The offset index is the log.”** Indexes are derived. Recovery rebuilds them from segment bytes.
+6. **“More partitions fix a hot wallet.”** They increase parallelism and **split** that wallet’s order unless you keep the key on one partition. See [partitioning](/learn/partitioning-vs-sharding-vs-aggregation).
+7. **“Acks and internals are the same lesson.”** Internals are segments, HW, ISR, controller, retention. `acks=all`, `min.insync.replicas`, unclean election, and producer idempotence belong in [delivery semantics](/learn/kafka-delivery-and-failure).
+8. **“Controller failover pauses all reads and writes.”** Metadata operations pause until a new controller loads the metadata log. Existing partition leaders usually keep serving. Fence and reassignment happen on **partition** leadership change, not because the controller process restarted. Stale metadata is a retry-and-refresh problem.
+9. **“After failover the new leader truncates everything above the old HW.”** HW is why consumers must not read that suffix. The new ISR leader typically keeps its log. Diverged former leaders and followers truncate using **leader-epoch end offsets**, not a blind HW rewind.
+
+</InterviewTraps>
+
+<Tradeoffs title="Copy width, lag roster, retention, and fsync">
+
+- **Larger ISR / higher replication factor** adds disk, network, and catch-up work, and buys more independent copies of log bytes. It does not change the fact that HW trails LEO.
+- **Tight replica-lag time** drops slow followers quickly and keeps HW honest about “who is here,” but shrinks ISR under jitter and can collide with write availability if the delivery envelope demands a high minimum ISR.
+- **Loose lag** keeps replicas “in sync” on paper while their LEO trails, delaying HW and hiding a copy that would not survive leader failover.
+- **Per-message fsync** shrinks the power-loss window and adds latency plus disk queueing; **page-cache plus cross-rack ISR** is a common operational default and must be stated as such.
+- **Long time/size retention** enables replay and incident debug at storage cost; **compaction** saves space for latest-per-key streams and destroys history. Using both (`compact,delete`) still expires old keys—it is not immortal state.
+- **Campaign keys vs collector keys** trade per-entity order against ingest heat. Neither removes the need for a replay window on facts.
+
+</Tradeoffs>
+
+<KnowledgeCheck
+  question="A leader’s log-end offset is 500_010. Two ISR followers have log-end offset 500_000. A consumer requests offset 500_005. What should happen?"
+  options={[
+    "The leader serves 500_005 because it already has the bytes locally",
+    "The consumer is limited to the high-watermark at 500_000 until every current ISR replica has the later offsets",
+    "The controller copies the five missing records into ZooKeeper so the read can complete",
+    "Compaction immediately drops 500_000–500_004 so the consumer can skip to the leader tip"
+  ]}
+  correct={1}
+  explanation="High-watermark, not leader log-end offset, is the exclusive consumer-visible prefix. Serving 500_005 would expose records that are not yet ISR-covered. A later leader-epoch truncation on a diverged replica is a different recovery path; metadata stores and compaction do not advance the watermark."
+/>
+
+<KnowledgeCheck
+  question="After a broker crash, the offset index for a sealed segment is missing but the .log file is intact. What is the defensible recovery?"
+  options={[
+    "Treat the partition as empty because indexes are the source of truth",
+    "Rebuild the offset and time indexes by scanning the log bytes, then resume as follower or leader from cluster metadata",
+    "Ask consumers for their committed offsets and rewrite the log to match",
+    "Promote any replica, including one outside the ISR, so the index can be ignored"
+  ]}
+  correct={1}
+  explanation="Segment log bytes are authoritative until retention deletes them. Indexes are derived. Consumer offsets are group progress, not a rebuild of broker history. Promotion still follows ISR and controller metadata, which is the delivery-and-failover envelope."
+/>
+
+<ScenarioCheck
+  scenario="TokenX stores every wallet transfer on topic transfers, keyed by wallet_id, RF=3. An engineer enables log compaction ‘so the topic always holds the latest balance.’ A week later finance cannot reconstruct a disputed sequence of 12 transfers for wallet W. Replica disks still have the compacted segments."
+  question="What assumption was violated, and what is the repair?"
+  options={[
+    { label: "Compaction is a lossless projection of balances; restore by reading the compacted topic once.", feedback: "Compaction drops prior values for the same key. The twelve transfers are not in the log anymore. That topic is not a ledger." },
+    { label: "The high-watermark lagged, so the transfers were never readable; raise replica.lag.time.max.ms to recover them.", feedback: "Lag bounds affect ISR membership and HW, not resurrection of records compaction already deleted." },
+    { label: "Compaction is a retention policy on the same log, not a second source of truth; reconstruct from a time-retained fact log or backup, and keep compaction only on a derived changelog.", feedback: "Facts need time or size retention. A compacted changelog is rebuildable only if the fact log still exists." },
+    { label: "KRaft metadata still has the offsets, so the controller can replay the missing transfers into the partition.", feedback: "Controller metadata stores leadership and ISR, not application transfer bodies. Offsets without log bytes are not money." }
+  ]}
+  correct={2}
+  explanation="The violated assumption is ‘compaction preserves history.’ It preserves the latest record per key. Repair is operational: stop compacting facts, retain the transfer log for the audit window, and treat any compacted balance topic as derived."
+/>
+
+<InterviewAnswer>
+
+“A Kafka partition is an ordered log of an active segment plus immutable older segments. Offset indexes are derived and rebuilt from log bytes after a crash. One leader takes appends; followers fetch. Log-end offset is local length; the high-watermark is the exclusive prefix every current in-sync replica has, and that is the consumer read gate—not a promise that the next leader will delete everything above it. Clean failover elects an ISR member that keeps its log; diverged former leaders truncate using leader-epoch end offsets. ISR is a replica-lag time roster, not an fsync certificate—page cache and flush policy are operational durability assumptions. Cluster metadata has one controller authority; KRaft versus ZooKeeper is the implementation. Controller process failover pauses metadata changes; it does not reassign every partition. Retention by time or size deletes segments; compaction is another retention policy that forgets a key’s past, not a second database. For TokenX I key by wallet and I do not compact the fact log. For ads I expect campaign skew. Acks, min ISR, unclean election, and producer idempotence sit on this machinery—I spell those out in the delivery envelope, not as slogans about exactly-once or immortal disks.”
+
+</InterviewAnswer>

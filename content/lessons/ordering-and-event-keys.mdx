@@ -1,0 +1,222 @@
+---
+title: "Ordering and Event Keys"
+description: "Choose Kafka keys that match a named ordering scope, and keep offsets, event time, and application sequences as distinct contracts."
+module: 3
+moduleTitle: "Kafka & Fault Tolerance"
+order: 4
+duration: 38
+difficulty: "Intermediate"
+tags:
+  - Kafka
+  - partition keys
+  - ordering
+  - compaction
+  - hot keys
+objectives:
+  - "Distinguish broker append order from event-time and causal order"
+  - "Choose keys that match the required order scope without creating unbounded skew"
+  - "Separate application sequence numbers from Kafka offsets"
+  - "Explain when producer retries and compaction destroy an assumed history"
+---
+
+<BigPicture title="Kafka orders appends in one partition">
+
+Kafka's ordering contract is narrow. A partition is an append-only log. Records that land in that partition receive monotonically increasing offsets, and a consumer that reads that partition sees **broker append order**. That is the whole default guarantee.
+
+It is not topic-wide order. It is not event-time order. It is not causal order. It is not conservation of TokenX balances. Those properties exist only if the application names extra machinery: a stable key-to-partition mapping, a single writer or sequencer, payload sequence numbers, and a consumer policy for late data.
+
+A **key** is a routing input to the producer **partitioner**. While partition count and the partitioner stay stable, equal keys hash to the same partition, so that key's records form an ordered subsequence of the partition log. Change the partition count, or install a custom partitioner, and the same key can move. A consumer-group **assignor** only maps partitions onto members; it does not remap keys.
+
+Design the key for the invariant you must serialize, then budget the hot-key cost of that choice. Delivery, ISR membership, and offset-commit protocol stay in [Kafka delivery and failure](/learn/kafka-delivery-and-failure); this lesson asks what order that durable log actually contains.
+
+</BigPicture>
+
+<UnderTheHood title="Keys route; offsets record arrival; sequences belong to the app">
+
+### What the broker actually orders
+
+The leader appends each accepted record to one partition and assigns the next offset. Followers replicate that log. A consumer group member that owns the partition reads offsets `n`, `n+1`, `n+2` in that sequence. Other partitions of the same topic are independent logs. There is no broker merge into a global timeline.
+
+Per-key order is a **subsequence** of partition order, and only while every produce for that key still maps to that partition. Other keys sharing the partition interleave. Consecutive offsets therefore do not mean consecutive events for one wallet or one campaign.
+
+Event time is a field on the payload, usually a source clock. The broker does not wait for it, sort by it, or reject a late click because an earlier window already closed. Processing time is when a consumer happens to run. [Time and ordering](/learn/time-and-ordering) treats those clocks as different questions; Kafka answers only append order.
+
+Causal order requires that if B was produced after observing A, then every reader who sees B can also see A in the prior state they use. Kafka does not track happened-before. Two producers hashing to the same key still race at the leader: whichever batch the leader appends first gets the lower offset, even if the losing producer "happened first" in wall time or in a user's session.
+
+### Stable mapping, then remapping
+
+Illustrative default: many Java clients hash the serialized key and take `hash % partitionCount`. Assumptions: the key is present, the partitioner is unchanged, and `partitionCount` is unchanged.
+
+- Same key, same count, same partitioner → same partition.
+- Null key → the partitioner may sticky-batch onto one partition then rotate; those records have **no** per-entity order.
+- Adding partitions remaps `hash % N`. Most keys move. Historical records stay on the old partition; new produces for the same key may land on a new one. Per-key append order splits across logs.
+- A custom partitioner can ignore the key, salt it, or pin it. Treat that code as part of the ordering contract.
+- Changing the consumer assignor (range, cooperative sticky, custom) reassigns **partition ownership**, not key placement.
+
+### One producer versus many
+
+A single producer process that waits for acknowledgement before sending the next record for a key gives a practical causal chain for that writer's own output: the leader cannot append B before A if A was already acked in that partition. That is still not event-time order, and it is not a second writer's order.
+
+Two TokenX services emitting settlement events for the same `wallet_id` can invert user-visible history: a debit produced later can receive a lower offset than a credit produced earlier. Fix it with a **single writer** per key, or an application sequencer that stamps `account_seq` (or the ledger's own log position) before produce. Kafka will not elect that sequencer for you.
+
+<ExecutionTimeline
+  title="Two producers, one wallet key, one partition"
+  steps={[
+    { title: "Route", detail: "Both producers hash wallet_id W onto partition 7 while count and partitioner stay fixed.", state: "Key placement is a producer-partitioner contract, not a consumer-assignor contract.", failure: "An operator adds partitions; new produces for W miss partition 7 and split W's history." },
+    { title: "Race at the leader", detail: "Producer A sends debit D; producer B sends credit C without observing D's ack. The leader appends whichever batch arrives first.", state: "Offsets record broker arrival, not business sequence.", failure: "The lower offset can be the later business event." },
+    { title: "Retry without idempotence", detail: "A's first produce times out. A retries while a later in-flight batch for W already succeeded.", state: "Without producer idempotence, retries are new append attempts.", failure: "max.in.flight greater than 1 can reverse A's intended send order inside the partition." },
+    { title: "Consume", detail: "The consumer reads offset order and applies D then C, or C then D. Conservation still depends on transfer_id at the ledger, not on which offset won.", state: "The sink owns transfer uniqueness and balance math.", failure: "Treating offset order as conservation double-applies or skips a transfer after replay." }
+  ]}
+/>
+
+### Retries, in-flight batches, and idempotence
+
+Name the producer envelope; do not re-derive ISR math here. Cross-link: [Kafka delivery and failure](/learn/kafka-delivery-and-failure).
+
+- A **non-idempotent** producer with `retries` greater than zero and `max.in.flight.requests.per.connection` greater than 1 can append a later batch before an earlier retried batch. Offset order then disagrees with send order **from one writer**.
+- An **idempotent** producer (`enable.idempotence=true`) requires `acks=all`, uses a producer id plus per-partition sequence numbers, and lets the broker reject out-of-order or duplicate batches. With that envelope, Kafka 3.x still allows `max.in.flight` up to 5 without reversing that writer's partition order. It does not order two producers. It does not deduplicate two different `transfer_id` values.
+- `acks=0` or `acks=1` is a weaker durability wait. Idempotence is not available without `acks=all`. Lost leader acks plus blind retries can both duplicate and reorder.
+- A transactional producer that **aborts** may still have appended records that `isolation.level=read_uncommitted` consumers observe. `read_committed` skips aborted ranges. That is a visibility boundary, not global order, and not exactly-once side effects.
+
+### Compaction is a latest-value cache in log form
+
+With `cleanup.policy=compact`, the log cleaner eventually retains the **latest value per key** (plus tombstones until their delete horizon). Intermediate offsets for that key disappear. Compacted topics are useful for current configuration, changelog snapshots, and compacted state stores. They are **not** a ledger: you cannot reconstruct a TokenX balance from a compacted settlement topic, and you cannot prove conservation from "the last record for this wallet." Compaction also runs asynchronously; readers can still see older duplicates until the cleaner catches up.
+
+### Resequencing is a consumer problem
+
+If the product needs event-time windows, the consumer (or stream processor) buffers, tracks a **watermark**, and applies a lateness policy. Kafka continues to deliver in offset order even when event time jumps backward. A resequence buffer that waits forever for a missing `account_seq` will stall the partition for every other key that shares it. Bound the wait, park the hot key, or fail that key into a repair path. Details of windowing belong with stream processing; the ordering claim here is: **Kafka does not wait for event time.**
+
+<Calculation label="Celebrity-key skew on a 32-partition settlement topic">
+Assumptions (illustrative): 8,000 settlement events/s peak; 32 partitions; hash placement; one celebrity wallet is 12% of events (960 events/s) and always uses wallet_id as the key.
+
+Uniform share if no hot key: 8,000 / 32 = 250 events/s per partition
+
+Hot partition: 960 (celebrity) + 0.88 × 8,000 / 32 = 960 + 220 = 1,180 events/s
+
+Heat versus uniform: 1,180 / 250 ≈ 4.7× write amplification on that partition and its consumer
+
+Salting the celebrity into 8 deterministic buckets drops that key to 120 events/s per bucket but **splits** per-wallet append order unless a second stage merges by wallet_id plus account_seq.
+</Calculation>
+
+</UnderTheHood>
+
+<MentalModel title="One grocery lane is not a city-wide queue">
+
+A partition is a grocery lane. The partitioner is the sign that sends "last name A–G" to lane 3. Offset numbers are the tickets the cashier hands out as people reach the belt. Event time is the clock on each shopper's phone. Causal order is "I only got in line after I saw you pay." Compaction is the store keeping only each shopper's **last** receipt.
+
+If two family members with the same last name enter lane 3 through different doors, the tickets record arrival at the belt, not who promised to pay first. If the store adds lanes overnight, tomorrow's A–G sign may point somewhere else, while yesterday's tickets remain in the old lane. If the cashier retries a confused scan without a unique receipt id, a later bag can be ticketed before an earlier one.
+
+Retain: **key → partition (while mapping is stable); offset → append order in that partition; sequence/transfer_id → business order; event time → source clock the broker ignores.**
+
+</MentalModel>
+
+<ArchitectureDiagram title="Keys, offsets, and event time are different objects" chart={"flowchart LR\n  PA[Producer A same key]\n  PB[Producer B same key]\n  HASH[Partitioner hash of key]\n  LOG[(Authoritative partition offsets)]\n  OTHER[(Other partitions)]\n  COMP[Compacted latest per key]\n  C[Consumer]\n  BUF[App resequence buffer]\n  SEQ[App sequence numbers]\n  ET[Event-time field]\n  WM[Watermark policy]\n  LATE[Late event]\n  LEDGER[(Ledger by transfer_id)]\n  SKEW[Hot celebrity key]\n  FAIL[Retry without idempotence]\n  PA --> HASH\n  PB --> HASH\n  SKEW --> HASH\n  HASH --> LOG\n  HASH -->|different key| OTHER\n  FAIL -. async retry reorder .-> LOG\n  LOG --> C\n  LOG --> COMP\n  C --> BUF\n  SEQ --> BUF\n  ET --> WM\n  WM --> BUF\n  LATE -. async late arrival .-> BUF\n  BUF --> LEDGER"}>
+
+The partition log is authoritative for **offset order until retention or compaction**. The partitioner owns key placement. Compacted latest-per-key state is derived and lossy. Event time and watermarks live on the consumer path; dashed edges are asynchronous and can arrive after later offsets. The ledger is authoritative for `transfer_id` uniqueness and balance math. Producer B and a retry without idempotence are failure paths that can invert send order without moving the key.
+
+<ArchitectureWalkthrough
+  title="Name the ordering object before you promise it"
+  stages={[
+    { name: "Key mapping", owner: "Producer partitioner", state: "hash(key) under a fixed partition count", boundary: "Same key stays on one partition only while count and partitioner stay stable.", failure: "Partition add, custom partitioner, or a null key splits or rotates placement.", recovery: "Freeze count during an ordered epoch, dual-read old and new partitions through a cutover, or salt only with a merge stage." },
+    { name: "Offset order", owner: "Partition leader log", state: "Monotonic offsets for every record that lands", boundary: "Append order inside one partition, including interleaved keys.", failure: "Non-idempotent retries with multiple in-flight batches reorder one writer; a second producer races.", recovery: "Idempotent producer plus acks=all for one writer; single writer or app sequencer across writers." },
+    { name: "Event time", owner: "Payload and consumer policy", state: "Source timestamp, watermark, lateness bound", boundary: "Windows and corrections; Kafka does not delay delivery for event time.", failure: "Late or skewed clocks arrive after a later offset already processed.", recovery: "Buffer with a bound, emit a versioned correction, or quarantine the key; do not stall the whole partition forever." },
+    { name: "Business sequence", owner: "Ledger or application sequencer", state: "transfer_id and per-account sequence", boundary: "Conservation and gap detection at the sink.", failure: "Treating offsets or compacted latest values as the ledger.", recovery: "Idempotent sink writes keyed by transfer_id; reject gaps or duplicates using account_seq." }
+  ]}
+/>
+
+</ArchitectureDiagram>
+
+<RealExamples title="TokenX wallets and Ad Click keys serialize different questions">
+
+**TokenX.** Key settlement events by `wallet_id` (or account id) so one wallet's projection sees a stable append subsequence while mapping is unchanged. That helps a consumer apply per-account state without a global lock. It does **not** make conservation true. A transfer still needs a unique `transfer_id` applied in the ledger transaction, often with an `account_seq` assigned by the ledger rather than by Kafka. A two-wallet transfer hashes to **two** keys and therefore two partitions: offset order cannot prove that Alice's debit happened before Bob's credit. Celebrity wallets (exchanges, payout hubs) concentrate produce and consume load on one partition; salt only if a downstream merge still enforces `account_seq`. Never claim partition order equals conservation.
+
+**Ad Click Aggregator.** Key choice is an explicit product decision:
+
+- `campaign_id`: campaign-local append order and simple partial aggregates; a superstar campaign becomes a hot partition, as in [partitioning versus sharding](/learn/partitioning-vs-sharding-vs-aggregation).
+- `user_id`: better spread when users are more uniform than campaigns; campaign totals then require a shuffle, and a celebrity user still skews.
+- `click_id`: even write spread and no useful per-entity order; every reader must re-group.
+
+Store `click_id`, event time, ingestion time, and offset together. Window assignment uses event time; replay uses offsets; dedupe uses `click_id`. Sorting the topic by client time is not Kafka's job.
+
+<FailureScenario
+  title="Inspect an ordering failure"
+  prompt="A team keyed TokenX settlement by wallet_id and now treats the partition as a correctness oracle."
+  choices={[
+    { label: "Second writer on the same wallet", impact: "Debit and credit race at the leader; offset order can invert the business sequence the user saw.", recovery: "Single-writer per wallet or stamp account_seq in the ledger before produce; still unique-index transfer_id." },
+    { label: "Add partitions to relieve a hot wallet", impact: "hash % newCount moves the celebrity key; new events leave the old log, so per-wallet append order splits.", recovery: "Scale consumers first, salt with a versioned merge, or dual-read through a planned cutover; do not assume keys stick after a count change." },
+    { label: "Compact the settlement topic", impact: "The cleaner drops intermediate settlement records; balances cannot be rebuilt and audit history vanishes.", recovery: "Keep an uncompacted, retained log as the ledger input; use compaction only for derived snapshots." },
+    { label: "Retries without idempotence", impact: "A timed-out batch and a later in-flight batch can land in reverse offset order for the same producer and key.", recovery: "Enable idempotence with acks=all; keep transfer_id at the sink so a remaining duplicate delivery cannot mutate twice." }
+  ]}
+/>
+
+</RealExamples>
+
+<InterviewTraps title="I keyed by X, therefore I have the order I wanted">
+
+1. **“I keyed by wallet_id, so I have causal order.”** Same key only preserves append subsequence for records that still map to one partition. Two producers, retries without idempotence, or a partition-count change can invert or split that subsequence. Causality needs a single writer or an explicit sequence.
+2. **“Partition order is topic order.”** Independent partitions have independent offsets. A join across partitions is an application merge.
+3. **“Offsets follow event time.”** Device clocks skew; producers pipeline; Kafka appends on arrival at the leader.
+4. **“Increasing partitions keeps keys in place.”** `hash % N` remaps. Plan dual-read or accept split histories.
+5. **“The consumer assignor chooses the partition for a key.”** The producer partitioner does. The assignor only chooses which member reads an existing partition.
+6. **“A compacted topic is a smaller ledger.”** It is latest-value-per-key after cleaning, not a full history.
+7. **“Idempotent producers give causal order across services.”** They preserve one producer's batch order to one partition under `acks=all`. They do not order two services and they do not make a database effect unique. See [idempotency and deduplication](/learn/idempotency-and-deduplication).
+8. **“The consumer will wait until event time catches up.”** Only if you build a bounded resequence buffer. The broker will not.
+9. **“Wallet-key order conserves tokens.”** Conservation is a ledger invariant over `transfer_id` and balances, including cross-wallet pairs that do not share a partition.
+
+</InterviewTraps>
+
+<Tradeoffs title="Order scope versus skew, history, and stall risk">
+
+- **Key by entity (wallet, campaign).** Stronger local append order and simpler stateful consumers; hotter partitions and a painful remap if you later add partitions.
+- **Salt a hot key.** Spreads write bytes; destroys that entity's single-partition order unless a merge stage uses `account_seq` or window keys. Version the salt policy as in the partitioning lesson.
+- **Key by unique event id.** Even ingress; every ordered view becomes a shuffle. Good for raw capture, poor as the only campaign log.
+- **Single writer per key.** Practical causality for that key; availability now depends on that writer and on failover fencing.
+- **Application sequencer / ledger sequences.** Correct across producers; extra coordination and a new failure domain. Use it when the invariant compares two writers.
+- **Uncompacted long retention.** Replayable history and audit; storage cost and a finite expiry. Compacted changelogs save space and forget intermediates.
+- **Deep event-time buffers.** Closer to business windows; memory, stall risk for other keys on the same partition, and a lateness policy you must name.
+- **More partitions.** More consumer parallelism and a smaller blast radius per partition, but weaker practical order and a remap event when count changes.
+
+</Tradeoffs>
+
+<KnowledgeCheck
+  question="A team keys TokenX settlement events by wallet_id on a 24-partition topic. Two microservices produce for the same wallet without sharing a sequence. What order does Kafka provide?"
+  options={[
+    "Causal order of those services' events because the key matches",
+    "Event-time order because brokers sort by payload timestamp",
+    "Broker append order inside the wallet's current partition, which may invert the two services",
+    "Global order across all wallets because offsets are unique"
+  ]}
+  correct={2}
+  explanation="Equal keys map to one partition only while count and partitioner stay stable, and that partition records leader append order. Two producers still race. Offsets are unique per partition, not a global clock, and brokers do not sort by event time."
+/>
+
+<KnowledgeCheck
+  question="Why is an idempotent producer with acks=all still insufficient as a TokenX conservation proof?"
+  options={[
+    "It only preserves one producer's batch order and duplicate-append suppression on a partition; conservation still needs transfer_id at the ledger, including cross-wallet pairs",
+    "acks=all already linearizes every wallet in the cluster",
+    "Idempotent producers compact the log down to one record per wallet",
+    "max.in.flight of 5 always reverses conservation regardless of idempotence"
+  ]}
+  correct={0}
+  explanation="Producer idempotence plus acks=all stops that writer from reordering or double-appending its own sequenced batches. A second writer, a second wallet key, compaction, and sink-side duplicates are outside that envelope. Conservation is a ledger invariant."
+/>
+
+<ScenarioCheck
+  scenario="An Ad Click pipeline keys by campaign_id so 'all clicks for a campaign stay ordered.' A superstar campaign is 20% of peak ingress. Operators add partitions from 12 to 48 to spread load. A dashboard later keys a compacted topic by campaign_id and treats the remaining record as the audit trail. A stream job sorts by event time and assumes Kafka waited for late phones."
+  question="Which statement is defensible?"
+  options={[
+    { label: "Keying by campaign_id created causal order, so adding partitions and compacting are safe and Kafka will hold records until event time is complete.", feedback: "Same key is not causality. Adding partitions remaps hash placement. Compaction drops history. Kafka delivers in offset order regardless of event time." },
+    { label: "Campaign keys give append subsequence on one partition only until mapping changes; compaction keeps latest value per key, not an audit ledger; late clicks need a consumer watermark policy.", feedback: "This names each contract: routing, append order, lossy compaction, and app-owned event time." },
+    { label: "The consumer-group assignor will keep the superstar campaign on the original partition after the count change.", feedback: "Assignors map partitions to members. They do not pin keys when partition count changes." },
+    { label: "Switching the key to click_id would preserve campaign order without skew.", feedback: "click_id spreads writes and removes campaign-local append order; aggregation then needs a shuffle." }
+  ]}
+  correct={1}
+  explanation="The tempting claim is 'I keyed by X so I have order.' The defensible design names mapping stability, hot-key cost, compaction's latest-value semantics, and a consumer lateness policy. See also [time-series storage](/learn/time-series-and-append-only-storage) for watermarks as a product contract."
+/>
+
+<InterviewAnswer>
+
+“Kafka gives broker append order inside one partition—offset order—not topic-wide, event-time, or causal order. A key keeps records on one partition only while partition count and the producer partitioner stay stable; a consumer assignor does not pin keys. I pick the key for the invariant I must serialize: TokenX `wallet_id` for per-account projection order, still with `transfer_id` uniqueness at the ledger, because two wallets and two producers are outside that log. Ad clicks keyed by campaign, user, or click_id trade skew against how much re-grouping the consumer does. One writer plus an idempotent producer with acks=all preserves that writer's batch order under bounded in-flight requests; a second writer or a non-idempotent retry can still reorder. Compaction keeps latest value per key, not a ledger. If I need event-time windows I buffer and watermark in the consumer—Kafka will not wait. I never call that exactly-once. Details of ISR and offset commit are in the delivery lesson.”
+
+</InterviewAnswer>
