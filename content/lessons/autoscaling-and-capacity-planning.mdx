@@ -1,0 +1,222 @@
+---
+title: "Autoscaling and Capacity Planning"
+description: "Plan peak and in-flight work with units, then autoscale the right tier from leading signals without pretending a primary database will sprout replicas."
+module: 2
+moduleTitle: "Scalability"
+order: 5
+duration: 39
+difficulty: "Intermediate"
+tags:
+  - autoscaling
+  - capacity planning
+  - HPA
+  - headroom
+  - warm-up
+objectives:
+  - Size peak and in-flight capacity with explicit units and Little's Law
+  - Choose leading versus lagging scale signals and a warm-up plus cooldown policy
+  - Name what Horizontal Pod Autoscaler can add versus what you must provision
+  - Keep TokenX uniqueness and billed-click partitions from being the accidental scale target
+---
+
+<BigPicture title="Scale the queue that is actually the bottleneck">
+
+Autoscaling adds **replicas of a homogeneous, mostly stateless pool** after a signal says the current pool is short. Capacity planning decides the **floor, ceiling, and headroom** those replicas are allowed to occupy, including the pieces that **do not** autoscale: a single-primary database, a shard map, a Kafka partition count, a broker disk, an account row lock.
+
+[Scaling read-heavy services](/learn/scaling-read-heavy-services) already showed that ten API boxes do nothing if the origin is saturated. This lesson adds the control loop: which metric, how much spare, how long until a replica is useful, and what a scale-out **amplifies** downstream.
+
+Name the two math envelopes up front, with units:
+
+- **Rate envelope:** peak ≈ average × seasonal or burst factor (requests/s, records/s, bytes/s).
+- **Concurrency envelope:** in-flight L = λW (Little’s Law) for a named boundary—API, connection pool, or consumer.
+
+TokenX: autoscale the **stateless transfer API** before you pressure the **uniqueness store** and **ledger primary**. Never autoscale into a hot ledger row; that row is one owner, as in [Write scaling](/learn/write-scaling). Ad Click: autoscale **collectors** from ingest queue depth, and **consumers** from lag—separately. Consumer replicas above the **partition count** stay idle ([Ordering and event keys](/learn/ordering-and-event-keys) and consumer-group ownership).
+
+</BigPicture>
+
+<UnderTheHood title="Signals, warm-up, packing, and the math with units">
+
+### Leading versus lagging signals
+
+A **leading** signal moves **before** user-visible SLO burn: inbound queue depth, Kafka consumer lag, request wait time in the load balancer, TokenX checkout latency excluding a known slow dependency, billed-click produce buffer occupancy.
+
+A **lagging** signal moves **after** the pool is already late: average CPU, memory, RPS **completed** (not offered), disk fullness, error rate. CPU is useful as a **cap** and a cost signal. It is a poor sole trigger for a JVM service whose CPU is 40% while the ledger pool is 95% busy, or for a consumer whose CPU is idle while lag is 12 minutes.
+
+RPS as a scale metric is ambiguous: completed RPS can **fall** on overload while offered RPS rises. Prefer **queue depth + latency + lag**, with CPU as a sanity bound. Checkout latency is leading only if you measure the **queueing** component, not just the ledger’s 15 ms row hold.
+
+### Headroom, warm-up, cooldown, scale-to-zero
+
+**Headroom** is spare capacity you pay for so the next burst fits **before** new replicas become ready. If warm-up is 90 s and lag grows at 8,000 records/s, 90 × 8,000 = 720,000 extra records land first.
+
+**Warm-up** is not “the container started.” JVM JIT, HTTP/2 and database **connection pools**, TLS sessions, and **cache fill** all happen after `Ready`. A replica that is Ready with an empty cache can **stampede** the primary—the scale-out **amplifies** database QPS, the opposite of [cache-aside](/learn/scaling-read-heavy-services).
+
+**Cooldown** stops flapping: after a scale-out, wait before another; after a scale-in, wait longer. Aggressive scale-in during a brief trough dumps connection pools and cold caches right before the next spike.
+
+**Scale-to-zero** traps: the first request pays cold start plus pool plus cache; token-bucket bursts collide; Kafka consumers that scale to zero **stop heartbeat/poll** and trigger a rebalance storm when they return; TokenX uniqueness checks cannot wait 8 s for a function cold start on a debit path. Keep a **min replica floor**.
+
+**Min replicas for AZ failure:** if you need N serving replicas after losing one availability zone, floor is at least `ceil(N / (z-1))` per remaining math, deployed across z zones, not `N` in one zone with HPA hope. Illustrative: need 6 APIs after one of three AZs dies → at least 3 per AZ (9 total floor), not 6 total.
+
+### HPA versus provisioned; bin packing; seasonal capacity
+
+**Horizontal Pod Autoscaler (HPA)** (or equivalent) can add/remove **stateless API** pods, **collector** pods, **consumer** pods, and—carefully—**cache cluster** nodes with a rebalance story. It cannot add **Postgres primary** writers, **shard count**, **Kafka partitions**, or **broker disks**. Those you **provision** on a lead time of minutes to weeks.
+
+**Bin packing** is placing replicas onto nodes without stranding CPU, memory, or network. A 4 GiB consumer on a 5 GiB node wastes 1 GiB and may still OOM on a hot partition. Pack by the **scarce resource** (often memory for JVM consumers, disk for brokers) and keep disruption budgets so a node drain does not drop below the AZ floor.
+
+**Seasonal capacity:** ads around a known event (illustrative 10× peak factor) should be **pre-provisioned** hours ahead. HPA reacting at kickoff is already late by the warm-up plus partition-skew term. TokenX month-end settlement is the same pattern: raise the API floor and connection-pool caps the day before, not when checkout latency trips.
+
+<Calculation label="Peak rate, in-flight, and a 90-second warm-up">
+
+Assumptions (illustrative): Ad Click average 20,000 billed clicks/s over a day is the wrong planning base if you only have a daily total.
+
+Better: 864 million clicks/day ÷ 86,400 s/day ≈ 10,000 clicks/s **average**. Peak factor 8 → peak ≈ 80,000 clicks/s.
+
+Payload 400 B → peak leader ingress 80,000 × 400 B = 32 MB/s; ×3 replication ≈ 96 MB/s broker write (before protocol overhead).
+
+Little’s Law on collectors: λ = 80,000 /s, W = 25 ms in-collector (batch linger + network) → L = 80,000 × 0.025 = 2,000 clicks in flight in collectors.
+
+Consumer lag: apply 60,000 /s at peak 80,000 /s → surplus 20,000 /s. After 90 s warm-up, lag ≈ 1.8 million records **before** new consumers take partitions. If the topic has 40 partitions, adding a 41st consumer does not split the hot campaign partition.
+
+TokenX API: 2,000 transfers/s × 0.20 s end-to-end → 400 in flight. Uniqueness store hold 8 ms on 2,000 /s → 16 busy connections on average. Headroom to 40 connections is ~2.5× on the mean, less on p95. Scaling APIs from 6 to 18 does **not** multiply that 16; it can multiply **offered** attempts into the same primary.
+
+</Calculation>
+
+<InteractiveCalculation mode="event-ingress" title="Daily volume to peak ingress with a burst factor" />
+
+<InteractiveCalculation mode="little-law" title="In-flight work versus pool utilization after scale-out" />
+
+HPA math is not a substitute for [Latency, throughput, and queues](/learn/latency-throughput-and-queues): unbounded queues make lagging CPU look fine while W explodes.
+
+### Cache stampede and database amplification
+
+Scale-out of **API** replicas with empty caches turns a 90% hit rate into a miss storm. Origin QPS jumps toward the full read rate (the cache-load envelope in the read-scaling lesson). Mitigations: warm caches before marking Ready, request coalescing, TTL jitter, and **rate-limit new replicas’ origin traffic**. Scale **cache cluster** separately from APIs so you do not share one HPA.
+
+TokenX: new API pods that retry uniqueness inserts under a timeout multiply load into the uniqueness store. Shed with admission and [Graceful degradation](/learn/graceful-degradation); do not HPA the API on CPU while the primary’s lock wait is the real signal.
+
+Ads: scale **collectors** on ingest queue depth (leading). Scale **consumers** on **lag** and sink SLO, capped at partition count. Provision partitions (and brokers) when lag stays high with one owner per partition.
+
+<ExecutionTimeline
+  title="A TokenX and Ad Click scale event with a 90-second warm-up"
+  steps={[
+    { title: "Signal", detail: "Checkout wait (not CPU) and billed-click lag cross the leading threshold. Completed RPS is flat because the system is already waiting.", state: "Offered load is up. Lagging CPU on APIs is still 35%.", failure: "HPA on CPU does nothing; uniqueness connections climb unseen." },
+    { title: "Warm", detail: "HPA adds API and consumer pods. For 90 s they JIT, fill pools, and miss cache. Min AZ floor already held 3 per zone.", state: "Ready is not warm. Cache is derived and empty.", failure: "Stampede into the ledger primary and uniqueness store; consumer rebalance pauses apply." },
+    { title: "Amplify or cap", detail: "Admission caps uniqueness QPS. Collectors keep ACKing only after the fact log. Extra consumers beyond 40 partitions idle.", state: "Authoritative stores are provisioned, not HPA’d. Partition count is the consumer ceiling.", failure: "Autoscaling the API into the hot treasury row; treating idle pods as proof you need more partitions." },
+    { title: "Cooldown", detail: "Lag falls. Cooldown prevents scale-in for 10 minutes so pools and caches stay hot through the next burst.", state: "Floor remains the AZ-failure math, not zero.", failure: "Scale-to-zero on consumers; the next spike pays rebalance plus cold start and misses the debit SLO." }
+  ]}
+/>
+
+</UnderTheHood>
+
+<MentalModel title="Hire cashiers that can actually take a drawer">
+
+HPA is a recruiter who can wheel in extra cashiers (stateless APIs, collectors, consumers). It cannot 3D-print a second vault door (single primary), split one crowded drawer into two (a hot ledger row / one Kafka partition), or fill every new cashier’s till with cached bills (warm-up). Seasonal Saturday is a **scheduled hire**, not a surprise at 10:01.
+
+Queue depth is the line you can see forming. CPU is how sweaty someone looks after they have already been serving. Little’s Law counts bodies **in the store** (λW); peak factor stretches **arrivals**. Scale-to-zero is sending everyone home and hoping the first customer enjoys unlocking the building.
+
+Retain: **scale homogeneous pools from leading queues, provision authorities and partitions, keep AZ floors and warm-up headroom, and never autoscale a lock.**
+
+</MentalModel>
+
+<ArchitectureDiagram title="HPA on pools, provisioned authorities, warm-up and stampede paths" chart={"flowchart LR\n  CLI[Clients] --> LB[Load balancer]\n  LB --> API[Stateless API]\n  API --> UNIQ[(Uniqueness store)]\n  API --> LED[(Ledger primary)]\n  COL[Collectors] --> LOG[(Billed click log)]\n  LOG --> CON[Consumers]\n  Q[Queue depth] --> HPA[HPA]\n  CPU[CPU lagging] --> HPA\n  HPA --> API\n  HPA --> CON\n  HPA --> CACHE[(Cache cluster)]\n  WARM[Warm pool] --> API\n  MIN[Min AZ floor] --> HPA\n  HPA -. cooldown hold .-> WAIT[Pending replicas]\n  API -. stampede miss .-> LED\n  CON -. extra members idle .-> LOG"}>
+
+**Authoritative state:** TokenX uniqueness store plus ledger primary (one writer), and the Ad Click billed-click log until retention. **Derived state:** API caches, dashboards, and consumer apply progress (lag). **Consistency boundary:** autoscaling never moves money or invoice identity; those commit on the provisioned authorities. HPA may add API, collector, consumer, and cache-cluster replicas. Shards, brokers, partition count, and the ledger primary are **provisioned**. Solid edges are serving and scale-out of pools. Dashed edges are cooldown holds (reject extra churn), cache-miss stampede into the primary (failure amplification), and extra consumers idle on an unchanged partition count. Recovery is warm before Ready, admit/shed into the uniqueness store, pre-provision seasonal partitions, and fail closed on TokenX if the primary cannot take more—not “add pods until CPU falls.”
+
+<ArchitectureWalkthrough
+  title="What the control loop is allowed to change"
+  stages={[
+    { name: "Measure", owner: "Leading queues and lag", state: "Queue depth, checkout wait, consumer lag, produce buffer", boundary: "Completed RPS and mean CPU are lagging or ambiguous under overload.", failure: "Scale on CPU while lock wait is 90%.", recovery: "Alert on wait and lag; use CPU as a cap." },
+    { name: "Floor", owner: "Capacity plan", state: "Min replicas per AZ, warm pool, seasonal ceiling", boundary: "Floor survives one AZ; ceiling is cost and downstream amplification.", failure: "Scale-to-zero on the debit API or billed consumers.", recovery: "Keep min≥AZ math; pre-scale before known peaks." },
+    { name: "Scale pools", owner: "HPA", state: "Stateless API, collectors, consumers, cache nodes", boundary: "Homogeneous replicas only. Consumer cap = partition count.", failure: "HPA on the database Deployment or past partition count.", recovery: "Provision shards/brokers/partitions; stop idle replica growth." },
+    { name: "Protect authority", owner: "Admission plus provisioned primary", state: "Uniqueness connections, ledger locks, fact-log ISR", boundary: "New pods must not stampede. Hot rows do not split by HPA.", failure: "Cold cache plus unbounded retries into Postgres.", recovery: "Warm, coalesce, bound origin QPS; isolate celebrity accounts as in write scaling." }
+  ]}
+/>
+
+</ArchitectureDiagram>
+
+<RealExamples title="TokenX scales APIs first; ads scale collectors and consumers on different signals">
+
+**TokenX.** Scale the **stateless API** on checkout **wait time** and offered RPS, with a min floor for AZ loss. Watch **uniqueness store** connections and ledger lock wait as **saturation of an authority you provision** (bigger primary, read-only offload of non-spendable reads, or shard by account—not HPA). Do not autoscale into a hot treasury row: more pods retrying the same `UPDATE` make Little’s Law worse. Uniqueness and money stay fail-closed if the primary is full ([Graceful degradation](/learn/graceful-degradation)). Replication and failover of that primary are [Replication and failover](/learn/replication-and-failover), not an HPA tick. Cache only metadata; a cold-cache scale-out must not become a spendable-balance origin storm.
+
+**Ad Click Aggregator.** **Collectors** autoscale on **ingest queue depth** (leading) and are allowed to grow with offered click rate. They still ACK after the billed-fact log, so collector scale cannot outrun **broker** provision. **Consumers** autoscale on **lag** up to **partition count**; beyond that, provision partitions (and accept a rebalance). A viral campaign remains one partition: extra members idle. Do not couple collector HPA to consumer HPA—the collector can be CPU-busy on compression while consumers wait on a sink. Seasonal product launches: raise partition count and broker disk **the day before**, then let HPA fill consumers to that new cap.
+
+<FailureScenario
+  title="Inspect an autoscaling failure"
+  prompt="Peak ads arrive at 8× daily average. TokenX checkout wait is 2 s. CPU on APIs is 30%. One campaign owns a single partition. Pick the failure."
+  choices={[
+    { label: "HPA on API CPU only", impact: "No scale-out. Checkout wait stays 2 s. Uniqueness pool saturates. Ads collectors overflow memory buffers.", recovery: "Lead with queue depth and checkout wait. Page the uniqueness store as a provisioned bottleneck." },
+    { label: "Scale consumers to 200 with 40 partitions", impact: "160 members idle. Rebalances stall apply. Lag grows during the shuffle. Brokers unchanged.", recovery: "Cap HPA at partition count. Provision more partitions before the event if lag is partition-bound." },
+    { label: "Scale-to-zero collectors overnight, then the morning spike", impact: "Cold start plus empty batches. SDKs retry. If ACK was memory-only, facts vanish; if ACK waits for the log, SDKs see timeouts until warm.", recovery: "Min collector floor; warm pools; never scale billed ingest to zero." },
+    { label: "Add 30 TokenX APIs into the celebrity account", impact: "Lock wait and uniqueness conflicts climb. Throughput of that row does not. Primary CPU and WAL do.", recovery: "Stop HPA on that symptom. Isolate the hot key; provision shards; keep fail-closed rather than stampede." }
+  ]}
+/>
+
+</RealExamples>
+
+<InterviewTraps title="Capacity slogans that fail at IC6">
+
+- **“We autoscale the database.”** You autoscale **clients** of a single primary until it dies. Secondaries are reads. Shards are a provisioned topology.
+- **“CPU at 70% is the SLO.”** CPU can be low while queues and lock wait burn the latency SLO.
+- **“Peak equals average.”** Daily totals hide an 8× hour. Always state the factor and the window.
+- **“In-flight is RPS times replica count.”** In-flight is λW on a **named** boundary. Replica count is not W.
+- **“More consumers always drain lag.”** After partition count, they idle or thrash rebalances.
+- **“Ready means warm.”** Empty caches and closed pools make scale-out a stampede.
+- **“Scale-to-zero is free.”** The first debit or billed batch pays cold start; Kafka membership flaps.
+- **“One HPA for the whole chart.”** APIs, caches, collectors, and consumers have different leading signals and different authorities behind them.
+- **“Autoscaling gives us linearizability of capacity.”** There is no such property. There is a control loop with delay, hysteresis, and downstream amplification.
+
+</InterviewTraps>
+
+<Tradeoffs title="Paying for headroom versus paying for delay">
+
+- **Leading versus lagging metrics:** queues scale earlier and can overshoot on a brief spike; CPU is cheaper to scrape and late.
+- **Headroom versus cost:** a warm min floor wastes idle cores and saves SLO during AZ loss and warm-up. Seasonal pre-provision wastes a weekend and beats 90 s of 8× lag.
+- **HPA versus provisioned:** HPA is minutes and reversible; partitions, shards, and primary size are slow, operationally heavier, and actually raise write ownership.
+- **Scale-out versus stampede:** faster HPA without warm-up hurts the authority you were trying to protect.
+- **Cooldown versus agility:** long cooldown misses a second peak; short cooldown flaps pools and DNS.
+- **Bin-pack density versus blast radius:** tighter packing raises utilization and makes one node drain an AZ-floor breach.
+
+Do not trade TokenX uniqueness or billed-fact durability for a prettier CPU graph. Trade dashboard completeness and debug ingest first.
+
+</Tradeoffs>
+
+<KnowledgeCheck
+  question="TokenX API CPU is 35% while checkout wait is 2 s and uniqueness connections are 95% busy. HPA is tied to CPU. What should you do first?"
+  options={[
+    "Raise CPU threshold so HPA adds APIs faster and the uniqueness store load-spreads",
+    "Treat uniqueness/ledger saturation as a provisioned bottleneck; do not HPA more APIs into the same primary; shed or fail closed on new debits if needed",
+    "Enable scale-to-zero on APIs so CPU idle capacity returns to the cluster",
+    "Autoscale read replicas and send TokenX debits to them until CPU on the primary falls"
+  ]}
+  correct={1}
+  explanation="The bottleneck is the authority, not API CPU. More APIs amplify uniqueness load. Debits cannot go to read replicas. Scale-to-zero makes the next wait worse."
+/>
+
+<KnowledgeCheck
+  question="Ad Click consumers sit at lag 2 million records. You have 40 partitions and 40 consumers. Peak is 8× average. Which capacity move matches the model?"
+  options={[
+    "HPA consumers to 80 so each partition gets two owners and lag splits",
+    "Switch the sole scale signal to consumer CPU, which must be high if lag is high",
+    "Provision more partitions and brokers ahead of the next seasonal peak, and keep collector HPA on ingest queue depth separate from consumer lag",
+    "Scale collectors to zero during troughs so the log cannot grow"
+  ]}
+  correct={2}
+  explanation="One owner per partition is the parallelism cap. Extra members do not split a partition. CPU can be low while lag is high. Collectors and consumers scale on different leading signals; partition count is provisioned."
+/>
+
+<ScenarioCheck
+  scenario="A launch is scheduled in six hours. Planning numbers: 10,000 clicks/s average, 8× peak, 400 B facts, 40 partitions, 90 s consumer warm-up. TokenX expects 2,000 transfers/s with a celebrity account already lock-bound. An engineer sets one CPU HPA on a combined API+consumer Deployment, minReplicas=0, and ‘autoscale Postgres.’"
+  question="What plan is defensible before the launch?"
+  options={[
+    { label: "Ship the CPU HPA and minReplicas=0: cost is the SLO, and Postgres operator docs mention replicas.", feedback: "CPU is lagging, scale-to-zero misses the first 90 s, and Postgres replicas are not extra writers." },
+    { label: "Pre-provision broker/partition headroom and an AZ-aware API/collector/consumer floor. Separate HPAs on queue depth and lag, cap consumers at partitions, warm caches, and leave the ledger primary plus uniqueness store as provisioned. Isolate the celebrity account; do not HPA into that row.", feedback: "Seasonal math plus the right loop on pools, with authorities called out as non-HPA." },
+    { label: "Add 200 consumers now and autoscale the uniqueness store Deployment with the API so TokenX and ads share one saturation metric.", feedback: "200 > 40 partitions. Uniqueness is not a stateless pool. Shared metrics couple unrelated bottlenecks." },
+    { label: "Use only Little’s Law L=λW with W=replica count to pick minReplicas, and ACK clicks from collector memory so ingest HPA can be aggressive.", feedback: "W is time in a named system, not replica count. Memory ACK drops billed facts." }
+  ]}
+  correct={1}
+  explanation="Capacity planning names peak factor, warm-up lag, AZ floor, and what cannot autoscale. HPA is per pool with leading signals. Money and partitions are provisioned."
+/>
+
+<InterviewAnswer>
+
+“I plan two envelopes: peak rate as average times a named burst factor, with bytes per event, and in-flight L equals lambda W on a named boundary—not replica count. Autoscaling adds homogeneous pools: TokenX APIs, ad collectors, consumers, maybe cache nodes. It does not add a second Postgres primary, extra shards, or Kafka partitions. I scale on leading signals—queue depth, checkout wait, consumer lag—not completed RPS or CPU alone, because completed RPS can fall under overload. Headroom covers warm-up: JIT, connection pools, cache fill. Ready is not warm; a cold scale-out can stampede the ledger. Min replicas follow AZ-failure math, not scale-to-zero on debit or billed ingest. Ads: collectors and consumers have separate HPAs; consumers cap at partition count. TokenX: scale APIs before the uniqueness store; never autoscale into a hot ledger row. Seasonal peaks I provision ahead of the 90-second lag spike. Cooldown stops flapping. If the primary is the bottleneck I shed or fail closed rather than add pods.”
+
+</InterviewAnswer>

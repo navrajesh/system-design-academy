@@ -1,0 +1,218 @@
+---
+title: "Load Balancing Deep Dive"
+description: "Choose L4 versus L7, health and drain bounds, and retry policy so a balancer admits work without becoming a false source of truth."
+module: 2
+moduleTitle: "Scalability"
+order: 2
+duration: 38
+difficulty: "Intermediate"
+tags:
+  - load balancing
+  - health checks
+  - Maglev
+  - retries
+  - locality
+objectives:
+  - Separate L4 connection selection from L7 HTTP policy and name what each layer may retry
+  - Choose health, drain, and outlier bounds that eject a sick instance without emptying a healthy fleet
+  - Place Maglev or consistent hash, stickiness, and AZ locality against the protocol that actually needs them
+  - Bound TokenX debit retries and Ad Click ingest so the proxy is not a second ledger
+---
+
+<BigPicture title="A balancer admits work; it does not own the ledger">
+
+A load balancer is an **admission and selection** hop: it maps a new connection or request onto a backend that still has capacity, then it must get out of the way of the **authoritative** write. It is not a source of truth for TokenX balances, unique ids, or billed ad clicks. Health tables, Maglev lookup slots, and sticky cookies are **derived routing state**. They can be rebuilt. Ledgers cannot.
+
+This lesson sits after [Scaling read-heavy services](/learn/scaling-read-heavy-services), which already required a health-aware balancer in front of **stateless** APIs. Here the question is *which* balancer properties you actually bought: OSI layer, algorithm, health semantics, drain timeout, locality, affinity, retry budget, outlier ejection, and backend pools. Packet and TCP mechanics stay in [Networking for system design](/learn/networking-for-system-design). Replica promotion stays in [Replication and failover](/learn/replication-and-failover). Idempotent debits stay in [Idempotency and deduplication](/learn/idempotency-and-deduplication). Overload math stays in [Latency, throughput, and queues](/learn/latency-throughput-and-queues). Mesh outlier ejection as a degradation control is in [Graceful degradation](/learn/graceful-degradation).
+
+Name the product last. An **L4 balancer** (NLB-class behavior) selects a backend from a 5-tuple or Maglev table and forwards bytes; it does not parse HTTP, does not retry POSTs, and does not know a debit from a health probe. An **L7 proxy** (ALB-class behavior) terminates TLS, reads method and path, can retry, can drain per request, and can therefore **duplicate a non-idempotent POST** if you let it. Those are properties, not vendor slogans.
+
+</BigPicture>
+
+<UnderTheHood title="Layer, algorithm, health, drain, then retry budget">
+
+### L4 versus L7 is a parse-and-retry decision
+
+**L4** sees IP, port, and TCP/UDP. Connection setup is the unit of work. Once the 5-tuple is bound to a backend, bytes flow. Good for high-QPS collectors, TLS passthrough, and protocols whose messages are not HTTP. The balancer cannot apply HTTP retry, path routing, or header-based affinity unless a later hop does.
+
+**L7** sees HTTP (or gRPC after decode). Request is the unit of work. You gain host/path routing, request timeouts, header policy, and access logs. You pay CPU, you introduce a new timeout owner, and you create a **retry surface**. L7 idle timeout is not the TCP idle timeout; a stream can die at the proxy while the backend commit continues.
+
+Do not put TokenX **spendable debit** behind an L7 retry that fires on 502 without an [idempotency key](/learn/idempotency-and-deduplication). Do put Ad Click **ingest** on L4 when the collector already speaks a framed protocol and you need Maglev plus locality more than you need path-based routing. Use L7 ingest when you must authenticate, rate-limit per campaign, or reject malformed bodies before they hit the log.
+
+### Algorithms distribute *new* work, not equal CPU
+
+- **Round-robin** walks the healthy set. Equal connection counts, not equal load, when service times differ.
+- **Least-connections** sends the next request to the backend with the fewest in-flight calls. Better when durations are mixed; it still lies if connections are idle HTTP/1.1 keep-alives counted as busy, or if HTTP/2 multiplexes many streams on one connection.
+- **Weighted round-robin** (WRR) scales the walk by declared capacity. Weights are operator intent, not measured headroom.
+- **Consistent hashing / Maglev** maps a key (often the 5-tuple, sometimes a cookie or campaign id) onto a lookup table so most mappings survive a backend add/remove. Maglev fills a large table (planning default from the paper: **65,537 slots**) from per-backend permutations. Naive `hash % N` remaps nearly every key when N changes. Consistent hashing without **virtual nodes** (or Maglev’s table) has the same churn: one node out, a large fraction of keys move, and caches plus connection pools stampede.
+
+Session **affinity** (cookie, 5-tuple stickiness) is a **correctness smell** for ordinary HTTP APIs: it means application state still lives in a process. Prefer signed tokens or a shared store as in the read-heavy lesson. Affinity is justified for **connection-bound** protocols: WebSockets, gRPC bidirectional streams, and long TCP sessions that cannot be migrated. Even then, drain and restart still break the connection; affinity is not failover.
+
+Locality is a different knob. **AZ-aware** selection keeps bytes inside an availability zone when a healthy in-zone backend exists, which cuts cross-AZ cost and latency but **concentrates** blast radius if that zone’s database replica is the lagging one. **Anycast** advertises the same VIP from several points of presence so BGP (Border Gateway Protocol) delivers the client to a nearby edge. Anycast failover is a routing convergence bound (often seconds to tens of seconds), not a linearizable cutover, and it does not move ledger bytes.
+
+### Health: instance-local versus shared-dependency
+
+A **shallow** check (TCP accept, or `GET /health` that returns 200 if the process loop is alive) keeps a dead-dependency instance in the pool. Traffic arrives; handlers 500 on the ledger. A **deep** check that pings the shared database has the opposite failure: when the database is down, **every** instance fails the probe, the pool empties, and you convert a 503-from-app into a connection-refused from the VIP.
+
+**Dependency-aware** health distinguishes:
+
+- **Instance-local faults:** dead event loop, full local disk, stuck thread dump. Eject that member.
+- **Shared-dependency faults:** ledger unreachable from all members. Keep the pool; let the app **fail closed** with 503 and a retry-after. Do not ask the balancer to invent a healthy owner of money.
+
+**Outlier ejection** (consecutive 5xx or latency percentile versus the pool) is a statistical cousin: yank one slow host, then probe it back. It is not proof the database is fine, and it is not fencing. Pair it with a **minimum healthy percentage** so a correlated 5xx cannot eject the fleet.
+
+### Drain is a timeout, not a feeling
+
+**Deregistration delay / connection draining:** stop sending *new* work, wait for in-flight requests up to a **drain timeout**, then reset whatever remains. The timeout must exceed the p99 of the work you care about, or you will RST TokenX transfers that already entered the ledger transaction. Infinite drain means a stuck request blocks deploy forever. Name both bounds.
+
+Backend **connection pools** at the proxy and at the app are separate Little’s Law systems. The proxy’s keep-alive pool to a backend can hide a restart until the next request, or it can pin work to a draining host if you never set max connection age.
+
+### Retry amplification is a load multiplier
+
+L7 retries are extra arrivals into the same pool that is already failing. Client retries multiply them again. Hedged retries send a second copy before the first returns.
+
+<Calculation label="Illustrative TokenX retry budget at the proxy">
+
+Assumptions, not a measured cluster: 8,000 payment requests/s at the L7 proxy; 2% see 502 from one bad AZ; L7 retries each failure once with no jitter; 40% of requests are non-idempotent debit POSTs that lack a key.
+
+Failed requests = 8,000 × 0.02 = 160 req/s of retries from the proxy alone.
+
+If clients also retry twice: additional ≈ 160 × 2 = 320 req/s after the proxy exhausted its attempt, for ~480 extra req/s (~6% added load) while the AZ is only 2% unhealthy.
+
+If the AZ is actually 50% 502s and both layers retry: extra work can approach the original arrival rate. Debit POSTs without keys are then duplicate-spend risk, not just extra CPU. See [idempotency](/learn/idempotency-and-deduplication) for the key that makes a retry a read of the first outcome.
+
+Ad Click L4 path: 80,000 frames/s, 200 B, no HTTP retry. Maglev remaps ~1/N of 5-tuples when one collector of N=20 dies → ~4,000 connections move. Those reconnects are a burst, not a retry loop, if the client does not replay the same click id.
+
+</Calculation>
+
+<InteractiveCalculation mode="little-law" title="Proxy pool occupancy versus backend hold time" />
+
+<ExecutionTimeline
+  title="One TokenX debit through L7, health, and drain"
+  steps={[
+    { title: "Select", detail: "The L7 proxy hashes or least-conns onto a healthy API member. Maglev or WRR is routing metadata only.", state: "Derived pool membership. No ledger row yet.", failure: "Shallow /health keeps a member whose ledger pool is already dead; the debit 500s after admission." },
+    { title: "Admit", detail: "The proxy forwards POST /debits with the caller deadline. It must not retry this POST unless the same idempotency key is present and the method is classified retry-safe.", state: "In-flight at one backend. Authoritative state still uncommitted.", failure: "A 502 retry without a key can apply the debit twice if the first handler committed and lost the response." },
+    { title: "Commit", detail: "The API inserts the unique event id and mutates the spendable balance in one database transaction. Success is that commit, not the proxy 200.", state: "Ledger plus event-id table is authoritative.", failure: "Client timeout after commit looks like failure; only a keyed retry is safe." },
+    { title: "Drain", detail: "Deploy deregisters the member. New requests go elsewhere. In-flight debits continue until min(handler done, drain timeout).", state: "Pool membership is derived and shrinking. In-flight commits still belong to the ledger.", failure: "Drain timeout 1 s with p99 2 s RSTs committed-but-unanswered transfers and invites unkeyed client retries." }
+  ]}
+/>
+
+</UnderTheHood>
+
+<MentalModel title="A dispatch window, not a vault">
+
+Think of a train dispatcher who assigns platforms. The dispatcher’s chalkboard (health, Maglev table, sticky cookie) is a **derived** view of who is on duty. The vault that holds TokenX balances sits behind the platform and does not care which door the passenger used. If the chalkboard says “open” because someone taped a green card on the door (`/health`), passengers still walk into a dark vault. If the dispatcher retries a signed withdrawal slip because the first runner dropped the receipt, you may withdraw twice.
+
+Retain: **L4 forwards connections, L7 may retry HTTP, health must not empty a fleet on a shared outage, drain needs a timeout above p99, stickiness is for connection-bound protocols, Maglev without a table or virtual nodes churns, and the balancer is never the ledger.**
+
+</MentalModel>
+
+<ArchitectureDiagram title="Admission, derived pool state, and authoritative commits" chart={"flowchart LR\n  CLI[Clients] --> EDGE[Anycast edge]\n  EDGE --> L4[L4 Maglev select]\n  EDGE --> L7[L7 HTTP proxy]\n  L7 -->|admitted| API[Stateless API]\n  L4 -->|byte stream| COL[Click collectors]\n  API --> LED[(Authoritative ledger)]\n  COL --> LOG[(Durable click log)]\n  HC[Instance health] --> POOL[Backend pool]\n  POOL --> L7\n  POOL --> L4\n  L7 -. reject unkeyed retry .-> CLI\n  POOL -. drain timeout .-> DRAIN[Deregister wait]\n  HC -. shared dep 503 .-> API"}>
+
+**Authoritative state:** TokenX ledger plus unique event ids; billed-click log until retention. **Derived state:** anycast advertisements, Maglev/lookup tables, pool membership, health scores, sticky cookies, outlier-ejection lists. **Consistency boundary:** a debit is committed only at the ledger transaction; a click is durable only when the ingest log acknowledges it under its configured acks policy. The balancer’s 200 is not that boundary. Solid edges are admitted, in-policy selection and commits. Dashed edges are unkeyed-retry reject, drain/deregister, and the shared-dependency path that must 503 in the app rather than emptying the pool. Recovery is: re-probe ejected members, finish drain or RST at the timeout, refresh Maglev when membership changes, and retry TokenX only with the same idempotency key.
+
+<ArchitectureWalkthrough
+  title="What each hop is allowed to decide"
+  stages={[
+    { name: "Edge", owner: "Anycast or regional VIP", state: "BGP-advertised address set", boundary: "Locality of packets, not ledger locality. Convergence is a routing bound.", failure: "Hairpinning regional Ad Click ingest across an ocean, or claiming anycast failover is linearizable.", recovery: "Advertise from the ingest region; fail open to a second region only with a stated loss/delay window." },
+    { name: "L4 select", owner: "Connection balancer", state: "Maglev table or 5-tuple map", boundary: "Forwards bytes. No HTTP retry. Churn ≈ 1/N with Maglev; ~all keys with hash mod N.", failure: "Consistent hash without virtual nodes during a collector deploy remaps caches and reconnect storms.", recovery: "Maglev table or enough virtual nodes; connection draining on the old member." },
+    { name: "L7 policy", owner: "HTTP proxy", state: "Pool, retry class, request timeout", boundary: "May retry only idempotent or keyed methods. Deadline is owned here and must decrease downstream.", failure: "Blind POST retry duplicates a TokenX debit.", recovery: "Retry budget of 1, jitter, and require the idempotency key on money paths." },
+    { name: "Health and drain", owner: "Control plane plus each member", state: "Instance-local probes; drain timer", boundary: "Eject local faults. Keep the pool on shared dependency loss. Drain timeout ≥ p99.", failure: "Shallow /health with a dead DB, or deep checks that zero the pool, or drain with no timeout.", recovery: "Split instance versus dependency health; 503 fail-closed on money; bound drain; outlier-eject one host with a min-healthy floor." },
+    { name: "Commit", owner: "API plus ledger or click log", state: "Authoritative rows", boundary: "Balancer success ≠ commit. Replica failover is a different lesson.", failure: "Treat pool membership as proof the debit landed.", recovery: "Read the event-id row or query the transfer; never mint a second key." }
+  ]}
+/>
+
+</ArchitectureDiagram>
+
+<RealExamples title="TokenX refuses unkeyed L7 retries; Ad Click prefers L4 locality">
+
+**TokenX payment API.** Put the debit path on L7 because you need TLS, identity, and path routing, then **disable automatic retries** on `POST /debits` unless the request carries the tenant-scoped idempotency key and the proxy is configured to replay that same body. Health checks are instance-local (process, disk, event loop). If the ledger is down, every instance should stay **in** the pool and return 503 fail-closed—not 200 from a cache, and not a VIP with zero backends. Drain timeout: if p99 debit hold is 150 ms and p99 including client RTT is 800 ms, a **5 s** drain is a planning default that covers the commit; a **500 ms** drain is a truncation of in-flight money. Sticky sessions to keep a user’s cart in process memory are a smell; the payment API must be stateless as in the [read-heavy lesson](/learn/scaling-read-heavy-services). WRR weights belong on instance size, not on “this pod has the hot wallet.”
+
+**Ad Click Aggregator ingest.** Peak **80,000 clicks/s** is a byte-forwarding problem. L4 plus Maglev onto regional collectors avoids HTTP parse tax and avoids L7 retry duplication of click frames. Locality: collectors in the region of the publisher so a US campaign does not hairpin through an EU proxy (cross-region RTT is extra queueing; it is also a different failure domain). If you need per-campaign HTTP auth, terminate L7 at a thin ingest edge, then L4 to collectors—do not let that L7 retry the POST that already may have been appended. Billed facts still need a durable log and a click id; the balancer does not dedupe. See [Kafka delivery and failure](/learn/kafka-delivery-and-failure) for acks. Hot campaigns are a partition problem, not a round-robin problem: Maglev on `campaign_id` at L4 would **pin** a viral campaign to one collector—use collector id or connection 5-tuple for ingest spread, and shuffle by campaign later ([partitioning](/learn/partitioning-vs-sharding-vs-aggregation)).
+
+<FailureScenario
+  title="Name the balancer failure, not the slogan"
+  prompt="Pick the broken control and the bound that actually failed. TokenX ledgers and Ad Click logs remain the only authorities."
+  choices={[
+    { label: "Shallow /health, dead ledger", impact: "VIP stays green. Debit handlers 500 after admission. Clients retry. Without keys, double-spend risk rises.", recovery: "Keep instance-local health. Fail closed with 503 on ledger errors. Do not empty the pool because the shared DB is down." },
+    { label: "Drain with no in-flight timeout", impact: "A stuck handler blocks the deploy indefinitely, or operators skip drain and RST in-flight TokenX commits.", recovery: "Deregister, wait min(done, drain timeout ≥ p99), then reset. Treat unanswered commits as unknown; retry with the same key." },
+    { label: "L7 retries POST /debits on 502", impact: "First attempt may have committed. Second attempt is a new debit unless the idempotency row fences it.", recovery: "Classify the route non-retryable at L7, or require the key and identical body. See the idempotency lesson." },
+    { label: "hash mod N on collector deploy", impact: "Almost every Ad Click connection remaps. Reconnect burst plus cache miss storm on any connection-local state.", recovery: "Maglev table or virtual nodes so churn stays ~1/N. Drain the retiring collector." },
+    { label: "Sticky sessions instead of stateless APIs", impact: "One AZ or one pod owns a user’s in-memory session. Drain, crash, or scale-in loses that state. Load cannot spread.", recovery: "Put session in a signed token or shared store. Reserve affinity for WebSocket or long TCP." }
+  ]}
+/>
+
+</RealExamples>
+
+<InterviewTraps title="Balancer slogans that fail at IC6">
+
+- **“The load balancer is highly available, so failovers are safe.”** The VIP remaining reachable is not fencing, not replica promotion, and not a committed debit. Name the drain timeout, the health bound, and the ledger.
+- **“Health check hits /health, so the instance can take traffic.”** `/health` often means the process accepted TCP. The ledger can be dead. Conversely, probing the shared DB from every instance can zero the pool.
+- **“We drain on deploy.”** Without an in-flight timeout you either stall forever or you kill work. State both.
+- **“Sticky sessions give us sessions.”** They give you a process-memory dependency and a scaling ceiling. That is a correctness smell for HTTP APIs.
+- **“L7 retries make us reliable.”** They multiply load and can replay POSTs. Reliability for money is an idempotency record, not a proxy checkbox.
+- **“Consistent hashing is smooth.”** Not without virtual nodes or a Maglev table. `hash % N` is a shuffle.
+- **“Least-conn equals least load.”** HTTP/2 streams, idle keep-alives, and CPU-heavy requests break the proxy’s connection counter.
+- **“NLB versus ALB: pick the AWS name.”** Pick byte-forwarding versus HTTP policy. The cloud SKU is an implementation.
+- **“Outlier ejection proved the database is healthy.”** It proved one host looked worse than its peers.
+- **“Anycast failover is instant and lossless.”** It is BGP convergence plus whatever in-flight connections reset. Clicks in flight need click ids; they are not magically unique.
+
+</InterviewTraps>
+
+<Tradeoffs title="Layer, churn, locality, and who may retry">
+
+- **L4 versus L7:** L4 is cheaper per packet and cannot duplicate HTTP POSTs; L7 routes and observes requests and can duplicate them. TokenX identity wants L7. 80k click/s ingest often wants L4.
+- **Round-robin versus least-conn versus WRR:** RR is simple and unfair under mixed service times; least-conn tracks in-flight but not CPU; WRR needs honest weights and still needs health.
+- **Maglev/virtual nodes versus modulo hash:** extra table memory and fill code versus deploy-time reconnect storms.
+- **AZ locality versus spread:** locality saves cross-AZ bytes and tail RTT; a zone outage then hits a larger fraction of in-zone sessions. Cross-zone is a cost you pay for a wider failure domain.
+- **Deep health versus shallow:** deep catches dead dependencies per instance and can empty the VIP; shallow keeps the VIP up and serves 500s. Split the signal.
+- **Long drain versus short drain:** long drain delays rollouts; short drain RSTs in-flight commits.
+- **Retries at one layer versus many:** one owner with a budget; everyone retrying is [queueing amplification](/learn/latency-throughput-and-queues) plus duplicate effects.
+- **Affinity versus statelessness:** affinity saves a shared session store and costs drain safety and even spread.
+
+Correctness of TokenX unique ids is not a load-balancing knob. Completeness of an ingest retry is.
+
+</Tradeoffs>
+
+<KnowledgeCheck
+  question="The TokenX ledger is unreachable from every API pod. Instance-local /health still returns 200. What should the balancer and the app do?"
+  options={[
+    "Mark every pod unhealthy so the VIP refuses TCP, which proves the ledger is fenced",
+    "Keep pods in the pool; the API fail-closes with 503; do not L7-retry POST /debits without the idempotency key",
+    "Enable sticky sessions so the few pods that still have a cached balance can serve spendable debits",
+    "Switch the VIP from L7 to L4 so retries stop and Maglev will find a healthy ledger"
+  ]}
+  correct={1}
+  explanation="Shared-dependency loss must not empty the pool or the client only sees connection failure and retries blindly. Instance-local health stays green; the app fails closed. L4 cannot invent a ledger, and sticky cache is a forged debit."
+/>
+
+<KnowledgeCheck
+  question="You remove 1 of 10 Ad Click collectors. Ingest uses hash(5-tuple) % N with no virtual nodes. What is the defensible expectation?"
+  options={[
+    "About 10% of connections remap, matching Maglev’s 1/N bound",
+    "Almost all connections remap, producing a reconnect burst; Maglev or virtual nodes would have kept churn near 1/N",
+    "L7 retries will transparently replay each click exactly once onto a new collector",
+    "Anycast will hold mappings until DNS TTL, so no connections move"
+  ]}
+  correct={1}
+  explanation="Modulo-N hashing reshuffles keys when N changes. Maglev’s lookup table or consistent hashing with virtual nodes is what bounds moves to about 1/N. HTTP retries are not click idempotency, and anycast does not preserve 5-tuple maps across collector membership."
+/>
+
+<ScenarioCheck
+  scenario="An L7 proxy in front of TokenX has automatic retry on 502/504, a 1 s drain timeout, and cookie stickiness because 'payments feel stateful.' p99 debit time is 1.8 s. A canary pod is deregistered. During drain it returns 502 to the proxy after the ledger transaction committed but before the response flush. The client sent no idempotency key."
+  question="Which change set actually closes the duplicate-spend window?"
+  options={[
+    { label: "Keep L7 retries, raise drain to 30 s, and keep stickiness so the canary’s in-memory nonce prevents a second debit.", feedback: "Stickiness and process memory are not a uniqueness store. The proxy retry still issues a second POST, and a restart loses the nonce." },
+    { label: "Disable unkeyed retries on POST /debits, require an idempotency key at the ledger, and set drain timeout above p99 so in-flight commits can finish or be treated as unknown.", feedback: "The duplicate comes from a second POST after an ambiguous commit. Keys fence the effect; drain reduces unnecessary 502s. The proxy is not the source of truth." },
+    { label: "Move the VIP to L4 only so Maglev makes retries safe, and shorten drain to 200 ms to fail fast.", feedback: "L4 stops HTTP retries but cannot fence a client retry. Short drain RSTs more in-flight commits and increases ambiguity." },
+    { label: "Deep-health the ledger from every pod so the canary is ejected before commit, proving exactly-once.", feedback: "Health is not a transaction. Ejecting on shared DB also empties the pool during a real ledger outage." }
+  ]}
+  correct={1}
+  explanation="Duplicate spend is an identity problem at the ledger plus an L7 retry policy problem. Drain timeout is an in-flight bound, not fencing. Stickiness, L4, and deep health do not create unique event ids."
+/>
+
+<InterviewAnswer>
+
+“I treat the load balancer as admission, not authority. L4 forwards connections—Maglev or consistent hash with a real table so membership changes move about 1/N of 5-tuples, not hash-mod-N churn. L7 parses HTTP and is allowed to retry only idempotent or keyed requests; TokenX POST /debits without an idempotency key is not retryable at the proxy. Health is instance-local; a dead shared ledger stays fail-closed 503 with pods still in the pool so we do not convert a dependency outage into an empty VIP. Drain means deregister, wait up to a timeout above p99, then RST—no infinite wait, no 500 ms cut of a 1.8 s debit. Stickiness is for connection-bound streams, not HTTP session memory. AZ locality and anycast are latency and BGP bounds, not linearizable failover. Ad Click high-QPS ingest I prefer L4 plus regional collectors so we do not HTTP-retry billed frames. Outlier ejection can yank one bad host with a min-healthy floor. The ledger and the click log remain the only commits.”
+
+</InterviewAnswer>

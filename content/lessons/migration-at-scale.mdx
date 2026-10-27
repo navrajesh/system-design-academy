@@ -1,0 +1,199 @@
+---
+title: "Migration at Scale"
+description: "Move live TokenX uniqueness and billed-click facts with a named source of truth, watermarked backfill, verified cutover, and a writable rollback path."
+module: 2
+moduleTitle: "Scalability"
+order: 8
+duration: 38
+difficulty: "Intermediate"
+tags:
+  - migration
+  - dual writes
+  - CDC
+  - backfill
+  - cutover
+objectives:
+  - "Name the source of truth in every migration phase and refuse dual writes that have no outbox or CDC owner"
+  - "Pair watermarked backfill with a catch-up rule, then verify with a metric and lag bound before cutover"
+  - "Fail closed on TokenX uniqueness and billed-click apply; keep the old store writable until rollback is retired"
+---
+
+<BigPicture title="Change who may be right, while traffic keeps writing">
+
+A live migration is not a copy job. It is a sequence of **who is allowed to be authoritative** while clients still send TokenX transfers and billed ad clicks. Until cutover, the **old store** owns the invariant. The **new store** is a candidate: filled by backfill, kept current by change-data capture (CDC) or a dual-write owner, compared by shadow reads, and promoted only after a named verification bound. Dashboards, search indexes, and caches stay **derived**.
+
+Dual writes that have **no outbox or CDC owner** can diverge on a crash between the two sinks. Shadow reads **compare**; they do not mutate the new store into authority and they do not authorize a debit. Backfill has a **watermark**; live rows that land after that position need an explicit catch-up rule. Verification is not “100% equal” unless you name the metric (checksum, row count, sampled diff) and the **lag bound**. Rollback needs the old store still writable or a reverse CDC stream; deleting the old cluster is a one-way door.
+
+Local commit-plus-outbox belongs in [Transactions across boundaries](/learn/transactions-across-boundaries). Retry identity and sink uniqueness belong in [Idempotency and deduplication](/learn/idempotency-and-deduplication). Broker redelivery and replay windows belong in [Kafka delivery semantics and failure](/learn/kafka-delivery-and-failure). Snapshot-plus-WAL recovery point language stays in [Backup, restore, and disaster recovery](/learn/backup-restore-and-disaster-recovery); a migration cutover is a **planned** recovery point against CDC lag, not a disaster restore. Replica promotion is [Replication and failover](/learn/replication-and-failover). How you prove the invariant during dual-run is [Consistency testing](/learn/consistency-testing). Write amplification of two sinks is [Write scaling](/learn/write-scaling). Shadow traffic that hits origin is extra read load, as in [Scaling read-heavy services](/learn/scaling-read-heavy-services).
+
+</BigPicture>
+
+<UnderTheHood title="Expand, copy behind a watermark, catch up, then change authority">
+
+### Expand, then contract
+
+Schema migration is **expand/contract**, not an in-place rewrite of the live row format. **Expand:** add the new column, table, or store; dual-write or CDC into it; keep the old shape readable. **Contract:** after cutover and a rollback window, stop writing the old shape and drop it. A single deploy that both writes only the new column and drops the old one cannot roll back.
+
+### Shadow reads do not mint authority
+
+A **shadow read** issues the same lookup against the candidate store after the old store has answered, or in parallel with a fence that still returns the old result. Compare keys, versions, and payloads. Log mismatches. **Do not** serve the new value as the user-visible truth, **do not** insert into the new uniqueness table from the shadow path, and **do not** ACK a TokenX debit because the shadow store looked empty. Shadow traffic is extra origin load; sample it if the old primary cannot absorb 100% compare reads.
+
+### Dual write needs an owner
+
+Two independent `INSERT`s—old database, then new database—are two consistency boundaries. If the process crashes after the first commit, the stores diverge. Clocks on the two nodes are not a merge function: last-write-wins on wall time reorders a debit and a compensating credit during the dual-write window.
+
+The defensible owner is the same pattern as the outbox lesson: **commit the old mutation and an outbox (or CDC log record) in one transaction**, then apply to the new store with a stable identity. CDC is **asynchronous**. It does not make the pair atomic. It makes divergence **detectable and replayable** from the old commit log. A dual-write that must fail closed (TokenX uniqueness) still uses that owner: the API does not ACK until the apply is durable, and a reject on either unique key fails the debit.
+
+### Backfill watermark and catch-up
+
+Backfill copies history **up to a watermark**—a log sequence number, CDC cursor, or snapshot consistent scan position—not “until the job feels done.” Live traffic overlapping the scan writes rows the snapshot will miss or will see in a race. The catch-up rule is: **CDC (or the outbox relay) starts at that watermark and applies every later change**, including rows the backfill also copied, through an **idempotent apply** (`INSERT … ON CONFLICT` / version fence on the business key).
+
+Assumptions (illustrative): TokenX uniqueness table has 400 million `(tenant_id, transfer_id)` rows; backfill copies 50,000 rows/s; live unique inserts continue at 2,000/s; billed-click facts arrive at 20,000 events/s, 400 B payload.
+
+<Calculation label="Backfill duration, catch-up lag, and cutover recovery point">
+
+TokenX uniqueness scan: 400,000,000 rows ÷ 50,000 rows/s = 8,000 s ≈ 2.2 h.
+
+Live inserts during that scan: 2,000/s × 8,000 s = 16,000,000 rows that the snapshot will not fully cover. Those rows are CDC’s catch-up set, plus any backfill duplicates fenced by the unique key.
+
+If CDC apply runs at 8,000 events/s after backfill while 2,000/s still arrive, net drain is 6,000/s. Catch-up of 16 million events is 16,000,000 ÷ 6,000 ≈ 2,667 s ≈ 44 min. Cutover is not the end of the copy job; it is after this drain plus verification.
+
+Ads billed log, 20,000 events/s × 400 B = 8 MB/s. A 24 h replay window is 20,000 × 86,400 = 1.728 billion events, about 691 GB before indexes. Retention shorter than the replay window you still need is a silent one-way door.
+
+Cutover **recovery point** against the old commit log: if you switch reads while CDC lag is 2.0 s, the new authority may be missing up to 2.0 s × 2,000 transfers/s = 4,000 committed uniqueness rows (TokenX) or 2.0 s × 20,000 = 40,000 billed facts (ads) unless you block writes or wait until lag is under the bound. Name that bound; do not call it zero RPO.
+
+</Calculation>
+
+<ExecutionTimeline
+  title="One TokenX uniqueness key through shadow, CDC, and cutover"
+  steps={[
+    { title: "Expand", detail: "Deploy the new uniqueness table (or store) and start writing the expanded schema on the old store. Old unique constraint on (tenant_id, transfer_id) remains the live fence.", state: "Old store is authoritative. New store is empty or backfilling.", failure: "Contracting the old column in the same deploy removes the rollback path." },
+    { title: "Backfill to watermark", detail: "Copy rows in key or log order up to snapshot LSN W. Do not treat the job complete as caught up.", state: "New store holds a prefix. Live inserts after W are not guaranteed in the snapshot.", failure: "A second backfill without a watermark overlaps live writes and cannot say which copy won." },
+    { title: "Catch up", detail: "CDC from W applies with idempotent (tenant_id, transfer_id). Dual-write of the unique pair fail-closes if either store rejects. Shadow reads compare; they do not insert.", state: "Old commit plus outbox is the owner. New apply is derived until cutover.", failure: "Independent dual inserts with wall-clock merge diverge; ACK before new apply is durable mints a debit the candidate cannot prove." },
+    { title: "Verify then cut over", detail: "Row counts, checksums, and sampled diffs must match inside a lag bound (for example 1 s of CDC). Then switch reads, then writes. Keep old writable for reverse CDC.", state: "New store becomes authority only at the cutover gate.", failure: "Deleting the old cluster, or verifying 'counts look close' with unbounded lag, is a one-way integrity incident." }
+  ]}
+/>
+
+### Verification is a metric plus a lag bound
+
+Row counts can match while payloads differ. Checksums of canonical bytes can match while you are comparing at different CDC cursors. Sampled diffs catch systematic bugs but miss rare key collisions. A defensible statement is: **counts and checksums agree for keys committed on the old store at cursor C, with CDC lag ≤ L seconds, sample error ≤ S.** That is not 100% of every in-flight transaction. [Consistency testing](/learn/consistency-testing) is where you encode those predicates as canaries, not as a once-off spreadsheet.
+
+### Replay window and clocks
+
+CDC and Kafka apply are **at-least-once**. The new sink must treat `event_id` (ads) or `(tenant_id, transfer_id)` (TokenX) as unique. The **replay window** is min(source retention, outbox retention, sink idempotency retention). Ordering during dual write follows the **old store’s commit/log order**, not NTP. If two writers dual-write the same key with different wall clocks, the candidate store can invert debit and credit; the CDC applier must use log sequence or a monotonic row version from the old transaction.
+
+</UnderTheHood>
+
+<MentalModel title="Move the vault while tellers are still posting">
+
+Think of changing bank vaults during business hours. The old vault remains the legal books until a named hour. Clerks may **look** into the new vault (shadow reads) to see if the copy matches; they must not tell a customer “paid” from that glance. Couriers (CDC) carry stamped slips from the old ledger; they do not invent slips. The archive team copies history up to a labeled box number (watermark) and then the couriers start at that box. Counting bags is not proving every note unless you say how you counted and how stale the count was allowed to be. Sending the old vault to scrap the same afternoon is a one-way door: you cannot roll back.
+
+Retain: **one named authority per phase, outbox or CDC as the dual-write owner, watermark plus catch-up, verify with a metric and lag bound, fail closed on money and unique ids, keep the old store writable until rollback is retired.**
+
+</MentalModel>
+
+<ArchitectureDiagram title="Old-store authority, watermarked CDC, shadow compare, and rollback" chart={"flowchart LR\n  CLI[Clients] -->|commands| API[API plus outbox owner]\n  API -->|commit| OLD[(Authoritative old store)]\n  OLD -->|same TX| OUT[(Outbox CDC owner)]\n  BF[Backfill to watermark] --> NEW[(Candidate new store)]\n  OUT -. async CDC catch-up .-> CDC[Idempotent CDC applier]\n  CDC --> NEW\n  API -->|shadow read| SHAD[Shadow compare]\n  SHAD --> VER[Checksums counts sampled diffs]\n  VER --> CUT[Cutover gate]\n  CUT -->|new authority| NEW\n  EXP[Expand then contract] --> OLD\n  EXP --> NEW\n  API -. fail-closed uniqueness .-> REJ[Reject debit]\n  CDC -. replay window .-> NEW\n  CUT -. rollback reverse CDC .-> OLD\n  VER -. mismatch halt .-> HOLD[Hold cutover]\n  NEW --> SINK[(Billed sink unique event_id)]\n  SINK -. missing unique double count .-> DASH[(Derived billed view)]"}>
+
+**Authoritative state:** the old TokenX uniqueness table and ledger (and the billed-click commit log) **until the cutover gate** fires; afterward the new store, still fenced by the same business keys. **Derived:** shadow comparisons, checksum jobs, dashboards, and any billed **view** built without a unique `event_id`. **Consistency boundary:** old mutation plus outbox share one commit; CDC apply is a second boundary with at-least-once delivery inside the replay window. Solid edges are in-policy commits, expand/contract schema, backfill into the candidate, shadow compare, and a gated promotion. Dashed edges are async CDC, uniqueness reject, replay, mismatch hold, reverse-CDC rollback, and double-count when the sink lacks a unique key. Recovery is halt cutover on mismatch, keep the old store writable, reverse-CDC or dual-write back, and never ACK a debit whose new apply is uncertain.
+
+<ArchitectureWalkthrough
+  title="Who is allowed to be right in each phase"
+  stages={[
+    { name: "Expand", owner: "Schema and API deploy", state: "Old shape plus new columns or new store", boundary: "Old unique constraints still fence live writes.", failure: "Drop the old column in the same release.", recovery: "Expand first; contract only after the rollback window." },
+    { name: "Copy", owner: "Backfill plus CDC applier", state: "Watermark W plus catch-up cursor", boundary: "Snapshot is not live truth; CDC from W is the overlap rule.", failure: "Live traffic during an unmarked scan with no catch-up.", recovery: "Idempotent apply of log order from W; do not LWW on wall clocks." },
+    { name: "Compare", owner: "Shadow reads and verifiers", state: "Counts, checksums, sampled diffs at lag ≤ L", boundary: "Compare does not mutate authority or ACK money.", failure: "Serve new-store reads, or claim 100% with unbounded lag.", recovery: "Hold cutover; raise sample or wait for the lag SLO." },
+    { name: "Cut over or roll back", owner: "Cutover gate", state: "New store as authority, old still writable", boundary: "Promotion is explicit. Delete of the old store is one-way.", failure: "ACK after only one of two uniqueness stores accepts.", recovery: "Fail closed; reverse CDC into the old store while it remains writable." }
+  ]}
+/>
+
+</ArchitectureDiagram>
+
+<RealExamples title="TokenX uniqueness fail-closed; billed clicks unique on event_id">
+
+**TokenX store migration.** The invariant is one accepted debit per `(tenant_id, transfer_id)` and a ledger that does not ACK an uncertain apply. Dual-write that pair into old and new uniqueness tables. If **either** store rejects (duplicate or unavailable), **fail closed**: do not ACK the debit. If the old insert committed and the new apply is unknown, the client retries the same ids; the old row is idempotent and CDC or a retrying applier must finish—**do not** tell the client the money moved while the candidate apply is uncertain. Shadow reads may compare balances and unique keys; they must not insert a uniqueness row and must not be the ACK path. Uniqueness during the dual-write window is **both stores**, with old still the commit owner via outbox. After cutover, new is authority; keep old writable until reverse CDC is proven. Clock order is the old transaction’s log sequence, not the two databases’ wall clocks.
+
+**Ad Click Aggregator billed-log migration.** Invoiceable clicks are facts keyed by stable `event_id`. Backfill closed periods from the retained source log up to watermark W; CDC or the consumer group continues from W. The **sink** must have a unique constraint on `event_id` (or an inbox in the same transaction as the billed row). Dual apply without that unique key **double-counts** and double-bills. At-least-once replay inside the window is expected; exactly-once is not a broker property you get for free across two stores. Dashboards may lag; finance must not invoice from a derived aggregate that lacks the unique fence. If you migrate the billed sink, keep the old fact log readable for the replay window in [Kafka delivery semantics and failure](/learn/kafka-delivery-and-failure).
+
+<FailureScenario
+  title="Pick the owner that matches the invariant"
+  prompt="You are migrating TokenX uniqueness and the ads billed sink at the same time. CDC lag is 12 s. A dual-write helper without an outbox is deployed on 10% of TokenX pods. The billed sink unique index is scheduled 'after cutover to save load.'"
+  choices={[
+    { label: "Fail closed on TokenX: require outbox or CDC ownership, reject if either uniqueness store fails, do not ACK uncertain ledger apply. Delay ads cutover until event_id is unique and lag is under the bound.", impact: "Transfers may 5xx during the bad 10% roll-out. Dashboards stay on the old billed path. No double-spend and no double-bill from the migration itself.", recovery: "Revert the helper; backfill plus CDC from a watermark; verify counts and checksums inside the lag SLO; then cut over." },
+    { label: "Shadow-read the new uniqueness store and ACK if either store accepted, to keep availability.", impact: "A shadow hit is not a commit. ACK after only the new store accepted (or only the old) splits the unique set. Retry can debit twice after cutover.", recovery: "Treat split rows as UNKNOWN; never ACK from shadow; fail closed and reconcile by transfer_id." },
+    { label: "Cut over ads now and add the unique index later so backfill stays fast.", impact: "At-least-once CDC and dual apply insert two billed rows per event_id. Finance double-counts.", recovery: "Stop invoicing from the new sink; rebuild from the retained log into a sink that already has the unique key." },
+    { label: "Delete the old TokenX table as soon as row counts match within 1% to cut storage cost.", impact: "1% at 400 million rows is 4 million keys. Unbounded lag makes 'match' meaningless. Rollback is gone.", recovery: "Keep old writable; reverse CDC or dual-write back; restore from WAL only if you still have a recovery point, which is a disaster path, not a migration plan." }
+  ]}
+/>
+
+</RealExamples>
+
+<InterviewTraps title="Migration slogans that fail at IC6">
+
+- **“Dual writes keep both stores in sync.”** Not without an owner. Two commits can split. Name outbox/CDC or fail closed and reconcile.
+- **“Shadow traffic means we already cut over.”** Shadow compares. Serving or ACKing from the candidate promotes it without a gate.
+- **“Backfill finished, so we are caught up.”** Finish is a watermark plus catch-up of overlapping live writes.
+- **“Verification was 100%.”** Ask for the metric, the cursor, and the lag bound. Counts can agree while bytes differ.
+- **“We’ll roll back by switching DNS.”** Only if the old store is still writable and has the writes from the new-authority window (reverse CDC or continued dual-write). DNS does not rewind uniqueness.
+- **“Last-write-wins with NTP during dual write.”** Wall clocks reorder money. Use old-store log order or row versions.
+- **“Exactly-once CDC.”** Delivery is at-least-once inside a replay window; uniqueness at the sink is the fence.
+- **“Add the unique index after cutover.”** Then dual apply double-bills. The unique key is part of the migration, not a later optimization.
+- **“Replica lag is the same as CDC lag.”** Promotion and fencing are the replication lesson. CDC is an asynchronous derived apply with its own cursor.
+
+</InterviewTraps>
+
+<Tradeoffs title="What you pay to keep a rollback path">
+
+- **Outbox/CDC owner versus naive dual write:** extra lag and apply capacity versus silent split-brain on crash.
+- **Fail-closed uniqueness versus availability:** TokenX refuses debits when either store rejects; ads ingest can often wait on the billed sink rather than forge an invoice.
+- **Shadow sample rate:** 100% compare reads load the old primary; 1% samples miss rare mismatches. Pick from the old store’s headroom ([Scaling read-heavy services](/learn/scaling-read-heavy-services)).
+- **Cutover lag bound versus write pause:** waiting for lag ≤ 1 s costs time; pausing writes costs availability but shrinks the recovery point toward the last old commit.
+- **Keeping the old store writable:** storage and dual-write cost for a rollback window versus a one-way delete.
+- **Expand/contract duration:** longer dual-schema windows cost write amplification ([Write scaling](/learn/write-scaling)); shorter windows raise the chance a rollback build cannot read the new-only shape.
+- **Checksum of all bytes versus sampled diffs:** full hashes catch payload bugs and cost I/O; samples are cheaper and need an explicit miss rate.
+
+Money and unique ids are not traded for a shorter migration calendar. Derived dashboards are.
+
+</Tradeoffs>
+
+<KnowledgeCheck
+  question="A TokenX pod dual-writes uniqueness to old and new stores with no outbox. It commits old, crashes, and never writes new. The client retries the same (tenant_id, transfer_id). What is true?"
+  options={[
+    "The stores stayed in sync because both would have used the same primary key",
+    "The old store has the unique row; the new store does not; a later cutover can ACK a debit the candidate never applied unless catch-up CDC or a fail-closed retry finishes the apply",
+    "Shadow reads will insert the missing new row, which is enough to ACK",
+    "NTP last-write-wins on the retry heals the split"
+  ]}
+  correct={1}
+  explanation="Two independent commits are two boundaries. The crash left divergence. Shadow must not mutate authority or ACK. Wall clocks are not a merge function. An outbox/CDC owner or a fail-closed retry that finishes the new unique insert is required before ACK."
+/>
+
+<KnowledgeCheck
+  question="Ads billed-click backfill copied 24 h of the source log to watermark W. Live apply continued. The new sink has no unique constraint on event_id. CDC is at-least-once. What happens on catch-up?"
+  options={[
+    "Exactly-once migration because each click had one producer id",
+    "Row counts at W prove finance can invoice from the new sink immediately",
+    "Overlapping live events and redelivery can insert twice per event_id and double-bill until a unique sink key exists",
+    "Shadow reads of the dashboard prevent double counting"
+  ]}
+  correct={2}
+  explanation="Catch-up replays from W into a sink that cannot fence duplicates. Producer ids and dashboard reads do not create uniqueness. Verification at W also ignores lag after W. Put the unique event_id on the sink before dual apply, then verify inside a lag bound."
+/>
+
+<ScenarioCheck
+  scenario="TokenX uniqueness backfill reports 'done' at snapshot W. CDC lag is 14 s (about 28,000 live unique inserts at 2,000/s). Checksums of the backfill prefix match. An engineer wants to cut read-and-write traffic to the new store now, drop the old table tonight, and ACK transfers as soon as the new unique insert succeeds even if the old store is slow. Shadow reads have been serving 5% of balance reads for a week."
+  question="What should you ship, and which claims were false?"
+  options={[
+    { label: "Cut over now: checksums matched, so verification was 100%, and dropping old tonight saves cost.", feedback: "Checksums at W ignore 14 s of catch-up. Dropping old is a one-way door. 100% was never defined." },
+    { label: "Hold cutover until CDC lag is inside the named bound and catch-up from W is applied. Keep old writable. Fail closed if either uniqueness store rejects; do not ACK if new apply is uncertain. Shadow must not be the ACK or uniqueness path.", feedback: "Backfill-done is not caught-up. Authority stays old until the gate. Rollback needs the old store. Shadow is compare-only." },
+    { label: "ACK from the new store only; treat old as a shadow, because expand/contract already added the new table.", feedback: "Expand is schema, not cutover. ACKing from the candidate while old is still the commit owner splits uniqueness." },
+    { label: "Pause verification and rely on replica promotion: replication lag is the same cursor as CDC.", feedback: "Failover fencing is a different boundary. CDC apply can lag, reorder vs wall clocks, and duplicate without a sink unique key." }
+  ]}
+  correct={1}
+  explanation="The false claims are that backfill-done equals catch-up, that checksums-without-lag-bound equal 100%, that shadow equals authority, and that deleting old preserves rollback. Ship the lag SLO, fail-closed dual uniqueness, no ACK under uncertainty, and a writable old store."
+/>
+
+<InterviewAnswer>
+
+“I treat live migration as changing who is allowed to be the source of truth, not as copying bytes. Until a named cutover, the old store stays authoritative. Shadow reads compare; they do not mutate the new uniqueness table and they do not ACK a TokenX debit. Dual writes without an outbox or CDC owner diverge on crash, so I commit the old mutation and the outbox together, then apply CDC idempotently in old-store log order—not NTP last-write-wins. Backfill stops at a watermark; overlapping live traffic needs catch-up from that cursor. Verification is a metric plus a lag bound: counts, checksums, sampled diffs at cursor C with lag ≤ L—not a vague 100%. TokenX dual-writes `(tenant_id, transfer_id)` and fails closed if either store rejects; I never ACK if new ledger apply is uncertain. Ads billed facts use `event_id` with a unique sink constraint so at-least-once dual apply cannot double-bill. Expand schema first, contract after the rollback window. Rollback needs the old store still writable or reverse CDC; deleting it is a one-way door. Delivery stays at-least-once inside the replay window.”
+
+</InterviewAnswer>

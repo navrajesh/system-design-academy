@@ -84,6 +84,30 @@ test("Module 1 contains the exact nine-topic roadmap inventory", async () => {
   assert.deepEqual(moduleOneTitles, expected);
 });
 
+test("Module 2 contains the exact eight-topic roadmap inventory", async () => {
+  const expected = [
+    "Scaling Read-Heavy Services",
+    "Load Balancing Deep Dive",
+    "Caching Patterns and Invalidation",
+    "Write Scaling",
+    "Autoscaling and Capacity Planning",
+    "Fan-out Architectures",
+    "Multi-Region Design",
+    "Migration at Scale",
+  ];
+  const lessonDirectory = path.join(process.cwd(), "content", "lessons");
+  const files = (await readdir(lessonDirectory)).filter((file) => file.endsWith(".mdx"));
+  const lessons = await Promise.all(
+    files.map(async (file) => matter(await readFile(path.join(lessonDirectory, file), "utf8")).data),
+  );
+  const moduleTwoTitles = lessons
+    .filter((lesson) => lesson.module === 2)
+    .sort((left, right) => left.order - right.order)
+    .map((lesson) => lesson.title);
+
+  assert.deepEqual(moduleTwoTitles, expected);
+});
+
 test("Module 6 contains the exact nine-topic roadmap inventory", async () => {
   const expected = [
     "CAP & Practical Consistency",

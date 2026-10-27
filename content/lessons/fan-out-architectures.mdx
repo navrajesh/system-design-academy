@@ -1,0 +1,220 @@
+---
+title: "Fan-out Architectures"
+description: "Choose write, read, or hybrid fan-out for feeds and notifications without pretending a ledger or billed-click log is a social inbox."
+module: 2
+moduleTitle: "Scalability"
+order: 6
+duration: 38
+difficulty: "Intermediate"
+tags:
+  - fan-out
+  - celebrity problem
+  - timelines
+  - write amplification
+  - materialization
+objectives:
+  - Choose fan-out-on-write, fan-out-on-read, or hybrid from follower skew and freshness, not from a slogan
+  - Size write amplification, inbox bytes, and celebrity skip thresholds with explicit units
+  - Treat timelines, unread counters, and ranking caches as derived views with a backfill watermark
+  - State unfollow and privacy as a race against already-materialized copies, not as instant global delete
+---
+
+<BigPicture title="Fan-out copies work; it does not copy the source of truth">
+
+Fan-out is how one event becomes many reader-shaped views: a post into follower inboxes, a TokenX receipt into notification devices, a campaign total into operator dashboards. The **authoritative** objects stay small: the post row, the follow/block graph, the TokenX ledger, the billed-click log. Everything you precompute for a home timeline is **derived**.
+
+Three honest shapes:
+
+- **Fan-out on write (push):** on publish, copy the item into each follower’s inbox. Reads are cheap. Writes explode with follower count.
+- **Fan-out on read (pull):** on timeline request, fetch recent items from each followee and merge. Writes stay one insert. Reads explode with follow-graph size.
+- **Hybrid:** push to regular followers; skip push for **celebrity / hot keys**; merge a cached celebrity recent-post list at read time.
+
+This is a **news-feed and notification** lesson. Do not model TokenX spendable balances as follower inboxes. A debit has one authoritative ledger row (plus a unique event id). Notifications may fan out; the money must not. Ad Click billed facts stay **one log**; campaign dashboards are a derived fan-out of aggregates. See [scaling read-heavy services](/learn/scaling-read-heavy-services) for cache-as-derived, [partitioning vs sharding vs aggregation](/learn/partitioning-vs-sharding-vs-aggregation) for hot keys, and [ordering and event keys](/learn/ordering-and-event-keys) for per-key order of the post stream.
+
+</BigPicture>
+
+<UnderTheHood title="Push, pull, hybrid, then the races that survive all three">
+
+### Write amplification versus read amplification
+
+**Planning assumptions (illustrative, not a measured product):** 200 original posts/s; mean 400 followers; payload 200 B stored per inbox row; 50,000 home-timeline reads/s; one celebrity account with 40 million followers posts once per 60 s; celebrity skip threshold 10,000 followers.
+
+<Calculation label="Push cost, pull cost, celebrity spike">
+
+Fan-out-on-write at the mean: 200 posts/s × 400 followers = **80,000 inbox writes/s**. Bytes: 80,000 × 200 B = **16 MB/s** of derived inbox appends, before indexes and replication.
+
+Celebrity push with no skip: 40,000,000 copies / 60 s ≈ **667,000 writes/s** for that one post—about **8×** the entire mean write budget—concentrated on one publish.
+
+Fan-out-on-read: each timeline merge that pulls the last 10 posts from 400 followees does **4,000** origin lookups (or cache gets). At 50,000 reads/s that is **200 million** lookups/s unless almost every followee’s recent list is cached. That is read amplification, not “we avoided writes.”
+
+Hybrid: skip push when follower_count ≥ 10,000. The celebrity post is **one** write to a recent-posts cache keyed by author. Regular inboxes stay ~80,000 writes/s. The celebrity tax moves to the **read mixer**: every follower of that author who opens the feed must merge that cache. Cache placement and stampede rules still belong with [read-heavy scaling](/learn/scaling-read-heavy-services).
+
+</Calculation>
+
+Inbox retention is a product bound, not infinite history. Last 800 posts × 200 B ≈ **160 KB** per user. 100 million users ≈ **16 TB** of derived inbox bytes before replicas. When the inbox is full, drop the oldest **derived** row; the authoritative post can still exist.
+
+### Ranking versus materialization
+
+**Materialization** copies “this post is a candidate in this reader’s inbox.” **Ranking** scores candidates at read (or in a nearline job) using recency, affinity, and policy. Do not store a fully ranked feed as if it were the post. A ranker can drop a materialized item; it cannot mint a post the store never committed.
+
+Push materializes membership. Pull materializes nothing until read. Hybrid materializes the cheap edges. Ranking always runs **after** you have a candidate set, and it is derived: rebuildable from posts plus features.
+
+### Pull versus push timelines, pagination, unread
+
+- **Push timeline:** read `inbox(user_id)` in rank or time order. Pagination should use a **cursor** `(sort_key, post_id)`, not an integer offset. Offset `page=3, limit=20` duplicates or skips when a newer row is inserted at the head.
+- **Pull timeline:** cursor must be **per followee** (or a merge of those cursors). A single offset across 400 logs is not defined.
+- **Unread counters** are derived: increment when a pushed item lands (or when a pull mixer sees a new watermark); decrement on open. They will drift. Repair with a periodic recount from inbox watermarks. Do not treat the counter as a lock on the post.
+
+Delivery of notification copies is at-least-once unless the device sink is idempotent on `notification_id`. That envelope is [Kafka delivery](/learn/kafka-delivery-and-failure), not fan-out math. Consumer lag on a fan-out topic is group progress; see [consumer groups](/learn/consumer-groups-and-rebalancing).
+
+### Backfill is a job with a watermark
+
+When user A follows user B, A’s inbox does **not** instantly contain B’s history. A **backfill worker** copies B’s last N authoritative posts into A’s inbox, advancing a watermark `(followee_id, last_copied_post_seq)`. Concurrent new posts from B may arrive via live fan-out **and** via backfill. Inbox inserts must be **idempotent on post_id**. Completeness is “watermark caught up to B’s current seq,” not “the follow RPC returned.” Until then, A’s feed is **partial by construction**.
+
+A celebrity follow usually **skips** inbox backfill and only records the follow edge so the read mixer includes B’s cache. Instant consistency of 40 million historical copies is not a design; it is a denial-of-service.
+
+### Privacy and unfollow are races
+
+The follow/block graph is authoritative for **who may see**. Inboxes are copies. Sequence:
+
+1. B posts; worker writes the item into A’s inbox.
+2. A unfollows B (or B blocks A). The graph updates.
+3. The inbox row is still there until a **revoke job** deletes by `(viewer, author)` or the **read path filters** against the current graph.
+
+If you only delete asynchronously, A can still see B’s post from the inbox—a **privacy race**, not a cache glitch you can ignore. If you only filter at read, storage retains copies you promised to forget until TTL. Do both: filter on every read (correctness for privacy), and revoke in the background (storage and unread repair). The post disappearing from A’s feed is **not** instantaneous global delete; it is graph-authoritative hide plus derived cleanup.
+
+Same race for “change post from public to followers-only”: already-pushed rows in non-follower inboxes remain until filter or revoke. Ranking cannot fix a copy that should not have been a candidate.
+
+<ExecutionTimeline
+  title="One post through hybrid fan-out, backfill, and unfollow"
+  steps={[
+    { title: "Commit", detail: "The writer inserts the post and a sequence number in the authoritative post store. The follow graph is not updated by this write.", state: "One post row exists. No inbox is required for correctness of the post.", failure: "Fan-out before commit, then rollback, leaves ghost inbox rows that still need idempotent delete." },
+    { title: "Push or skip", detail: "A worker loads follower ids. Regular followers get inbox inserts keyed by (viewer_id, post_id). Authors over the celebrity threshold are skipped; the post is appended to that author’s recent-posts cache.", state: "Regular inboxes are derived. Celebrity cache is derived. The graph and post remain authoritative.", failure: "Pushing the celebrity key anyway concentrates ~667,000 writes/s onto one publish and starves other fan-out." },
+    { title: "Backfill", detail: "A separate follow-accept job copies the followee’s last N posts into the new follower’s inbox up to a sequence watermark. Live pushes race the job; both use the same post_id key.", state: "Inbox completeness is the watermark, not the HTTP 200 of Follow.", failure: "Treating Follow success as a fully materialized history, then paging with offsets, duplicates or invents holes." },
+    { title: "Revoke", detail: "Unfollow updates the graph first. Reads filter candidates against the graph. A revoke worker deletes leftover inbox rows and adjusts unread counts.", state: "Privacy is graph-authoritative at read. Inbox delete is derived cleanup.", failure: "Inbox-only delete without a read filter leaves a window where the unfollowed post still renders." }
+  ]}
+/>
+
+Overload: bound the fan-out queue. If the worker lags, **shed ranking features and notification copies first**, not post commit. That priority list is [graceful degradation](/learn/graceful-degradation). Do not drop the follow-graph write to “keep the feed available.”
+
+</UnderTheHood>
+
+<MentalModel title="A newspaper press, a library query, and a celebrity exception desk">
+
+Fan-out on write is a printing press: one editorial page (the post) is copied onto every subscriber’s porch (the inbox). Cheap to read the porch. Ruinously expensive if one columnist has forty million porches.
+
+Fan-out on read is asking the library to pull every author you follow off the shelf at the door. Cheap to publish. The door becomes the bottleneck.
+
+Hybrid is the press for ordinary columnists and a single display copy for celebrities that the door staff merge in. Backfill is a clerk walking yesterday’s papers onto a new subscriber’s porch, stamping each paper with a page number (watermark). Unfollow is canceling the subscription at the office (the graph) while a paper already on the porch is still readable until someone takes it back.
+
+Retain: **posts and the follow graph are authoritative; inboxes, celebrity caches, rank scores, and unread counters are derived; celebrity keys skip push; backfill has a watermark; unfollow is a privacy race against copies.**
+
+</MentalModel>
+
+<ArchitectureDiagram title="Authoritative posts and graph versus derived inboxes, celebrity cache, and counters" chart={"flowchart LR\n  P[Poster] --> POST[(Authoritative posts)]\n  P --> GRAPH[(Authoritative follow graph)]\n  POST --> FO[Fan-out worker]\n  GRAPH --> FO\n  FO -->|push regular| INB[(Derived follower inboxes)]\n  FO -. skip celebrity push .-> SKIP[Skip hot-key push]\n  SKIP --> CACHE[(Derived celebrity cache)]\n  INB --> MIX[Read mixer]\n  CACHE --> MIX\n  GRAPH --> MIX\n  MIX --> RANK[Ranking]\n  RANK --> API[Timeline API]\n  API --> CUR[Cursor pagination]\n  CUR --> CLI[Clients]\n  BF[Backfill job] -. watermark catch-up .-> INB\n  GRAPH --> REV[Unfollow revoke]\n  REV -. privacy leftover delete .-> INB\n  MIX -. async unread repair .-> CTR[(Derived unread counters)]"}>
+
+**Authoritative state:** the post store (body, visibility, sequence) and the follow/block graph. **Derived:** follower inboxes, celebrity recent-post caches, ranker scores, unread counters, and notification copies. **Consistency boundary:** a post exists when the post row commits; a viewer is allowed to see it when the **current graph** says so at read time. Inbox presence is not permission. Solid edges are commit, regular push, and the read mix. Dashed edges are celebrity skip (reject of push), backfill catch-up (async), unfollow leftover delete (recovery), and unread repair (async). Recovery after a stuck worker is replay from the post log with idempotent `(viewer_id, post_id)` inserts, then advance the backfill watermark; recovery after unfollow is filter-on-read plus revoke, not “the inbox was the truth.”
+
+<ArchitectureWalkthrough
+  title="Where a feed answer is allowed to come from"
+  stages={[
+    { name: "Publish", owner: "Post store", state: "One sequenced post row", boundary: "Commit of the post is independent of inbox copies.", failure: "Worker push without a committed post.", recovery: "Idempotent delete of ghost inbox rows; republish only after commit." },
+    { name: "Fan-out", owner: "Push worker plus skip policy", state: "Regular inbox rows; celebrity cache append", boundary: "Skip push above the hot-key threshold. Do not fan-out TokenX ledger rows this way.", failure: "Celebrity treated as a regular follower list.", recovery: "Halt that key’s push, keep the author cache, drain the queue; see partitioning for skew." },
+    { name: "Backfill", owner: "Follow-accept job", state: "Watermark (followee, last_copied_seq)", boundary: "Follow RPC success is not inbox completeness.", failure: "Offset pagination over a still-filling inbox.", recovery: "Cursor by (sort_key, post_id); retry backfill until watermark matches followee seq." },
+    { name: "Read", owner: "Mixer plus ranker", state: "Candidates filtered by live graph", boundary: "Graph is the privacy gate. Ranker only orders allowed candidates.", failure: "Serving inbox rows without a graph check after unfollow.", recovery: "Always join graph on read; revoke job heals storage and unread counts." }
+  ]}
+/>
+
+</ArchitectureDiagram>
+
+<RealExamples title="News feed hybrid; TokenX notices; Ad Click dashboards">
+
+**News-feed product.** Regular users: fan-out on write into a per-viewer inbox partitioned by `viewer_id` (hot viewers still skew—see [partitioning](/learn/partitioning-vs-sharding-vs-aggregation)). Celebrities: write one cache list per author, merge at read. Ranking is a separate pass on the candidate union. Pagination uses a cursor. When a user follows a celebrity, skip history backfill; when they follow a regular account, backfill last 50 posts with a watermark.
+
+**TokenX.** A completed transfer may fan out **notifications** (email, push, activity row) to devices on the two wallets. That path can be at-least-once and skipped under overload. The **ledger** is a single debit/credit with a unique `event_id`. Do not write the spendable balance into N follower-shaped copies and call that a feed. Other wallets’ activity UIs may **pull** public receipt metadata; they must not assemble a spendable number from those copies. Cache of “recent public transfers” is derived with a freshness bound; spendable reads stay on the ledger path from [replication and failover](/learn/replication-and-failover) session rules when you need read-your-writes.
+
+**Ad Click Aggregator.** Each billed click appends **once** to the fact log. Fan-out is the **metrics pipeline**: per-campaign counters, dashboards, and anomaly pages. Those views are derived and can lag, sample, or rebuild. Finance still invoices from the billed log, not from a dashboard that was fanned out to 200 operator browsers. A viral campaign is a hot key on the aggregator, not a reason to copy each click into every analyst’s inbox.
+
+<FailureScenario
+  title="Pick the fan-out failure that matches the invariant"
+  prompt="A celebrity posts. A regular user unfollows them. A TokenX transfer commits. An ads dashboard is stale. Choose the control."
+  choices={[
+    { label: "Push the celebrity post to 40 million inboxes", impact: "Write amplification ~667,000 inbox writes/s for one post. Other publishes queue. Inboxes become the outage.", recovery: "Skip push; append the author cache; mix at read. Cap the fan-out queue." },
+    { label: "Hide on read using the graph; revoke inbox later", impact: "The unfollowed post disappears on the next filtered read even if the inbox row remains. Storage and unread counts catch up asynchronously.", recovery: "This is the privacy-correct order. Inbox-only delete without a filter leaves a leak window." },
+    { label: "Fan-out the TokenX debit into notification inboxes as the balance", impact: "Devices show a number that is not the ledger. Duplicate notifications look like duplicate money.", recovery: "Notify from a derived outbox. Spendable balance stays one ledger row with event_id idempotency." },
+    { label: "Treat the ads dashboard as the billed fact because it was fanned to every operator", impact: "Operators argue from a lagging aggregate. Finance cannot reconstruct clicks.", recovery: "Keep one billed log. Rebuild dashboards from that log; label staleness." }
+  ]}
+/>
+
+</RealExamples>
+
+<InterviewTraps title="Feed slogans that fail at IC6">
+
+- **“Fan-out on write is always faster.”** Faster **reads**. Writes die on celebrities. Name the skip threshold.
+- **“Fan-out on read does not amplify anything.”** It amplifies **reads** by follow-graph degree.
+- **“Hybrid means eventual consistency of money.”** Hybrid is a feed tactic. TokenX ledgers are not celebrity inboxes.
+- **“Follow returns when backfill finishes.”** That couples an RPC to a 40-million-row copy. Backfill is a watermarked job.
+- **“Unfollow deletes the post for everyone immediately.”** Unfollow updates **your** graph edge. Other inboxes, caches, and CDNs still hold copies until filter and revoke. Privacy is read-time graph plus cleanup.
+- **“Offset page=2 is enough.”** Inserts at the head shift offsets. Use cursors.
+- **“Unread count is source of truth.”** It is a counter you will repair.
+- **“Exactly-once inbox insert because the worker is in a consumer group.”** Group assignment is not a sink mutex. Idempotent `(viewer, post_id)` is. See [consumer groups](/learn/consumer-groups-and-rebalancing) and [delivery](/learn/kafka-delivery-and-failure).
+- **“Ranking materializes the only copy of the post.”** Ranking can drop candidates; it must not be the post store.
+- **“Ad dashboards are fanned-out facts.”** They are derived. The billed log remains one stream.
+
+</InterviewTraps>
+
+<Tradeoffs title="Where you pay: writes, reads, privacy lag, storage">
+
+- **Push versus pull:** push spends write I/O and storage for cheap reads; pull spends merge CPU and origin reads for cheap publishes. Hybrid spends **complexity** (two serving paths, skip policy, mixer) to cut the celebrity tail.
+- **Inbox depth versus RAM/disk:** longer inboxes improve offline catch-up and cost storage; short inboxes force pull for history.
+- **Filter-on-read versus eager revoke:** filter is the privacy gate and costs a graph lookup on every request; eager revoke shrinks leaked storage and costs a job that will race live reads anyway—run both.
+- **Cache of celebrity timelines:** excellent for read-heavy serving; invalidation and stampede are the same problems as the [read-heavy](/learn/scaling-read-heavy-services) lesson. A 30 s stale celebrity cache is usually allowed; a 30 s stale TokenX **balance** is not.
+- **Cursor versus offset:** cursors survive inserts; they complicate “jump to page 50.” Feeds should not promise offset pages.
+- **Notification fan-out versus ledger fan-out:** notifications may shed; ledgers may not. Ads metrics may lag; billed facts may not.
+
+[Consistency models](/learn/consistency-models) name what a viewer may see (monotonic feed versus read-your-writes on your own post). This lesson only adds: **derived copies make those guarantees harder**, and privacy is a different invariant than freshness.
+
+</Tradeoffs>
+
+<KnowledgeCheck
+  question="A celebrity with 40 million followers publishes one 200 B post. The service fans out on write to every follower with no skip. What did you just buy?"
+  options={[
+    "A single 200 B append, because Kafka will compact duplicate inbox keys",
+    "About 40 million derived inbox writes for that post, on the order of 667,000 writes/s if they must land within 60 s, plus no privacy win over a graph check",
+    "Linearizable feeds for every follower, because each inbox write is local",
+    "Exactly-once notifications, because each device gets one copy"
+  ]}
+  correct={1}
+  explanation="Fan-out on write copies the post once per follower. Compaction is not an inbox strategy, local writes are not linearizable global feeds, and device copies are a separate at-least-once path. Hybrid exists because this number is the celebrity problem."
+/>
+
+<KnowledgeCheck
+  question="User A unfollows user B. B’s last post is already in A’s inbox. Which design matches the privacy invariant?"
+  options={[
+    "Wait for the inbox TTL only; the graph can stay unchanged because the row will expire",
+    "Update the follow graph first, filter inbox candidates against the graph on every read, and run a revoke job to delete leftovers and fix unread counts",
+    "Delete the authoritative post so it disappears for every remaining follower",
+    "Decrement A’s unread counter and treat that as proof the post is gone"
+  ]}
+  correct={1}
+  explanation="Permission lives on the graph. Inbox rows are derived leftovers. TTL-only keeps a privacy window; deleting the post punishes other viewers; unread is a derived counter, not a hide."
+/>
+
+<ScenarioCheck
+  scenario="An engineer ships Follow as a single transaction: insert graph edge, then copy the followee’s entire 12-year post history into the new inbox before returning 200. A celebrity follow times out at 30 s after 2 million copies. The client retries. The graph insert is not idempotent. Timeline pagination uses SQL OFFSET."
+  question="What should you ship instead, and which assumptions broke?"
+  options={[
+    { label: "Keep the synchronous copy; raise the timeout to 15 minutes so celebrity follows can finish.", feedback: "You turned a follow into a multi-minute write amplification event and still race retries into duplicate graph edges." },
+    { label: "Record the follow edge idempotently, skip celebrity history push, backfill regular accounts with a watermark and idempotent post_id inserts, mix celebrity cache at read, paginate with cursors.", feedback: "Follow success is graph membership. Completeness is a watermarked job. Celebrity skip is the hybrid. OFFSET is the pagination trap." },
+    { label: "Fan-out on read only for everyone so Follow never copies; drop the graph filter because pull always sees live posts.", feedback: "Pull still needs the graph to know whom to pull. It also shifts 400-way merge onto every home-timeline read without solving privacy." },
+    { label: "Store the spendable TokenX ledger the same way so wallet followers see instant balances in their inboxes.", feedback: "Ledgers are not social inboxes. Copying balances by fan-out creates many spendable numbers with no uniqueness story." }
+  ]}
+  correct={1}
+  explanation="The violated assumptions are ‘Follow includes history,’ ‘celebrity is a regular key,’ ‘retries of a non-idempotent graph write are safe,’ and ‘OFFSET is a cursor.’ Hybrid plus watermarked backfill plus read-time graph filter is the defensible feed. TokenX money stays off this path."
+/>
+
+<InterviewAnswer>
+
+“I pick fan-out from skew, not from a slogan. Fan-out on write copies each post into follower inboxes: mean 200 posts/s times 400 followers is 80,000 derived writes/s, but a 40-million-follower celebrity is hundreds of thousands of writes per publish, so I skip that key and keep a celebrity recent-post cache mixed at read. Fan-out on read leaves one post write and pays follow-graph degree on every timeline merge. Inboxes, rank scores, and unread counters are derived; posts and the follow graph are authoritative. Backfill after Follow is a job with a sequence watermark and idempotent post_id inserts—Follow 200 is membership, not instant history. Unfollow updates the graph first; I filter every read and revoke leftovers later, because an inbox row is a privacy race, not a delete of the post. Pagination uses cursors, not offsets. TokenX may fan out notifications; the ledger stays one debit with an event id. Ad click billed facts stay one log; dashboards are derived fan-out. If the fan-out queue saturates I shed notifications and ranker features, not the post commit.”
+
+</InterviewAnswer>

@@ -1,0 +1,219 @@
+---
+title: "Write Scaling"
+description: "Scale writes by owning keys, fencing retries, and choosing durable ACK versus derived aggregation—not by adding writers to a hot row."
+module: 2
+moduleTitle: "Scalability"
+order: 4
+duration: 38
+difficulty: "Intermediate"
+tags:
+  - write scaling
+  - batching
+  - sharding
+  - idempotency
+  - contention
+  - WAL
+objectives:
+  - Separate durable ACK from derived aggregation and write-behind loss windows
+  - Choose partitioned single-writer ownership for keys that need serial order
+  - Size batches against latency, retry amplification, and duplicate blast radius
+  - Fence TokenX debits and billed-click facts so extra writers cannot double-apply
+---
+
+<BigPicture title="Write throughput is ownership, not replica count">
+
+Read scaling in [Scaling read-heavy services](/learn/scaling-read-heavy-services) multiplies copies of **derived** state. Write scaling multiplies **owners** of **authoritative** state. Extra API processes do not increase durable throughput if they all lock the same ledger row, increment the same sequence, or hash to the same partition.
+
+A write path has three different verbs that interviews collapse into “just persist it”:
+
+- **Acknowledge** a caller (availability of the API).
+- **Commit** bytes the product is willing to lose money or invoices over (durability).
+- **Project** aggregates, caches, and search indexes (derived views).
+
+TokenX spendable money lives in the ledger plus a unique `(tenant, transfer_id)` fence. You cannot write-behind a debit into a cache and call it committed. Ad Click billed facts may batch in memory **only until** they hit a durable log; collector ACK is then a durability claim. Windowed campaign totals remain derived and rebuildable.
+
+Cross-lesson spine: how you **place** keys is [Partitioning vs sharding vs aggregation](/learn/partitioning-vs-sharding-vs-aggregation); how retries stay safe is [Idempotency and deduplication](/learn/idempotency-and-deduplication); pairing a database commit with a log is [Transactions across boundaries](/learn/transactions-across-boundaries) and [Kafka delivery and failure](/learn/kafka-delivery-and-failure); per-key order is [Ordering and event keys](/learn/ordering-and-event-keys).
+
+</BigPicture>
+
+<UnderTheHood title="Batch, own the key, then name what the ACK promised">
+
+### Batching: latency paid, amplification bought, retries multiplied
+
+A batch amortizes fsync, RPC, and index maintenance across *N* items. It also holds the first item until the *N*th arrives or a linger timer fires, and it turns one failed ACK into *N* retries.
+
+Planning assumptions (illustrative, not a measured cluster): TokenX transfer API at 2,000 commits/s, 800 B encoded facts, linger 5 ms or 50 records. Ad Click collector peak 80,000 clicks/s, 400 B billed facts, linger 20 ms or 500 records.
+
+<Calculation label="Batch linger versus retry blast radius">
+
+TokenX: at 2,000 transfers/s a 50-record batch fills in 50 / 2,000 = 0.025 s. A 5 ms linger usually wins, so p50 extra wait ≈ 5 ms, not 25 ms.
+
+Ad Click: 80,000 clicks/s × 400 B = 32 MB/s leader payload before headers and compression. A 500-record batch is 200 KB; fill time = 500 / 80,000 = 6.25 ms. A 20 ms linger adds up to 20 ms to the first click in a sparse window.
+
+Retry: one timed-out 500-click batch re-sends 500 facts. Without a stable click id those 500 can double-count a derived window. With an idempotent billed-fact log they are duplicates of identity, not of money.
+
+</Calculation>
+
+Batching is a throughput lever. It is not a correctness lever. The correctness lever is the identity that survives the retry.
+
+### Partitioned ownership and single-writer keys
+
+If a key must be applied in a total order—TokenX account *A* debit then credit—**one owner at a time** must serialize that key. Mechanisms that actually provide it: a per-account partition with a single consumer (or single-writer replica), a row lock on `accounts[A]`, or an explicit sequencer whose output is the apply order.
+
+Mechanisms that **do not**: more write replicas of the same primary, sticky sessions without fencing, or hashing transfers by `transfer_id` while still needing per-account order. Hashing by transfer spreads load and **destroys** account order; hash by `account_id` preserves order and **creates** a celebrity-account hot partition. See [Ordering and event keys](/learn/ordering-and-event-keys).
+
+### Synchronous ACK versus asynchronous write
+
+A **sync ACK** means the caller may treat the write as durable **inside the named store**: TokenX ledger transaction committed; billed-click record below the log’s high-watermark under the delivery lesson’s `acks` / ISR policy. An **async ACK** means the API accepted work into a buffer or queue. That is availability. It is not durability. The loss window is “process crash, replica failover, or disk not yet flushed” until the authoritative commit.
+
+**Write-behind** is the extreme async case: mutate a cache, ACK, flush later. The loss window is every write not yet in the WAL or database. That is legal for TokenX **token metadata** and for ad **debug counters**. It is forbidden for TokenX **debits** and for **billed click facts**.
+
+**Write-ahead log (WAL) versus cache:** the WAL (or Kafka fact log, or database redo) is the authority until retention. A cache is a photocopy. Rebuilding the cache from the WAL is recovery. Rebuilding the WAL from the cache is fiction.
+
+### Contention: hot partition, row lock, sequence generator
+
+Three classic serial choke points:
+
+- **Hot partition:** one `account_id` or `campaign_id` owns a disproportionate rate. Extra consumers cannot split a Kafka partition; extra SQL writers queue on the same row lock.
+- **Row lock:** `UPDATE balances SET amount = amount - 100 WHERE account = A` serializes all of *A*. Ten API boxes become a longer wait queue, not 10× throughput.
+- **Sequence generator:** a global `SELECT nextval('ledger_seq')` or a single-row counter is one lock. Prefer per-account sequences, UUID/ULID identities, or Hi/Lo ranges **if** the product does not need a single global integer order.
+
+<ExecutionTimeline
+  title="Two TokenX writers on one account, plus a collector batch"
+  steps={[
+    { title: "Fence", detail: "Both retries for transfer T-9 carry tenant Acme and transfer_id T-9. The uniqueness table inserts (Acme, T-9) in the same ledger transaction as the debit.", state: "Authoritative fence is the unique row plus balance mutation. Cache is unused.", failure: "Check-then-insert without a unique constraint lets both writers debit." },
+    { title: "Own", detail: "Account A is hashed to partition 7. One owner applies T-9 then T-10. A second API box cannot commit A until it becomes the owner or takes the row lock.", state: "Per-account order is the owner’s apply order, not arrival order at the load balancer.", failure: "Sharding T-9 by transfer_id applies T-10 first on another partition and still claims ‘account order’." },
+    { title: "ACK", detail: "The API returns success only after the ledger transaction commits. Analytics produce is a later outbox/CDC write.", state: "Sync ACK bounds durability to the ledger. Outbox is not yet a second authority.", failure: "Returning 200 after enqueueing a write-behind buffer loses the debit on crash." },
+    { title: "Batch ads", detail: "A collector lingers 500 billed clicks, appends them to the fact log, then ACKs the SDK.", state: "Billed facts are authoritative at the log. Window sums stay derived.", failure: "ACK before the log append, then retry the batch without click ids, double-bills the window." }
+  ]}
+/>
+
+### Sharding writes, CDC fans, outbox, aggregation
+
+**Shard writes** by the ownership key, not by “whatever is unique.” TokenX shards by account (or wallet) so each shard serializes that account. Cross-account transfers are two local mutations plus a protocol from [Transactions across boundaries](/learn/transactions-across-boundaries)—not one row on a global primary.
+
+**Outbox:** the same local transaction inserts the ledger row and an outbox row. A publisher then fans to Kafka. The ledger remains the money authority; the topic is a **derived, at-least-once** changelog until the sink is idempotent. Dual-write without an outbox (DB then naked `produce`) can commit money and lose the event, or the reverse.
+
+**CDC fans:** change-data capture tails the WAL and fans to search, warehouses, and caches. Fan-out is asynchronous. Derived stores lag. They must not be consulted as spendable balances.
+
+**Per-event persist versus aggregate-then-persist:** billed clicks persist **per fact** (or per durable batch of facts) because finance reconstructs invoices from identities. Campaign dashboards may **aggregate then persist** a 1-minute window sum. If you only store the sum, you cannot prove a click, cannot replay a dispute, and cannot correct a hot-key double count except by guessing.
+
+<InteractiveCalculation mode="little-law" title="In-flight writes versus the one locked row" />
+
+Little’s Law here is the lock queue, not the API fleet. If 400 transfers/s hit celebrity account *A* and each holds the row 15 ms, *A* needs L = 400 × 0.015 = 6 overlapping lock waits on **one** row. Adding API replicas increases arrivals, not lock capacity. Queueing math for the rest of the path lives in [Latency, throughput, and queues](/learn/latency-throughput-and-queues).
+
+</UnderTheHood>
+
+<MentalModel title="One cashier per account, a numbered receipt, a vault log">
+
+Picture a bank branch. Each account has **one cashier** (partition owner / row lock). Ten extra tellers standing behind the same cashier do not count cash faster. The customer’s **receipt number** is `(tenant, transfer_id)`: handing it twice must return the same outcome, not a second debit. The **vault log** (WAL / billed-fact topic) is what auditors believe. Sticky notes on the counter (write-behind cache, dashboard windows) can blow away in a draft.
+
+A courier van (batch) is cheaper per envelope and slower for the first envelope. If the van crashes and you resend every envelope without receipt numbers, the vault double-books.
+
+Retain: **own the key, fence the identity, ACK only what committed, treat aggregates as derived, and never confuse extra writers with extra lock capacity.**
+
+</MentalModel>
+
+<ArchitectureDiagram title="Write owners, WAL authority, CDC-derived views, and reject paths" chart={"flowchart LR\n  CLI[Clients] --> API[Write API]\n  API --> KEY[Idempotency fence]\n  KEY --> OWN[Account owner]\n  OWN --> SEQ[Seq generator]\n  OWN --> WAL[(Authoritative WAL)]\n  WAL --> LED[(Ledger rows)]\n  LED --> OUT[(Outbox)]\n  OUT -. CDC async .-> FAN[CDC fan]\n  FAN --> VIEW[(Derived views)]\n  CLI --> COL[Ad collector]\n  COL --> BATCH[Batch ingest]\n  BATCH --> FACT[(Billed fact log)]\n  FACT -. async windows .-> AGG[Window aggregator]\n  AGG --> VIEW\n  KEY -. duplicate reject .-> CLI\n  API -. forbidden debit path .-> CACHE[(Write-behind cache)]\n  CACHE -. loss until commit .-> WAL"}>
+
+**Authoritative state:** TokenX uniqueness `(tenant, transfer_id)` plus ledger rows, and the Ad Click **billed-fact log** until retention. The WAL (database redo or Kafka log) is the recovery source. **Derived state:** CDC-fed search/warehouse, window aggregators, dashboards, and any write-behind cache. **Consistency boundary:** a TokenX debit is committed only when the unique insert and balance mutation commit in one local transaction; collector ACK is legal only after billed facts are on the durable log. Per-account order is the **single owner** of that account key, not the load balancer. Solid edges are sync admission and commit. Dashed edges are reject (duplicate 409), forbidden write-behind for money, CDC/window asynchrony, and the cache’s loss window until a later flush. Recovery is retry the same idempotency key, rebuild derived views from the WAL/log, and never reconstruct spendable money from a cache.
+
+<ArchitectureWalkthrough
+  title="Where a write is allowed to stop being authoritative"
+  stages={[
+    { name: "Fence", owner: "Idempotency table", state: "Unique (tenant, transfer_id) or billed click id", boundary: "Identity plus effect in one commit; duplicates replay the stored result.", failure: "Check-then-write without uniqueness; batch retry without click ids.", recovery: "Reject or replay; retain keys for the retry/replay horizon in the idempotency lesson." },
+    { name: "Own", owner: "Per-account partition or row lock", state: "Single writer for that key’s apply order", boundary: "Order and contention live here. Extra APIs queue.", failure: "Global sequence or celebrity key saturates one owner.", recovery: "Split only keys that do not need joint order; isolate hot accounts; do not add writers to the same row." },
+    { name: "Commit", owner: "WAL plus ledger or billed-fact log", state: "Bytes the product will audit", boundary: "Sync ACK means this store has the record under its durability policy.", failure: "ACK from memory, write-behind debit, or dual-write without outbox.", recovery: "Client retries with the same id; operator replays outbox/CDC from committed rows." },
+    { name: "Project", owner: "CDC fan and window aggregator", state: "Derived indexes, dashboards, cache", boundary: "Asynchronous; lag is allowed; not spendable; not invoice identity.", failure: "Serving balances from CDC lag or billing from a 1-minute sum only.", recovery: "Rebuild projections from the fact log; keep facts longer than views." }
+  ]}
+/>
+
+</ArchitectureDiagram>
+
+<RealExamples title="TokenX serializes money; Ad Click durables facts then derives windows">
+
+**TokenX.** Partition (or shard) by `account_id`. Serial ownership per account is mandatory if the product promises per-account debit/credit order. Uniqueness is `(tenant, transfer_id)` stored atomically with the mutation—see [Idempotency and deduplication](/learn/idempotency-and-deduplication). A celebrity treasury account at an illustrative 400 of 2,000 transfers/s is a hot key: scale **other** accounts by adding shards; this account still has one cashier. Write-behind of a debit is an integrity bug: crash-before-flush mints or loses spendable money. Analytics may follow an outbox; a produce timeout must not rewind the ledger. Cross-account settlement is a saga with local fences, not a second writer on both rows at once ([Transactions across boundaries](/learn/transactions-across-boundaries)).
+
+**Ad Click Aggregator.** Collectors may **batch** 500 clicks, but they ACK the SDK only after the billed-fact batch is on the durable log (`acks` policy as in [Kafka delivery and failure](/learn/kafka-delivery-and-failure)). Aggregation windows (1-minute campaign totals, unique users) are **derived**: they can be rebuilt, sampled, or lagged under [Graceful degradation](/learn/graceful-degradation). A viral campaign is a hot partition if you key by `campaign_id`; collector keys spread ingest and move skew into the aggregator. Billing from the window table without the fact log cannot survive a double-applied batch.
+
+<FailureScenario
+  title="Pick the write-path failure and name the bound"
+  prompt="Two TokenX retries, one hot account, and one 500-click collector timeout happen in the same minute. Choose a failure and stay inside the durability bound."
+  choices={[
+    { label: "Write-behind the debit, ACK 200, flush the cache every 50 ms", impact: "A crash in that 50 ms window loses or duplicates spendable money. Uniqueness never met the ledger.", recovery: "Remove write-behind on money. Commit unique id plus balance, then ACK. Cache only metadata." },
+    { label: "Add 20 write APIs against the same balances row", impact: "Lock wait queue grows. Throughput of account A stays ~1 / hold-time. p99 explodes; other accounts on the same primary starve.", recovery: "Keep one owner per account; shard other keys; isolate the celebrity row; measure lock wait, not API CPU." },
+    { label: "ACK the collector before the fact-log append, retry the whole batch", impact: "Derived windows can double-count. Finance has no identity to prove a single click.", recovery: "ACK after durable append. Retry with stable click ids. Rebuild windows from facts, not from the live counter." },
+    { label: "Dual-write ledger then Kafka without an outbox", impact: "Process crash after commit and before produce: money moved, analytics missing—or the reverse if you produce first.", recovery: "Outbox in the ledger transaction, at-least-once publish, idempotent sink. Do not treat Kafka as the ledger." }
+  ]}
+/>
+
+</RealExamples>
+
+<InterviewTraps title="Write-scaling slogans that fail at IC6">
+
+- **“More writers mean more throughput.”** Not on one row, one sequence, or one partition. That is a longer queue.
+- **“Async ACK is just as durable if we replicate the cache.”** Replication of derived state does not create a WAL. Loss window remains until the authority commits.
+- **“Write-behind is fine; Redis has AOF.”** Redis AOF is a different durability envelope with its own fsync policy. It is still not the TokenX ledger and not an invoiceable click identity.
+- **“Exactly-once because we batch.”** Batching multiplies duplicates on retry. Exactly-once is at best **effect-once inside a named atomic boundary** with a retained idempotency key—not a transport property.
+- **“CDC is strongly consistent with the primary.”** CDC is asynchronous. Replica and search lag are expected. Spendable reads must not cross that boundary.
+- **“We’ll aggregate clicks in memory and flush sums every minute to save Kafka.”** You saved brokers and destroyed billed facts. Disputes cannot replay a sum.
+- **“Global AUTO_INCREMENT keeps transfers ordered.”** It orders inserts on that generator, serializes the whole fleet, and still does not equal per-account causal order across shards.
+- **“Sticky sessions give us single-writer.”** Sticky is a routing hint. Failover, rolling deploys, and a second region create split writers unless you fence.
+
+</InterviewTraps>
+
+<Tradeoffs title="What you spend to go faster on writes">
+
+- **Batch size versus latency and retry radius:** larger batches raise throughput and the cost of a timeout. TokenX small batches protect debit tail latency; ads can linger longer if ACK waits for the log.
+- **Sync ACK versus availability:** sync ACK fails closed with the store; async ACK stays up and hides a loss window. Money and billed facts take sync-to-authority. Debug counters may not.
+- **Per-event facts versus aggregate-then-persist:** facts cost storage and buy replay. Aggregates cost less and cannot reconstruct identity.
+- **Account sharding versus global order:** shards scale unrelated keys and give up a single ledger sequence. Cross-shard transfers need a protocol, not a hope.
+- **Single-writer order versus parallelism:** serial apply preserves invariants and caps that key’s QPS at 1 / service-time. Parallel apply needs commutative events or conflict resolution.
+- **Outbox/CDC complexity versus dual-write luck:** outbox adds a publisher and lag; dual-write is simpler until the first crash.
+
+Correctness of TokenX balances and billed-click identity is not a throughput knob. Completeness of a dashboard is.
+
+</Tradeoffs>
+
+<KnowledgeCheck
+  question="Twenty TokenX API replicas all update the same celebrity account row. Throughput of that account is unchanged. What bound did the replicas miss?"
+  options={[
+    "TLS overhead on the load balancer, which caps all writes regardless of locking",
+    "The single-row lock (or single partition owner) serializes apply; extra writers only lengthen the wait queue",
+    "Kafka consumer count, which must exceed API replicas for writes to scale",
+    "Write-behind cache replicas, which are the true authority for spendable balances"
+  ]}
+  correct={1}
+  explanation="Useful write capacity is the number of independent owners, not the number of stateless APIs. One row or one partition remains one cashier. Caches are not the ledger; consumer count is a derived-path concern."
+/>
+
+<KnowledgeCheck
+  question="An Ad Click collector ACKs the SDK after buffering 500 billed clicks in process memory, then a crash loses the buffer. A retry resends the batch. Which design matches the lesson?"
+  options={[
+    "Keep the memory ACK; Redis write-behind will recover the 500 clicks from replica memory",
+    "Treat the 1-minute campaign sum as authoritative so lost facts do not matter",
+    "ACK only after the billed-fact log append; retry with stable click ids so duplicates do not become two invoices",
+    "Add more collector processes so the next batch has somewhere else to live"
+  ]}
+  correct={2}
+  explanation="Collector ACK is a durability claim. It belongs after the billed-fact log. Identities make at-least-once retries safe. Window sums and extra processes do not recreate lost unlogged facts."
+/>
+
+<ScenarioCheck
+  scenario="A candidate proposes: TokenX returns 200 as soon as the debit hits a local write-behind buffer (flush every 50 ms to Postgres). Transfers use a UUID but no unique constraint. Ad Click stores only 1-minute aggregated counts to ‘scale writes,’ and collector retries are unkeyed batches. They add 30 write APIs because CPU is 20%."
+  question="What must you change so money and invoices survive crash and retry?"
+  options={[
+    { label: "Keep write-behind; just fsync Redis every 5 ms so the loss window is ‘small enough’ for IC6 money.", feedback: "A smaller window is still a loss window, and it is still not the ledger uniqueness boundary." },
+    { label: "Commit (tenant, transfer_id) plus the ledger mutation before ACK. ACK billed clicks after the fact log. Keep window tables derived. Stop adding APIs to the hot row; own keys instead.", feedback: "Sync ACK to the authority, identity for retries, aggregates as projections, ownership instead of replica count." },
+    { label: "Move the TokenX debit onto Kafka with acks=0 so writes scale, and bill ads from the in-memory aggregator to avoid log amplification.", feedback: "acks=0 is an async ACK. In-memory aggregates are not billed facts. Both violate the durability bound." },
+    { label: "Enable read replicas for TokenX writes so each API can commit locally, and compact the click log so only the latest campaign total remains.", feedback: "Read replicas are not write owners. Compacting facts into a total destroys invoice identity." }
+  ]}
+  correct={1}
+  explanation="Write scaling that preserves invariants is partitioned ownership plus durable, idempotent commits. Write-behind debits, unkeyed batches, and aggregate-only ads trade the wrong thing for QPS."
+/>
+
+<InterviewAnswer>
+
+“I scale writes by adding owners of keys, not processes on one row. TokenX partitions by account so one owner serializes that account; uniqueness is (tenant, transfer_id) in the same transaction as the debit. I never write-behind spendable money—an ACK means the ledger committed, not that a cache will flush in 50 ms. Extra APIs on a celebrity row only grow lock wait; throughput stays about one over hold time, same as a global sequence generator. Ads may batch to amortize fsync, but the collector ACKs after billed facts are on a durable log; one-minute windows are derived and rebuildable, so a retried batch needs click ids or it double-counts. Outbox plus CDC fans search and dashboards asynchronously; those views are not balances. Batching buys amplification and spends latency and retry blast radius. Async ACK is availability, not durability. I name the WAL, the fence, the owner, and the loss window before I draw more boxes.”
+
+</InterviewAnswer>

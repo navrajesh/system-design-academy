@@ -40,21 +40,21 @@ Authoritative curriculum state lives in `content/lessons/`. Search data and rend
 | Module | Planned lessons | Current state |
 | --- | ---: | --- |
 | 1. Storage & Data | 9 | 9 authored; coverage complete |
-| 2. Scalability | 8 | 1 foundation lesson authored |
+| 2. Scalability | 8 | 8 authored; coverage complete |
 | 3. Kafka & Fault Tolerance | 9 | 9 authored; coverage complete |
 | 4. Performance | 9 | 1 foundation lesson authored |
 | 5. Networking | 9 | 1 foundation lesson authored |
 | 6. CAP & Consistency | 9 | 9 authored; coverage complete |
 | 7. Architecture & Mock Interviews | 11 | 1 foundation exercise authored |
-| **Total** | **64** | **31 authored, 33 planned** |
+| **Total** | **64** | **38 authored, 26 planned** |
 
-Modules 1, 3, and 6 are complete in topic coverage on `feat/module-3-kafka-fault-tolerance`. The Modules 1 and 6 technical audit (13 items) is merged on `main` at `3e5a71e`.
+Modules 1, 2, 3, and 6 are complete in topic coverage on `feat/module-2-scalability`. Module 3 is merged on `main` at `8ad26ed`. The Modules 1 and 6 technical audit (13 items) is merged on `main` at `3e5a71e`.
 
 ## Current progress
 
 - Phase 0 foundation hardening is complete.
 - Phase 1A authored all nine lessons in Module 1 and all nine lessons in Module 6.
-- The repository contains **31 of 64 lessons** after completing Module 3.
+- The repository contains **38 of 64 lessons** after completing Module 2.
 - All seven modules have at least one foundation lesson.
 - The future Architecture Reference Library remains Phase 2 and has not been implemented.
 
@@ -88,8 +88,8 @@ The Modules 1 and 6 audit found **13 items**. All 13 are addressed and merged to
 
 ## Next milestone
 
-1. Pause for approval of Module 3 (9/9) on `feat/module-3-kafka-fault-tolerance`. Do not apply or drop `stash@{0}` until a later decision.
-2. Resume operating lessons in Modules 2, 4, and 5.
+1. Pause for approval of Module 2 (8/8) on `feat/module-2-scalability`. Do not push, merge, or deploy this branch until a later decision. Do not apply or drop `stash@{0}` until a later decision.
+2. Resume operating lessons in Modules 4, 5, and 7.
 
 Phase 2 is explicitly out of scope for this milestone.
 
