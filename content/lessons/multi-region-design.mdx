@@ -1,0 +1,233 @@
+---
+title: "Multi-Region Design"
+description: "Place writes, replicas, and DNS so locality and sovereignty stay explicit, and failover is a fenced cutover with a named RPO, not an instant flip."
+module: 2
+moduleTitle: "Scalability"
+order: 7
+duration: 39
+difficulty: "Intermediate"
+tags:
+  - multi-region
+  - active-active
+  - data sovereignty
+  - failover
+  - RPO
+objectives:
+  - Choose active/passive versus active/active from write conflict, locality, and sovereignty, not from a latency slogan
+  - Bound TokenX spendable writes to one region (or a named consensus protocol) and serve regional caches with a stale bound
+  - Size DNS TTL, replica lag, RPO, and RTO so failover is a fenced evacuation, not an instant safe cutover
+  - Keep billed ad clicks in per-region logs and treat dashboards as derived aggregates
+---
+
+<BigPicture title="A region is a failure domain and a legal boundary">
+
+Multi-region design is **where writes are allowed to commit**, **how far copies may lag**, **who may leave the region**, and **how you stop the old region from writing after you evacuate**. It is not “put a load balancer on two continents and call it active/active.”
+
+Two serving shapes:
+
+- **Active/passive:** one **write region** (or one writer per shard). Other regions serve reads from replicas or caches, or sit warm until promotion. Conflict rate on a single object is zero by construction. Failover is promotion plus **fencing**.
+- **Active/active:** more than one region accepts writes to the **same keys**. You must name a **conflict rule** (last-writer-wins with a clock you distrust, merge functions, CRDTs, or application reconciliation). Dual-write without that rule is a bug, not a topology.
+
+Locality (read nearby) is a latency and egress win. **Data sovereignty** is a legal constraint: some records **must not leave** a region even if another region is healthier. CAP during a partition is [CAP and practical consistency](/learn/cap-and-consistency-models); session guarantees and bounded staleness are [consistency models](/learn/consistency-models). How you copy bytes and fence a primary is [replication and failover](/learn/replication-and-failover). This lesson adds **geography, DNS, evacuation, and sovereignty** on top of those mechanisms. It does not re-derive Raft.
+
+TokenX **spendable balances** need a **single write region** (or an explicit consensus/CRDT protocol you must actually design). Prefer **ledger authority in one region** plus **regional read caches with a stated stale bound**. Do not fake a multi-master wallet. Ad click **ingest** can be multi-region: per-region billed logs, then aggregate. Dashboards are derived.
+
+</BigPicture>
+
+<UnderTheHood title="Locality, lag, DNS, fencing, then evacuation">
+
+### What “active” actually writes
+
+Per object, list the allowed writer set.
+
+| Object | Allowed writers | Replica / cache | Conflict |
+| --- | --- | --- | --- |
+| TokenX ledger row | One region (or one consensus group you named) | Regional caches, **non-spendable**, stale bound e.g. 5 s | None at the wallet; retries use `event_id` |
+| TokenX notifications | Any region | Derived | Duplicates OK if sink idempotent |
+| Billed click | The region that observed the click | Cross-region aggregate jobs | Same click id may dual-produce; sink dedupes |
+| Campaign dashboard | None (derived) | Many | Rebuild from logs |
+
+Active/active **reads** with a single write region is a common, honest design. Active/active **writes** on a TokenX wallet without a conflict rule produces two spendable balances. Last-write-wins on money is not a conflict rule you want. CRDTs for balances are a research protocol, not a slogan—do not claim them unless you specify merge of debits without double-spend. Prefer one writer.
+
+### Replication lag is RPO if you cut over now
+
+**Planning assumptions (illustrative):** TokenX WAL 15 MB/s in region A; async replica in region B; measured lag 8 s typical, 45 s at p99; DNS TTL 60 s; recursive resolver extra cache commonly 30–120 s; anycast withdraw 2–15 s depending on the provider; in-flight HTTP 5 s client timeout.
+
+<Calculation label="RPO, DNS delay, catch-up, RTO floor">
+
+If you evacuate A **now**, asynchronous replica lag **is** the recovery point: p99 **45 s** of acknowledged-in-A writes may be missing in B. That is RPO for this topology. Synchronous cross-region commit would shrink RPO toward the inter-region round trip (often 60–150 ms one-way transatlantic; **do not** treat that as zero) and add that RTT to every debit.
+
+DNS TTL 60 s does not bound client delay. Resolvers and OS caches ignore or clamp TTLs. **Planning floor:** 60 s TTL + 120 s sticky cache ≈ **3 minutes** of some clients still arriving in A after you flip the record. Anycast can be faster **if** you withdraw the prefix and health checks are honest; it does not fence the database.
+
+Catch-up after A was 120 s behind at 15 MB/s: backlog 1.8 GB. If B can apply 45 MB/s while new writes (if any) continue at 15 MB/s, leftover 30 MB/s → **60 s** ideal catch-up. Promote **after** fencing A, not while A still accepts debits.
+
+RTO is detection + fence + DNS/anycast drain + cache warm + replay of UNKNOWN in-flight, not the 60 s catch-up alone. A 30 s RTO with 60 s TTL and 45 s replica lag is a **contradictory** promise. Tie the numbers to [backup, restore, and DR](/learn/backup-restore-and-disaster-recovery).
+
+</Calculation>
+
+### Session stickiness, read-your-writes, sovereignty
+
+A user who writes in region A and is load-balanced to region B on the next click will not see that write unless you:
+
+- **stick the session** to the write region (cookie, consistent hash that survives failover poorly), or
+- carry a **read-position token** `{shard, epoch, commit_position}` and wait or forward to authority, as in [replication and failover](/learn/replication-and-failover), or
+- accept **bounded staleness** and label it (portfolio yes; spendable debit no).
+
+Stickiness across regions is not a consistency protocol. If the sticky region dies, the cookie still points at a corpse until TTL and health checks catch up.
+
+**Sovereignty:** if EU wallet PII and ledger rows must not leave `eu-central`, you **cannot** fail those writes over to `us-east` just because latency is better. Evacuation for that partition is **another EU region** or a **read-only** mode. Cross-region replicas of those bytes are a compliance incident even if CAP would allow it. Ads click bodies that include EU user identifiers follow the same rule; aggregates stripped of personal data may leave.
+
+### DNS TTL versus anycast versus the database fence
+
+Control planes people confuse:
+
+- **DNS:** cheap, globally cached, **slow to retract**. Good for coarse region maps, bad as the only fence.
+- **Anycast / GSLB health:** faster withdraw if the network actually stops announcing. Still not a WAL fence.
+- **Application router:** can check a **region epoch** and refuse writes to a drained region immediately—for clients that already talk to you.
+- **Storage fence:** increment epoch / revoke the old primary’s lease so a partitioned A **cannot commit**. This is the actual split-brain control. Timeouts are suspicion; [failure detection and recovery](/learn/failure-detection-and-recovery) is the protocol.
+
+Failover is **not instant**. Even a perfect fence leaves in-flight RPCs, producer buffers, and clients with the old VIP.
+
+### Split brain, fencing, dual-write
+
+If A is partitioned from the coordinator but still reachable by some clients, and you promote B without fencing A, **two write regions** exist. TokenX double-spends. Recovery is not “pick the larger WAL.” It is: **fence first**, accept B’s epoch, treat A’s unfenced suffix as **UNKNOWN**, reconcile by `transfer_id`. See replication/failover; do not restatement-Raft this.
+
+**Active/active dual-write** (client writes A and B) without a conflict rule: both regions may commit different bodies for one id, or one commit and one timeout. The sink must define winners. For ads, dual-produce of the **same click id** into two regional logs is survivable if the aggregator **dedupes**. For TokenX ledgers, dual-write is an integrity bug.
+
+### Evacuation leaves in-flight work
+
+<ExecutionTimeline
+  title="Evacuate region A without claiming instant failover"
+  steps={[
+    { title: "Declare", detail: "Mark A draining. Stop new TokenX debits at the application router even if DNS still points at A. Ads ingest may fail-open onto the local billed log if sovereignty allows.", state: "A is no longer the intended writer. Some clients have not heard.", failure: "Flipping DNS only, waiting TTL, while A still commits spendable rows." },
+    { title: "Fence", detail: "Advance the ledger epoch and revoke A’s write lease. Storage rejects old-epoch commits. Record replica lag; that lag is RPO.", state: "One fenced writer remains (B) if sovereignty allows B to hold those keys.", failure: "Promote B while A can still commit: split brain." },
+    { title: "Drain", detail: "Wait client timeouts for in-flight RPCs (planning 5 s) plus sticky sessions and DNS caches (minutes unless anycast withdraws). Do not replay client request logs as new debits.", state: "In-flight work is UNKNOWN, not missing-and-must-mint.", failure: "Auto-retrying every timed-out debit on B duplicates money unless event_id is unique." },
+    { title: "Serve", detail: "B serves writes for keys it is allowed to own. Regional caches rebuild with a stale bound. Ad aggregates replay per-region logs. EU-only keys stay EU.", state: "Caches are derived. Dashboards lag. Spendable reads go to B’s authority or wait the token.", failure: "Serving spendable balances from a 5-minute US cache of an EU ledger." }
+  ]}
+/>
+
+Ads ingest during A’s death: collectors in B keep appending to **B’s log**. Collectors in A that still run may append locally until they die; those bytes exist only if they were mirrored. Do not invent clicks to fill a hole. Delivery and idempotent sinks: [Kafka delivery](/learn/kafka-delivery-and-failure).
+
+Degrade honestly: TokenX read-only in a sovereignty-locked region rather than illegal failover; ads dashboards labeled delayed. That policy list is [graceful degradation](/learn/graceful-degradation).
+
+</UnderTheHood>
+
+<MentalModel title="One notary office, branch photocopy rooms, and a slow change-of-address form">
+
+The **write region** is the notary: only that office can stamp a spendable TokenX page. Other regions are photocopy rooms. Photocopies are faster to walk to and may be minutes behind. Putting a second notary on the same page without a merge rule is two legal stamps on different numbers.
+
+DNS is the change-of-address card you mail to the phone book. The phone book’s clerks (resolvers) keep the old address for the TTL they feel like. Anycast is hanging a new sign on the highway; cars already on the off-ramp still arrive at the closed office. Fencing is taking the notary stamp away from the closed office so those cars cannot notarize anything.
+
+Evacuation is locking the doors while people inside are still signing. Their papers are in-flight: you catalog them as UNKNOWN, you do not photocopy a second stamp at the new office and call it lossless.
+
+Retain: **one write authority per spendable key, replicas and caches derived with a lag bound, DNS is not a fence, dual-write needs a conflict rule, failover is fence-then-drain, sovereignty can forbid the healthy region, in-flight work survives the flip.**
+
+</MentalModel>
+
+<ArchitectureDiagram title="Single-region ledger authority, regional caches, DNS delay, and fenced evacuation" chart={"flowchart LR\n  CLI[Clients] --> DNS[DNS or anycast]\n  DNS --> GA[Region A gateway]\n  DNS --> GB[Region B gateway]\n  GA --> LED[(Authoritative write-region ledger)]\n  GA --> CA[(Derived region A cache)]\n  GB --> CB[(Derived region B cache)]\n  LED -. async replica .-> REPL[(Region B replica)]\n  REPL --> CB\n  GB -->|RYW or miss| LED\n  CTRL[Failover control] --> FENCE[Fence epoch]\n  FENCE -. reject old writer .-> OLD[Fenced region A]\n  DNS -. TTL cache delay .-> STALE[Stale resolver]\n  EVAC[Region evacuation] -. abandon in-flight .-> GB\n  ADS[(Per-region click logs)] --> DASH[(Derived dashboards)]"}>
+
+**Authoritative state:** the TokenX ledger (and unique event ids) in the **write region** that is allowed to own those keys; each region’s **billed-click log** for clicks observed there. **Derived:** regional balance/metadata caches, B’s replica, operator dashboards aggregated from regional logs. **Consistency boundary:** a spendable debit commits only at the fenced ledger in the write region. Replica apply position is freshness, not a second wallet. Dashboard totals are not invoices. Solid edges are admitted reads/writes and RYW/miss forward to authority. Dashed edges are **async** replication, **reject** of a fenced old writer, **DNS cache** after a flip, and **abandoned in-flight** work during evacuation. Recovery is fence A, promote only keys B may legally hold, treat in-flight as UNKNOWN, rebuild caches with a stale bound, and replay ad aggregates from surviving regional logs—not from DNS.
+
+<ArchitectureWalkthrough
+  title="Controls that actually move traffic versus controls that fence data"
+  stages={[
+    { name: "Route", owner: "DNS, anycast, app gateway", state: "Which region receives the TCP connection", boundary: "Routing is not commit. TTL and sticky cookies outlive the incident.", failure: "Treating a DNS flip as completed failover.", recovery: "Withdraw anycast, drain at the gateway, wait client timeouts; still fence storage." },
+    { name: "Replicate", owner: "Async replica plus caches", state: "Apply lag and cache TTL", boundary: "Lag is RPO if you cut over now. Cache is non-spendable.", failure: "Debit success from a stale regional cache.", recovery: "Forward RYW to the write region or fail closed on spendable reads." },
+    { name: "Fence", owner: "Epoch or lease at the ledger", state: "One writer per key", boundary: "Old region commits must fail even if clients still arrive.", failure: "Two write regions: split brain.", recovery: "Reject old epoch; reconcile UNKNOWN by transfer_id. Detection details in the failure-detection lesson." },
+    { name: "Evacuate", owner: "Incident commander plus router", state: "Draining A, serving B where lawful", boundary: "Sovereignty can keep EU keys in EU even if B is US and healthy.", failure: "Copying EU ledger bytes to US to hit RTO.", recovery: "EU standby or read-only. Ads: keep per-region logs; aggregate what policy allows." }
+  ]}
+/>
+
+</ArchitectureDiagram>
+
+<RealExamples title="TokenX one-writer ledger; ads per-region logs">
+
+**TokenX.** Place the ledger primary in one region per sovereignty class (for example `eu-central` for EU wallets, `us-east` for US wallets). Other regions get **read replicas** and **caches of metadata and non-spendable displays** with an explicit bound (“as of up to 5 s”). A debit from a user whose packet landed in the wrong region **forwards** to the write region or rejects. Do not dual-write the wallet. Notifications can originate anywhere. After loss of the write region, RPO is mirror lag; RTO includes fence, DNS/anycast, and in-flight UNKNOWN. If the only other region is the wrong legal venue, the product goes **read-only** rather than illegal. Session read-your-writes uses a position token, not “the nearest cache.”
+
+**Ad Click Aggregator.** Collectors in each region append to a **regional billed log** (acks policy from the delivery lesson). A viral campaign in APAC does not have to write US disks on the click path. A job copies or aggregates into a global derived store for dashboards with a lag SLO (illustrative 30–120 s). Finance still joins regional logs by `click_id`. Dual-produce during failover is expected; **dedupe** at the aggregator. Do not promote a dashboard counter to an invoice because it was visible in two regions.
+
+<FailureScenario
+  title="Match the region failure to the control"
+  prompt="Region A is partitioned. DNS TTL is 60 s. Ledger lag to B is 45 s p99. Some EU keys must not leave A’s EU pair. Ads collectors in A are still up."
+  choices={[
+    { label: "Flip DNS to B and keep A writable until TTL expires so in-flight debits finish", impact: "Split brain: A and B both commit. TokenX double-spend. DNS delay is extra, not a drain plan.", recovery: "Fence A immediately. Let in-flight A calls fail. Reconcile UNKNOWN on event_id." },
+    { label: "Fence A, promote B only for keys B may legally hold, leave EU keys read-only, keep ads collectors appending locally", impact: "Spendable US keys resume on B with ~45 s RPO. EU money is unavailable for writes. Ads in A continue until A dies; those bytes need the local log or a mirror.", recovery: "This matches sovereignty, RPO-as-lag, and per-region ingest." },
+    { label: "Active/active dual-write TokenX to A and B with last-write-wins on wall clocks", impact: "Two balances, clock skew chooses the money. Not a CRDT, not conservation.", recovery: "Single write region. If you truly need multi-master, specify a debit merge protocol—do not LWW." },
+    { label: "Serve spendable balances from the 5 s cache in B and call it linearizable failover", impact: "Users spend a stale number. Failover was a cache read, not a fenced primary.", recovery: "Caches stay labeled stale. Spendable reads go to the fenced leader or wait the session token." }
+  ]}
+/>
+
+</RealExamples>
+
+<InterviewTraps title="Geography slogans that fail at IC6">
+
+- **“Active/active means both regions write everything.”** It often means both **serve**. Writes still need an owner or a conflict rule.
+- **“Dual-write to two regions so we cannot lose data.”** Without a conflict rule you **create** two histories. Loss window versus fork: pick one and name it.
+- **“DNS TTL is 60 s so failover is 60 s.”** Resolver caches, sticky sessions, and in-flight RPCs are longer. DNS is not fencing.
+- **“Anycast is instant and safe.”** It can be faster to move packets. The old primary still needs a fence.
+- **“We are multi-region so RPO is zero.”** Async replica lag **is** RPO at cutover. Sync cross-region commit is a latency tax, not magic.
+- **“Safe failover.”** Failover is fenced promotion plus UNKNOWN in-flight. It is not instant and not lossless.
+- **“Read-your-writes because the user hit our global anycast.”** Anycast does not stick a session to the WAL that committed.
+- **“CRDT wallets.”** Say how two debits merge without double-spend, or do not say CRDT.
+- **“Evacuate, then replay all HTTP logs into the new region.”** That mints transfers that never committed. Replay committed journals only.
+- **“CAP says we pick AP for payments during a partition.”** Payments fail closed without a write quorum; see [CAP](/learn/cap-and-consistency-models). Availability of a labeled cache is a different operation.
+- **“Move EU data to US for RTO.”** Sovereignty can make the healthy region unusable.
+
+</InterviewTraps>
+
+<Tradeoffs title="Latency, legality, conflict, and recovery time">
+
+- **One write region versus multi-master:** one writer has no merge and a geographic RTT for remote users; multi-master has locality and needs a conflict rule you will operate in anger.
+- **Async versus sync replication:** async keeps local debit latency and sets RPO to lag; sync shrinks RPO toward the inter-region RTT and fails or stalls when the link dies (CAP on the write).
+- **DNS versus anycast versus app epoch:** DNS is simple and cached; anycast is faster to withdraw and harder to debug; app/storage epochs actually fence.
+- **Sticky sessions versus token-forward:** stickiness is operationally easy and wrecks evacuation; tokens port across regions if lineage matches.
+- **Regional caches:** they make [read-heavy](/learn/scaling-read-heavy-services) serving cheap and they lie about money if you let them.
+- **Per-region ad logs versus one global log:** regional logs keep ingest available under a cross-ocean outage and cost a shuffle/aggregate; a global log orders more keys in one place and concentrates the hot campaign plus sovereignty issues.
+- **RTO versus sovereignty:** the legal constraint can dominate the latency graph. Read-only is an allowed outcome.
+
+Link [backup/DR](/learn/backup-restore-and-disaster-recovery) for restore throughput math and [failure detection](/learn/failure-detection-and-recovery) for heartbeat-versus-fence. Do not paste Raft into this answer.
+
+</Tradeoffs>
+
+<KnowledgeCheck
+  question="TokenX replicates asynchronously from region A to B with p99 lag 45 s. You fence A and promote B. What is true?"
+  options={[
+    "Failover is instant and lossless because both regions were active",
+    "RPO is at least the lag you cut over with: about 45 s of A-committed writes may be missing on B; in-flight RPCs are UNKNOWN",
+    "DNS TTL of 60 s guarantees every client reaches B within 60 s, which completes RTO",
+    "Regional caches in B are now linearizable spendable balances because the primary moved"
+  ]}
+  correct={1}
+  explanation="Async lag at cutover is the recovery point. Active serving is not zero RPO. DNS caches overshoot TTL. Caches remain derived; fencing does not linearize a cache read."
+/>
+
+<KnowledgeCheck
+  question="An engineer proposes active/active TokenX: every debit dual-writes US and EU with last-write-wins on wall clocks, plus a 30 s DNS failover. EU wallets must not leave the EU. What is the defect?"
+  options={[
+    "LWW dual-write on spendable keys has no conservation story, DNS is not a fence, and EU bytes must not become US bytes just to hit RTO",
+    "The only defect is DNS TTL; anycast would make dual-write linearizable",
+    "CRDTs are implied by dual-write, so balances commute automatically",
+    "Ad click billed logs must use the same dual-write LWW rule or invoices fork"
+  ]}
+  correct={0}
+  explanation="Money needs one writer or a specified merge that preserves conservation—not LWW. Anycast still needs a fence. CRDTs are not implied. Ads can dual-produce with click_id dedupe; that does not license LWW on ledgers. Sovereignty independently forbids silent US copies of EU wallets."
+/>
+
+<ScenarioCheck
+  scenario="Region A (US) is on fire. TokenX US wallets replicate async to US-west (lag 12 s) and illegally also to EU (lag 3 s) ‘for RTO.’ Ads collectors in A still have 8,000 in-flight click posts. An engineer flips DNS (TTL 60 s) to EU, leaves A writable ‘until connections drain,’ and serves spendable balances from the EU cache. Product legal requires US wallet rows stay in the US."
+  question="What should you do instead?"
+  options={[
+    { label: "Keep the DNS flip to EU: 3 s lag beats 12 s, so RPO is better and sovereignty is a paper policy.", feedback: "You moved spendable US data to the EU and kept A writable. That is a compliance incident plus split brain." },
+    { label: "Fence A, promote US-west for US wallets, treat 12 s lag as RPO, abandon or UNKNOWN the in-flight work, stop serving spendable numbers from caches, and let ads collectors finish only into surviving regional logs with click_id dedupe.", feedback: "Lawful writer, named RPO, storage fence, derived caches, per-region ads. DNS can follow; it is not the fence." },
+    { label: "Dual-write remaining in-flight TokenX HTTP bodies into US-west and EU so nothing is lost.", feedback: "Replaying request logs mints UNKNOWN as committed and forks two regions. Committed journals only." },
+    { label: "Wait 60 s for DNS TTL, then promote whatever replica has the highest cache hit rate.", feedback: "TTL is not drain, cache hit rate is not WAL position, and A may still be writing." }
+  ]}
+  correct={1}
+  explanation="The violated assumptions are ‘nearest low-lag replica wins,’ ‘DNS drain fences the old primary,’ ‘cache equals ledger,’ and ‘in-flight HTTP is a journal.’ Promote the lawful US replica, fence A, name the 12 s RPO, and keep ads on regional logs."
+/>
+
+<InterviewAnswer>
+
+“I treat a region as a failure domain and a legal boundary. TokenX spendable writes have one write region per sovereignty class—not dual-write, not last-write-wins, not a CRDT I did not specify. Other regions get replicas and caches with a stale bound; spendable read-your-writes forwards to authority or waits a position token. Ads ingest is the opposite: per-region billed logs, then derived aggregates, with click_id dedupe if failover dual-produces. Active/active without a conflict rule is a bug. Failover is not instant: async lag is RPO, DNS TTL plus resolver cache plus in-flight RPCs are RTO floors, and anycast still does not fence the old primary. I fence the epoch first, drain, mark in-flight as UNKNOWN, and I will go read-only rather than copy EU money to US. Split brain is two writers, not a health-check failure. Raft details stay in the consensus lesson; here I name the owner, the lag, the fence, and what must not leave the region.”
+
+</InterviewAnswer>

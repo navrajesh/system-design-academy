@@ -1,0 +1,227 @@
+---
+title: "Caching Patterns and Invalidation"
+description: "Place CDN, application, and database caches as derived views, and choose fill, TTL, and invalidation so spendable state never pretends to be authoritative."
+module: 2
+moduleTitle: "Scalability"
+order: 3
+duration: 40
+difficulty: "Intermediate"
+tags:
+  - caching
+  - invalidation
+  - TTL
+  - stampede
+  - CDC
+objectives:
+  - Place CDN, application, and database buffer caches as separate derived layers with different owners
+  - Choose cache-aside, read-through, write-through, or write-behind and name the durability window of each
+  - Fence stampede, negative-cache, and version-skew races without claiming linearizable reads
+  - Keep TokenX spendable balances off the cache path while Ad Click dashboards stay explicitly derived
+---
+
+<BigPicture title="A cache is a photocopy with an expiry policy">
+
+Caching is **derived state** placed closer to a reader so the **authoritative** store does less work. The photocopy can be at a CDN edge, in an application Redis, or in a database buffer pool. Those three layers do not share a coherence protocol. Invalidating Redis does not flush Postgres pages. Purging a CDN does not fence an in-flight cache-aside fill.
+
+This lesson deepens the cache-aside path already introduced in [Scaling read-heavy services](/learn/scaling-read-heavy-services). That lesson showed the version-41 late fill after a valid invalidation. Here the same race is a **missing fence**, not a missing DELETE, and it is joined by write-through, write-behind, CDC, TTL jitter, stampede, negative caching, and flush herds. Consistency vocabulary stays in [Consistency models](/learn/consistency-models). Replica lag stays in [Replication and failover](/learn/replication-and-failover). TokenX unique writes stay in [Idempotency and deduplication](/learn/idempotency-and-deduplication). Admission when the cache is down stays in [Graceful degradation](/learn/graceful-degradation).
+
+Never claim “cache plus invalidate is linearizable.” Linearizability would require a single real-time order across cache and primary. A DELETE is a notification. A TTL is a freshness *budget*. A version fence is a compare. None of those is a consensus log.
+
+</BigPicture>
+
+<UnderTheHood title="Layers, fill paths, eviction, then fences">
+
+### Three layers, three owners
+
+- **CDN:** HTTP cache at the edge, keyed by URL plus Vary headers. Owner is Cache-Control / surrogate-key policy. Good for immutable bytes and public metadata. Bad for Authorization-personalized TokenX balances. A purge is best-effort across POPs; some edges serve the old object until their copy expires or the purge arrives.
+- **Application cache:** Redis or memcached beside the API. Owner is your fill and invalidation code. This is where cache-aside, stampede control, and version fences live.
+- **Database buffer cache:** pages the engine already read. Owner is the storage engine. You do not TTL it from the API. A “cache flush” at this layer is an operational incident, not a product invalidation.
+
+Treat them as a cascade of derived views. A hit at the CDN never consulted Redis. A Redis hit never consulted the buffer pool. The **primary database / ledger** remains authoritative.
+
+### Fill paths and who can lose a write
+
+**Cache-aside:** the app looks up the key, on miss reads the primary (or a replica—name which), then SET. The app owns coherence. Miss storms become origin storms.
+
+**Read-through:** a cache library loads on miss. Same race as cache-aside unless the library also owns a singleflight lock and a version compare. “Read-through” is not a fence.
+
+**Write-through:** the writer updates the cache and the database as one logical write. If those are two commits, you still have a dual-write: a crash between them leaves cache and primary split. If they share one transaction with a transactional cache (rare), you bought a specific product capability—name it. Write-through still does not make *readers* linearizable if other writers use a different path.
+
+**Write-behind (write-back):** the writer updates the cache (or a memory buffer) and **flushes later**. Durability equals “the backing store has committed,” not “Redis accepted SET.” The **loss window** is every acknowledged write still sitting in the buffer when the process dies. TokenX spendable balances must not use write-behind. Ad Click **dashboard rollups** may, if finance never bills from that buffer.
+
+<ExecutionTimeline
+  title="Write-behind loss window versus write-through dual-write"
+  steps={[
+    { title: "Client ack", detail: "Write-behind: the API SETs Redis and returns 200. The primary has not seen the row.", state: "Derived cache is ahead of the authority. The loss window is open.", failure: "Process crash or Redis restart before flush: the client has a success the ledger cannot replay." },
+    { title: "Flush", detail: "A flusher drains the buffer into the primary. Until that COMMIT, the write is not durable.", state: "Authority catches up for keys the flusher completed.", failure: "Partial flush plus retry without identity duplicates derived rows; money paths should not be here at all." },
+    { title: "Write-through split", detail: "Write-through that COMMITs the database then SETs cache can still lose the SET. Readers miss and refill.", state: "Authority is the DB. Cache is behind or empty, not ahead.", failure: "SET-then-COMMIT write-through can serve a value the DB rolled back." },
+    { title: "Fence", detail: "Fills carry a monotonic row version or commit timestamp. SET is rejected if the cache already holds a newer version.", state: "Cache remains derived; stale fills are detectable.", failure: "TTL-only repair still serves the stale body until expiry." }
+  ]}
+/>
+
+### Eviction, TTL jitter, and stampede
+
+**LRU** drops the least recently used key under a byte cap. It is a capacity policy, not a freshness policy. A hot key that is **wrong** stays hot.
+
+**TTL** is the freshness budget. Aligned TTLs (every key set with `EX 60` at the same instant after a deploy or a flush) expire together: a **thundering herd**. **TTL jitter** adds a random extra interval (illustrative: 60 s ± 20%) so expiry spreads.
+
+**Stampede** is many misses on one key while the origin is still computing. Defenses:
+
+- **Singleflight / request coalescing:** one in-flight fill per key; waiters share the result. Bounds origin concurrency to about one per missing key, not one per waiter.
+- **Probabilistic early expire** (XFetch-style): as remaining TTL shrinks, a reader *may* refresh before expiry, with probability rising toward 1. Spreads refresh, not just expiry.
+- **Per-key lock with wait:** similar to singleflight; a crashed lock holder needs a lease, not an infinite mutex.
+
+A **flush** (`FLUSHALL`, wildcard DEL, CDN purge-all) is a planned stampede. Either disable traffic, pre-warm, or rate-limit fills. Hit rate is not constant across a flush—the read-heavy lesson’s interactive envelope is the capacity warning.
+
+### Coherence: invalidate is not a fence
+
+The version-41 sequence: Reader A misses, reads primary v41, pauses. Writer B commits v42 and DELETEs the cache key (nothing to delete). Reader A SETs v41. The invalidation already happened. **Deepening the defense:**
+
+- **Version fence:** SET only if the new version is greater than the stored version (or the key is absent). Delayed v41 loses to v42, and loses to an empty key that a CDC consumer marked with a tombstone version.
+- **Single ordered owner:** CDC from the primary’s commit log applies deletes or versioned puts in commit order. Readers may still race the CDC lag; the fence is “CDC is the only filler” plus versions, not “DELETE arrived.”
+- **Read-your-writes:** after a write, the writer must not refill from an asynchronous replica that still shows v41. Replica lag is a different derived view ([replication](/learn/replication-and-failover)).
+- **Delayed double-delete** shrinks the window; it is not a proof.
+
+**CDC versus TTL versus version fence:** TTL is a max-staleness budget with no invalidation channel. CDC is an invalidation channel with a lag budget (seconds of binlog delay, not zero). Version fence is a compare that makes late fills safe to reject. Use them together: TTL as a backstop if CDC dies; versions so a live CDC and a live reader cannot resurrect v41.
+
+**Negative caching:** store “miss” for a short TTL so absent keys do not hammer the origin. Danger: cache “wallet not found” then the wallet is created; the negative entry hides it until TTL. Keep negative TTLs short (illustrative 1–5 s) and invalidate on create.
+
+Do not cache **spendable TokenX balances**. A 200 from Redis is not a ledger read. Metadata, static token descriptions, and historical charts may cache. Ad Click **billed facts** stay in the log; dashboards are derived and may be stale by a named lag.
+
+<Calculation label="Stampede and jitter, illustrative catalog">
+
+Assumptions: 50,000 reads/s for one hot product key during a sale; origin fill = 20 ms CPU+DB; TTL = 60 s with no jitter; 200 API workers.
+
+Without coalescing, a simultaneous expiry can issue up to 200 concurrent origin fills for the same key (one per worker that misses before SET). Origin extra load ≈ 200 / 0.020 s = 10,000 fills/s peak in a burst, not 1/60 s.
+
+Singleflight: origin fills for that key drop to ~1 in flight; waiters block on the first fill. Origin extra ≈ 50 fills/s if the key is always hot and TTL is 60 s (one refresh per TTL), plus jitter spread.
+
+Jitter 60 s ± 12 s: expiry density over 24 s instead of one instant. Flush of 1e6 keys with 1% still hot: 10,000 keys miss at once; without coalescing and admission, the primary sees a step function equal to the old cache-hit traffic.
+
+Write-behind buffer of 50,000 pending clicks × 200 B = 10 MB. Process kill loses those 10 MB of **derived** dashboard increments. If those were billed facts, that is an integrity incident; they must not have been write-behind.
+
+</Calculation>
+
+<InteractiveCalculation mode="cache-load" title="Hit rate versus origin load after a cold flush" />
+
+</UnderTheHood>
+
+<MentalModel title="Photocopy machines with dated stamps">
+
+The primary is the signed original in a vault. CDN, Redis, and the DB buffer pool are three photocopy rooms that do not call each other when they make a copy. A clerk shouting “throw away your copies” (invalidate) does not stop a runner who already photocopied yesterday’s page from sliding it into the drawer afterward. A date stamp on the page (version) does: the drawer refuses older stamps. A timer on the drawer (TTL) eventually throws the page out even if no clerk shouted. A runner who writes on the photocopy and plans to file the original tomorrow (write-behind) can lose the paper in the rain.
+
+Retain: **authority is the primary; every cache is derived; write-behind has a named loss window; invalidate without a version fence can resurrect stale fills; stampede needs coalescing and jitter; spendable money is not a cache key.**
+
+</MentalModel>
+
+<ArchitectureDiagram title="Derived caches, primary authority, and invalidation lag" chart={"flowchart LR\n  CLI[Clients] --> CDN[CDN edge]\n  CDN -->|hit policy| API[API cache-aside]\n  API --> APP[(Derived Redis)]\n  API -->|miss plus version| DB[(Authoritative primary)]\n  DB --> BUF[DB buffer pool]\n  DB -. commit stream .-> CDC[CDC consumer]\n  CDC -. versioned delete or put .-> APP\n  API -->|read-your-writes| DB\n  WBH[Write-behind buffer] -. async flush .-> DB\n  WBH -. crash loss window .-> DROP[Uncommitted drop]\n  APP -. stampede miss .-> API\n  CDN -. purge or TTL .-> API"}>
+
+**Authoritative state:** the primary database / TokenX ledger. **Derived state:** CDN objects, Redis entries (including negative entries), DB buffer pages, dashboard write-behind buffers, CDC consumer offsets. **Consistency boundary:** a write is durable at primary COMMIT. Redis SET is not COMMIT. CDC apply trails the binlog by a lag bound. CDN purge is best-effort per POP. Solid edges are in-policy sync reads and primary writes. Dashed edges are CDC (async after commit), write-behind flush, crash loss, stampede refill, and CDN expiry/purge. Recovery is: rebuild Redis from the primary or from CDC, reject fills with older versions, fail closed on spendable reads if the ledger is down, and treat write-behind drops as lost *derived* work only.
+
+<ArchitectureWalkthrough
+  title="Who may fill, who may delete, what is durable"
+  stages={[
+    { name: "CDN", owner: "Edge HTTP cache", state: "URL-keyed objects with Cache-Control", boundary: "Public or explicitly varied responses. Purge is per-POP best-effort.", failure: "Caching an Authorization-personalized balance at the edge.", recovery: "private, no-store on money; purge plus short TTL on metadata." },
+    { name: "App cache", owner: "API plus Redis", state: "Versioned values and optional negatives", boundary: "Derived. Fill must carry a version. Negative TTL is short and invalidated on create.", failure: "Late v41 SET after v42 delete; FLUSHALL stampede.", recovery: "Version compare, singleflight, jitter, admission on miss." },
+    { name: "Primary", owner: "Database or ledger", state: "Committed rows", boundary: "Durability and unique ids live here. Replicas are derived.", failure: "Filling Redis from a lagging replica after a write.", recovery: "Read-your-writes from primary; CDC from the commit log." },
+    { name: "CDC", owner: "Binlog consumer", state: "Offsets plus applied versions", boundary: "Commit-order invalidation with lag. Not linearizable with concurrent cache-aside fills unless fills stop.", failure: "Treat CDC catch-up as a linearizable read fence for clients who still fill on miss.", recovery: "Either CDC is the only writer to Redis, or fills still version-compare." },
+    { name: "Write-behind", owner: "Flush worker", state: "Pending derived mutations", boundary: "Loss window until primary COMMIT. Forbidden for spendable balances and billed click facts.", failure: "Ack 200 from Redis for a TokenX debit.", recovery: "Remove the path. Flush dashboards only; rebuild from billed facts." }
+  ]}
+/>
+
+</ArchitectureDiagram>
+
+<RealExamples title="TokenX metadata caches; Ad Click dashboards stay derived">
+
+**TokenX.** Cache token names, icons, and historical price charts at CDN + Redis with TTL jitter (illustrative 30–120 s) and a version from the metadata table. **Do not cache spendable balances** for debit decisions. A portfolio UI may show a replica or cache number only if the product labels it non-spendable and the debit path still hits the ledger. Write-through of metadata is acceptable if the writer COMMITs the primary first, then SETs Redis with the new version; a lost SET is a miss, not a phantom credit. CDC from the metadata table repairs Redis; it does not make a cached balance safe.
+
+If Redis is down, metadata reads go to the primary with [admission](/learn/graceful-degradation) so origin load is capped. Debits never “fail open” to the last cached number.
+
+**Ad Click Aggregator.** Billed click facts append to a durable log ([Kafka delivery](/learn/kafka-delivery-and-failure)). Campaign dashboards are **derived**: cache-aside of aggregate counters with TTL 5–15 s, or write-behind into Redis with a flusher to an OLAP store. Name the loss window: a 10 s flush interval can lose ~10 s × click rate of **dashboard increments**, not invoices. Hot campaigns stampede one key—singleflight that key, do not FLUSHALL at midnight. Negative-cache unknown `campaign_id` for 2 s so scanners cannot hold the primary; invalidate on campaign create. CDN for public campaign pages; never CDN-cache the billed invoice API.
+
+<FailureScenario
+  title="Pick the cache failure and the actual bound"
+  prompt="Authority is the primary or billed log. Caches are photocopies. Choose a failure and name what was lost."
+  choices={[
+    { label: "Late v41 fill after invalidate", impact: "Readers see inventory or metadata regress until TTL. Spendable debit must not have used this key.", recovery: "Version fence or CDC-only fills. Delayed double-delete is not the proof." },
+    { label: "Write-behind crash", impact: "Every ack still in the buffer is gone. Fine for dashboards if billed facts remain in the log. Catastrophic if the buffer was TokenX money.", recovery: "Rebuild derived views from the authority. Remove write-behind from money and billed facts." },
+    { label: "Aligned TTL plus flush", impact: "Origin sees roughly the former cache-hit QPS. Tail latency explodes; replicas lag.", recovery: "Jitter, singleflight, miss admission, pre-warm. Do not flush as a coherence strategy." },
+    { label: "Negative cache of a new wallet", impact: "Create succeeds at the ledger; lookups return not-found until negative TTL.", recovery: "Delete the negative key in the create path; keep negative TTL short." },
+    { label: "CDN hit of a personalized balance", impact: "User B may receive user A’s bytes if the cache key omitted Authorization. This is a leak, not staleness.", recovery: "no-store for private money; vary on the correct headers only for public metadata." }
+  ]}
+/>
+
+</RealExamples>
+
+<InterviewTraps title="Cache slogans that fail at IC6">
+
+- **“We invalidate, so reads are linearizable.”** Invalidation is asynchronous relative to in-flight fills. Linearizability needs a single order; you have a photocopy.
+- **“Write-through means the cache is durable.”** Durability is the primary COMMIT. Two-phase SET+COMMIT is a dual-write.
+- **“Write-behind is just faster write-through.”** It is a **loss window**. Say how many milliseconds or how many buffered bytes you can lose.
+- **“Redis is the source of truth for balances.”** Then you built a ledger in a cache engine without unique-id transactions. TokenX must not.
+- **“Hit rate is 99%, so we are scaled.”** Until flush, deploy, or expiry alignment. Origin must survive 0% hit for a bound interval.
+- **“Read-through will handle stampede.”** Only if it coalesces. The name of the library is not singleflight.
+- **“Negative caching is free.”** It caches absence. Creates must invalidate it.
+- **“CDC makes the cache correct.”** CDC makes the cache **repairable in commit order** after lag. Concurrent cache-aside fills still need versions, or CDC must be the only writer.
+- **“The DB buffer pool is my application cache.”** You do not own its keys, TTLs, or invalidation from the API.
+- **“Copy the version-41 story and stop.”** DELETE-then-SET ordering is the setup; the **fence** is the lesson.
+
+</InterviewTraps>
+
+<Tradeoffs title="Freshness, loss windows, and origin blast radius">
+
+- **Long TTL versus short TTL:** hit rate and origin offload versus staleness. Jitter is cheap; it does not reduce max age, it spreads expiry.
+- **Explicit invalidation versus TTL-only:** invalidation is fresher and racy; TTL is simpler and bounded-stale. Combine: CDC + version + TTL backstop.
+- **Cache-aside versus write-through:** aside keeps the primary as the only durable write path; through adds a dual-write unless one transaction owns both.
+- **Write-behind versus synchronous primary:** latency and loss versus latency and durability. Forbidden for spendable TokenX and billed clicks.
+- **Singleflight versus thundering origin:** waiters add tail latency on the first fill; uncoalesced misses add origin overload. For hot keys, waiting is cheaper than 200 identical queries.
+- **Negative cache TTL:** longer protects origin from scanners; shorter reduces hide-after-create. Invalidate on create either way.
+- **CDN versus app cache:** CDN wins for public immutable bytes; app cache wins for keyed, authorized, versioned objects. Neither is a ledger.
+- **Replica fill versus primary fill:** replicas add read capacity and lag; filling a cache from a replica can plant v41 after v42 committed on the primary.
+
+Capacity versus freshness is the product knob. Integrity of money is not.
+
+</Tradeoffs>
+
+<KnowledgeCheck
+  question="A writer COMMITs product v42 and DELETEs the Redis key. A reader that started at v41 then SETs Redis. Inventory must not regress. Which mechanism actually fences the late fill?"
+  options={[
+    "A longer TTL, because the invalidation already deleted the stale value",
+    "A monotonic version on SET that rejects any fill older than the stored or tombstoned version",
+    "Switching from cache-aside to read-through so the library owns linearizable reads",
+    "Flushing Redis on every write so late fills find an empty namespace and give up"
+  ]}
+  correct={1}
+  explanation="The DELETE may already have happened before the late SET. Versions make that SET detectable. Longer TTL preserves the regression. Read-through without a compare is the same race. Flushing is a stampede, not a fence."
+/>
+
+<KnowledgeCheck
+  question="An Ad Click dashboard uses write-behind: increment Redis, flush to OLAP every 10 s. Finance bills from the Kafka click log. The Redis process is killed. What was lost?"
+  options={[
+    "Billed facts for those 10 s, because Redis was in front of Kafka",
+    "Up to ~10 s of derived dashboard increments; billed facts remain in the log if produce was acked",
+    "Nothing, because write-behind is durable once Redis returns SET",
+    "Linearizability of campaign counters, which Kafka will rebuild automatically from Redis"
+  ]}
+  correct={1}
+  explanation="Write-behind’s loss window is unflushed derived state. Invoices must not depend on it. Redis SET is not primary COMMIT, and Kafka does not treat Redis as an authority to rebuild from."
+/>
+
+<ScenarioCheck
+  scenario="TokenX proposes serving POST /debits from a write-through Redis balance cache with 50 ms TTL and CDC invalidation, claiming this is linearizable if every writer also DELETEs the key. Spendable money must not move on a photocopy. Metadata already uses versioned cache-aside safely."
+  question="What should you ship for debits versus metadata?"
+  options={[
+    { label: "Ship the proposal: cache + invalidate + 50 ms TTL is linearizable enough for money at this TTL.", feedback: "TTL is a staleness budget, not a ledger. CDC lag and late fills still exist. A debit success must be a ledger COMMIT." },
+    { label: "Debits read and write the ledger only, with unique event ids. Metadata keeps versioned cache-aside plus CDC. Never write-behind or cache-aside a spendable balance.", feedback: "The violated claim is that derived Redis plus DELETE is a linearizable spendable register. Photocopies are for metadata." },
+    { label: "Use write-behind for debits to cut ledger QPS, and keep CDC as the durability path.", feedback: "Write-behind acks before COMMIT. CDC cannot replay money that Redis lost." },
+    { label: "Fill debit balances only from the primary, but still SET Redis without versions because CDC will catch up within 50 ms.", feedback: "CDC lag is not a fence for in-flight fills, and Redis still should not be on the debit decision path." }
+  ]}
+  correct={1}
+  explanation="Spendable balances are authoritative ledger rows. Caching patterns apply to metadata and to Ad Click dashboards with a named lag. Cache plus invalidate is not linearizable and is the wrong store for money."
+/>
+
+<InterviewAnswer>
+
+“I treat every cache as derived. CDN, application Redis, and the database buffer pool are three photocopy layers with different owners; invalidating one does not flush the others. The primary or ledger is authoritative. Cache-aside and read-through both need a version fence because a DELETE can finish before a late v41 SET. Write-through is still a dual-write unless one transaction owns both. Write-behind has a loss window until the backing store commits—I will not put TokenX spendable balances or billed ad clicks there; dashboards may, if finance uses the log. TTL is a max-age budget; jitter and singleflight stop aligned expiry and stampedes; a flush is a planned origin flood. Negative cache must die on create. CDC repairs in commit order after lag; it does not make cache plus invalidate linearizable. Money is a ledger read. Everything else names its staleness.”
+
+</InterviewAnswer>
