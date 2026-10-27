@@ -33,8 +33,8 @@ Suppose write `W1` completes before read `R1` begins. A linearizable register re
 Other useful contracts are weaker but intentional:
 
 - **Causal consistency:** if B was created after observing A, anyone who sees B must also see A. Concurrent unrelated writes may appear in different orders.
-- **Read-your-writes:** a session sees its prior writes, often by carrying a minimum log position.
-- **Monotonic reads:** a session never goes backward to an older version.
+- **Read-your-writes:** a session sees its prior writes by carrying a token of shard, epoch or timeline, and commit position—not a bare offset.
+- **Monotonic reads:** a session never goes backward to an older version on that same timeline.
 - **Monotonic writes:** one client's writes apply in issue order.
 - **Bounded staleness:** a read is at most a stated time or version distance behind.
 - **Eventual consistency:** absent new writes and failures, replicas converge; it says nothing about the interim order or duration unless bounded separately.
@@ -42,10 +42,10 @@ Other useful contracts are weaker but intentional:
 <ExecutionTimeline
   title="A TokenX transfer followed by a balance read"
   steps={[
-    { title: "Commit", detail: "The ledger leader commits transfer T at log position 884 and returns that position with the transfer ID.", state: "Authoritative balance includes T.", failure: "The response can be lost after commit, so the client must retry with the same idempotency key." },
-    { title: "Carry a token", detail: "The client sends minimum_position=884 on the next balance read.", state: "The session declares its read-your-writes dependency.", failure: "Dropping the token permits routing to an older replica." },
-    { title: "Qualify a replica", detail: "The router chooses a replica only if its applied position is at least 884.", state: "Replica eligibility is measured by log position, not local clock.", failure: "If no replica qualifies, waiting without a deadline can hang the request." },
-    { title: "Wait or lead", detail: "The router waits within budget or falls back to the leader, then returns an as-of position.", state: "Read-your-writes is preserved.", failure: "Returning from an unqualified replica would show the user's money moving backward." },
+    { title: "Commit", detail: "The ledger leader commits transfer T and returns token {shard S, epoch 42, position 884} with the transfer ID.", state: "Authoritative balance includes T on that log timeline.", failure: "The response can be lost after commit, so the client must retry with the same idempotency key." },
+    { title: "Carry a token", detail: "The client sends the full token on the next balance read, not a bare offset.", state: "The session declares shard, failover lineage, and commit position.", failure: "Dropping epoch or shard identity lets the router compare unrelated logs after failover." },
+    { title: "Qualify a replica", detail: "The router chooses a replica only if it serves shard S, its timeline is epoch 42 or a verified successor, and its applied position is at least 884 on that lineage.", state: "Replica eligibility is identity plus ancestry, then apply wait.", failure: "A replica at 884 on epoch 41 looks numeric-fresh and is still the wrong history." },
+    { title: "Wait or prove authority", detail: "The router waits within budget or falls back to a replica that proves current leadership and has applied the required index.", state: "Read-your-writes is preserved on the token's timeline.", failure: "Sending the read to any node titled leader can return a deposed prefix." },
   ]}
 />
 
@@ -65,17 +65,17 @@ Retain three questions: which operations must agree, which order must be preserv
 
 <ArchitectureDiagram
   title="Per-operation consistency routing"
-  chart={"flowchart LR\n  CLIENT[Client with minimum position] --> ROUTER[Consistency-aware router]\n  ROUTER --> LEADER[(Ledger leader)]\n  LEADER --> LOG[(Committed log)]\n  LOG --> R1[(Replica applied 884)]\n  LOG --> R2[(Replica applied 872)]\n  ROUTER --> R1\n  ROUTER -. reject for session read .-> R2\n  R1 --> VIEW[Balance response as-of 884]\n  LOG --> PROJ[(Eventually consistent history)]\n  PROJ -. lag and rebuild .-> LOG"}
+  chart={"flowchart LR\n  CLIENT[Client token shard epoch pos] --> ROUTER[Consistency-aware router]\n  ROUTER --> LEADER[(Current-authority leader)]\n  LEADER --> LOG[(Committed log epoch 42)]\n  LOG --> R1[(Replica epoch 42 applied 884)]\n  LOG --> R2[(Replica epoch 41 applied 884)]\n  ROUTER --> R1\n  ROUTER -. same offset wrong timeline .-> R2\n  R1 --> VIEW[Balance as-of token]\n  LOG --> PROJ[(Eventually consistent history)]\n  PROJ -. lag and rebuild .-> LOG"}
 >
 
-The leader and committed log own the authoritative balance order. Replicas own local applied positions; the router decides whether those positions satisfy this operation's contract. Wallet history is derived and rebuildable. A lagging replica remains usable for explicitly stale endpoints but is excluded from a read carrying position 884.
+The leader and committed log own the authoritative balance order **on one shard timeline**. Replicas own local applied positions on an epoch; the router matches the client's token for shard, ancestry, then apply. Wallet history is derived and rebuildable. Replica R2 at numeric 884 on epoch 41 is excluded from a session token for epoch 42 position 884.
 
 <ArchitectureWalkthrough
   title="Match state to its consistency boundary"
   stages={[
-    { name: "Command", owner: "Ledger leader", state: "Transfer and balance mutation", boundary: "Strictly serializable commit.", failure: "Authority cannot be proven during partition.", recovery: "Reject the debit and retry after a fenced leader exists." },
-    { name: "Session read", owner: "Consistency router", state: "Client minimum position", boundary: "Read-your-writes and monotonic reads.", failure: "Eligible replicas exceed the latency budget.", recovery: "Fall back to leader or return a declared unavailable result." },
-    { name: "History", owner: "Projection consumer", state: "Wallet feed through an applied offset", boundary: "Eventual with visible as-of version.", failure: "Projection stalls or corrupts.", recovery: "Stop claiming freshness and rebuild from the log." },
+    { name: "Command", owner: "Ledger leader", state: "Transfer and balance mutation", boundary: "Strictly serializable commit under a proven epoch.", failure: "Authority cannot be proven during partition.", recovery: "Reject the debit and retry after a fenced leader exists." },
+    { name: "Session read", owner: "Consistency router", state: "Client token of shard, epoch, and position", boundary: "Read-your-writes on one log timeline.", failure: "Replica has the same offset on another epoch, or a titled leader is deposed.", recovery: "Wait for apply on a successor timeline or read from current authority after ReadIndex/lease plus apply." },
+    { name: "History", owner: "Projection consumer", state: "Wallet feed through an applied offset on a named log", boundary: "Eventual with visible as-of token.", failure: "Projection stalls or is rebuilt onto a new timeline.", recovery: "Stop claiming freshness and rebuild from the current log identity." },
     { name: "Analytics", owner: "Aggregate pipeline", state: "Versioned campaign windows", boundary: "Bounded lateness plus corrections.", failure: "Late data changes a closed result.", recovery: "Publish a higher aggregate version and preserve audit history." },
   ]}
 />
@@ -92,7 +92,8 @@ The leader and committed log own the authoritative balance order. Replicas own l
   title="Explore a consistency mismatch"
   prompt="A user completes a transfer, refreshes, and a replica shows the old balance."
   choices={[
-    { label: "Lost session token", impact: "The router cannot distinguish a sufficiently current replica from one behind the user's commit.", recovery: "Carry the commit position and require read-your-writes or use the leader." },
+    { label: "Lost session token", impact: "The router cannot distinguish a sufficiently current replica from one behind the user's commit, and after failover it cannot validate log lineage.", recovery: "Carry shard, epoch, and commit position; require read-your-writes on that timeline or use current authority." },
+    { label: "Same offset after failover", impact: "A replica at position 884 on the old epoch looks numeric-fresh for token position 884 on the new epoch.", recovery: "Reject until lineage is a successor and the new commit is applied." },
     { label: "Replica stalls", impact: "Clock age may look small while the applied log position stops advancing.", recovery: "Gate eligibility on version progress and remove stalled replicas from freshness classes." },
     { label: "Region partition", impact: "The local region cannot reach authority but may still hold an old copy.", recovery: "Reject balance-authorizing operations; optionally show a clearly labeled as-of view." },
   ]}
@@ -104,10 +105,11 @@ The leader and committed log own the authoritative balance order. Replicas own l
 
 1. **“Serializable means real-time.”** It constrains transaction equivalence; strict serializability additionally respects real-time order.
 2. **“Eventual consistency means a few seconds.”** Eventual has no time bound. State a bounded-staleness SLO and failure behavior if time matters.
-3. **“A leader makes reads linearizable.”** A stale or deposed leader can serve old data unless the read proves current authority or uses a quorum/read-index protocol.
-4. **“Read-your-writes is global consistency.”** It is a session guarantee and says little about what other clients observe.
-5. **“Timestamps establish order.”** Wall clocks skew and can move; use logical or hybrid mechanisms with explicit uncertainty assumptions.
-6. **“One model for the service.”** Classify commands, authorization reads, derived feeds, analytics, and offline exports separately.
+3. **“A leader makes reads linearizable.”** A stale or deposed leader can serve old data unless the read proves current authority (ReadIndex/quorum or a valid lease) and `lastApplied` has reached the required index.
+4. **“Read-your-writes is a scalar LSN.”** Equal numbers from different shard timelines are not the same committed data.
+5. **“Read-your-writes is global consistency.”** It is a session guarantee and says little about what other clients observe.
+6. **“Timestamps establish order.”** Wall clocks skew and can move; use logical or hybrid mechanisms with explicit uncertainty assumptions.
+7. **“One model for the service.”** Classify commands, authorization reads, derived feeds, analytics, and offline exports separately.
 
 </InterviewTraps>
 
@@ -129,22 +131,35 @@ The leader and committed log own the authoritative balance order. Replicas own l
 />
 
 <ScenarioCheck
-  scenario="A TokenX balance replica is at log position 872. The client's completed transfer returned position 884, and the read deadline has 40 ms remaining."
+  scenario="A TokenX replica is at {shard S, epoch 42, position 872}. The client's completed transfer returned {S, 42, 884}, and the read deadline has 40 ms remaining."
   question="What is the most defensible routing behavior?"
   options={[
-    { label: "Return position 872 because the replica is healthy", feedback: "Health does not satisfy the session's declared minimum version." },
-    { label: "Wait within the deadline for 884, then fall back to the leader or fail explicitly", feedback: "This preserves read-your-writes while keeping latency behavior bounded." },
-    { label: "Compare replica wall-clock time with the client", feedback: "Clock proximity does not prove that transfer 884 was applied." },
+    { label: "Return 872 because the replica is healthy", feedback: "Health does not satisfy the session token's applied position on this timeline." },
+    { label: "Wait within the deadline for apply of 884 on epoch 42, then fall back to current authority or fail explicitly", feedback: "This preserves read-your-writes while keeping latency behavior bounded." },
+    { label: "Send the read to any node titled leader without an authority check", feedback: "A deposed leader can serve an old prefix; linearizable and session reads still need current authority plus apply." },
     { label: "Clear the session token after one retry", feedback: "Discarding the dependency silently weakens the user-visible contract." },
   ]}
   correct={1}
-  explanation="Version-aware routing can wait or use an authoritative path, but must not silently return a version older than the client's commit."
+  explanation="Token-aware routing waits for apply on the same timeline or uses a currently authoritative replica, and must not return an older version."
+/>
+
+<ScenarioCheck
+  scenario="Failover moves shard S from epoch 41 to epoch 42. Replica B still serves epoch 41 and reports applied position 884. The client token is {S, epoch 42, position 884}."
+  question="Why is serving B incorrect for read-your-writes?"
+  options={[
+    { label: "884 on B is lower than 884 on the token", feedback: "The integers are equal; the histories differ." },
+    { label: "B's 884 is a different committed prefix; lineage does not match the token's epoch", feedback: "Equal offsets across failovers do not imply the same data. Wait for a successor timeline or current authority." },
+    { label: "Leaders never reuse position numbers, so B cannot exist", feedback: "New timelines often restart or reuse dense LSNs." },
+    { label: "Read-your-writes only requires the same shard id", feedback: "Shard id is necessary but not sufficient without epoch and apply." },
+  ]}
+  correct={1}
+  explanation="After failover, promotion, rollback, or shard movement, validate ancestry before comparing positions."
 />
 
 <InterviewAnswer>
 
 “I define consistency per operation. Linearizability is a real-time guarantee for individual operations; serializability is a valid transaction order, and strict serializability provides both. TokenX transfer authorization needs a current, strictly ordered invariant, while history can be an eventual projection if it exposes an as-of position and never authorizes spending.
 
-For sessions I carry the commit position and route only to a replica that has applied it, otherwise I wait within deadline or use the leader. Causal and bounded-stale models are useful when their weaker observations are acceptable. I do not infer linearizability from quorum arithmetic alone. See [replication and failover](/learn/replication-and-failover), [transactions across boundaries](/learn/transactions-across-boundaries), and [CAP and practical consistency](/learn/cap-and-consistency-models).”
+For sessions I carry a token of shard, epoch, and commit position, and I route only to a replica on that timeline that has applied it; equal offsets on another history are rejected. Otherwise I wait within deadline or use a replica that proves current authority and apply—not a leader title alone. Causal and bounded-stale models are useful when their weaker observations are acceptable. I do not infer linearizability from quorum arithmetic alone. See [replication and failover](/learn/replication-and-failover), [transactions across boundaries](/learn/transactions-across-boundaries), and [CAP and practical consistency](/learn/cap-and-consistency-models).”
 
 </InterviewAnswer>
