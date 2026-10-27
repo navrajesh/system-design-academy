@@ -172,7 +172,7 @@ A completed TokenX transfer may fan out **notification** copies to devices on th
 
 </RealExamples>
 
-<InterviewTraps title="IC6 follow-ups and a defensible rubric">
+<InterviewTraps title="Staff+ follow-ups and a defensible rubric">
 
 ### Questions the interviewer should be able to ask
 
@@ -186,7 +186,7 @@ A completed TokenX transfer may fan out **notification** copies to devices on th
 - What Kafka key orders the fan-out log, and why is celebrity `author_id` a hot key you skip rather than “partition more”?
 - How would you place this in two regions without dual-writing the same inbox key?
 
-### IC6 scoring rubric
+### Staff+ scoring rubric
 
 - **Requirements:** separates posts and graph from inboxes, rank caches, and notifications; excludes unsupported product scope.
 - **Quantification:** converts posts/s and follower degree into inbox writes/s, celebrity spike, read amplification, and storage.
@@ -230,7 +230,7 @@ This design becomes a poor fit when almost every author is above the skip thresh
 
 <ScenarioCheck
   scenario="A candidate proposes: push every post to all followers including a 40-million-follower celebrity; store the fully ranked feed as the only copy of each post; ack Follow only after copying 12 years of history; paginate with SQL OFFSET; and fan-out TokenX ledger balances into follower inboxes so the activity tab shows 'live money.'"
-  question="Which redesign is defensible at IC6?"
+  question="Which redesign is defensible in a staff+ interview?"
   options={[
     { label: "Keep full celebrity push, but compact Kafka so 40 million inbox keys become one.", feedback: "Compaction is not an inbox strategy and does not remove write amplification at publish time." },
     { label: "Hybrid fan-out with celebrity skip, ranking as a derived pass over graph-filtered candidates, watermarked backfill, cursor pagination, and TokenX notifications without copying spendable balances.", feedback: "This matches write amplification, privacy, pagination, freshness versus ranking, and the money-versus-notifications boundary." },

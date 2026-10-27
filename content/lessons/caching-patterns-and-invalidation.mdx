@@ -153,7 +153,7 @@ If Redis is down, metadata reads go to the primary with [admission](/learn/grace
 
 </RealExamples>
 
-<InterviewTraps title="Cache slogans that fail at IC6">
+<InterviewTraps title="Cache slogans that fail in staff+ interviews">
 
 - **“We invalidate, so reads are linearizable.”** Invalidation is asynchronous relative to in-flight fills. Linearizability needs a single order; you have a photocopy.
 - **“Write-through means the cache is durable.”** Durability is the primary COMMIT. Two-phase SET+COMMIT is a dual-write.

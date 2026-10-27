@@ -29,7 +29,7 @@ function Sidebar({ modules, onNavigate }: { modules: ModuleSummary[]; onNavigate
           <span className="grid h-8 w-8 shrink-0 place-items-center rounded-lg bg-white/10 text-xs font-bold">AR</span>
           <span className="min-w-0 flex-1">
             <span className="block truncate">Architecture reference</span>
-            <span className="block text-[10px] uppercase tracking-wider text-slate-500">Phase 2A · Storage</span>
+            <span className="block text-[10px] uppercase tracking-wider text-slate-500">Seven landscapes</span>
           </span>
         </Link>
         <p className="mb-3 px-3 text-[10px] font-semibold uppercase tracking-[0.22em] text-slate-500">Curriculum</p>

@@ -1,0 +1,87 @@
+{
+  "id": "quorum-consensus-crdt",
+  "title": "Quorum store vs consensus log vs CRDT/LWW",
+  "description": "Three repair models. Quorum is not linearizable. CRDTs do not settle TokenX.",
+  "landscape": "consistency",
+  "relatedSlugs": [
+    "cap-and-consistency-models",
+    "consensus-and-leader-election",
+    "conflict-resolution"
+  ],
+  "columns": [
+    {
+      "id": "workload",
+      "label": "Workload"
+    },
+    {
+      "id": "consistency",
+      "label": "Consistency"
+    },
+    {
+      "id": "latency",
+      "label": "Latency"
+    },
+    {
+      "id": "scaling",
+      "label": "Scaling"
+    },
+    {
+      "id": "failure",
+      "label": "Failure"
+    },
+    {
+      "id": "costOps",
+      "label": "Cost / ops"
+    },
+    {
+      "id": "whenNot",
+      "label": "When not"
+    }
+  ],
+  "rows": [
+    {
+      "id": "quorum",
+      "product": "Quorum KV (Dynamo-style)",
+      "cells": {
+        "workload": "Item access with tunable R/W. High availability writes at W=ONE.",
+        "consistency": "QUORUM is not linearizable. Conflicting versions need a merge policy.",
+        "latency": "R/W replica waits. Cross-AZ QUORUM is your p99.",
+        "scaling": "Hash ring. Hot partitions stay hot.",
+        "failure": "Hinted handoff + read repair. W=ALL unavailable under one loss.",
+        "costOps": "Repair, tombstones, capacity for hints.",
+        "whenNot": "Constrained multi-row ledgers or 'QUORUM means correct.'"
+      }
+    },
+    {
+      "id": "consensus",
+      "product": "Consensus log (Raft/Paxos-class)",
+      "cells": {
+        "workload": "Leader-elected replicated log for config, locks, or a small KV.",
+        "consistency": "Linearizable if you read through the leader (or read-index) under the protocol you named.",
+        "latency": "Majority round trip. Cross-region majority is a product choice with a cost.",
+        "scaling": "Does not scale write throughput like a partitioned KV. Keep the log small.",
+        "failure": "Leader election seconds. Dual leaders without fencing split-brain.",
+        "costOps": "Cluster membership, snapshot, and keeping the log off the application hot path.",
+        "whenNot": "Your click firehose, or using etcd as the TokenX ledger at payment QPS."
+      }
+    },
+    {
+      "id": "crdt",
+      "product": "CRDT / LWW merge",
+      "cells": {
+        "workload": "Concurrent updates that can converge without a single leader.",
+        "consistency": "Eventual merge. Not unique allocation. LWW needs a clock you trust.",
+        "latency": "Local write then async replicate.",
+        "scaling": "Good for presence, counters with merge, collaborative state.",
+        "failure": "Clock skew rewrites LWW winners. Tombstone/GC bugs resurrect values.",
+        "costOps": "Merge testing and tombstone policy.",
+        "whenNot": "Spendable balances, exactly-once settlement, or any invariant that is exclusive rather than mergeable."
+      }
+    }
+  ],
+  "assumptions": [
+    "A partition is a named cut: some replicas cannot talk. CAP is a per-operation policy (TokenX debit rejects without proven authority; labeled stale reads may continue), not a permanent two-letter sticker.",
+    "LWW clocks need a named timestamp source; wall clocks skew.",
+    "TokenX unique allocation is not an LWW merge."
+  ]
+}

@@ -1,0 +1,87 @@
+{
+  "id": "lb-gateway-k8s",
+  "title": "L4/L7 load balancer vs API gateway vs Kubernetes Service",
+  "description": "Three ingress/compute membership hops. None of them is a primary store or a fencing token.",
+  "landscape": "scalability",
+  "relatedSlugs": [
+    "load-balancing-deep-dive",
+    "autoscaling-and-capacity-planning",
+    "rate-limiting"
+  ],
+  "columns": [
+    {
+      "id": "workload",
+      "label": "Workload"
+    },
+    {
+      "id": "consistency",
+      "label": "Consistency"
+    },
+    {
+      "id": "latency",
+      "label": "Latency"
+    },
+    {
+      "id": "scaling",
+      "label": "Scaling"
+    },
+    {
+      "id": "failure",
+      "label": "Failure"
+    },
+    {
+      "id": "costOps",
+      "label": "Cost / ops"
+    },
+    {
+      "id": "whenNot",
+      "label": "When not"
+    }
+  ],
+  "rows": [
+    {
+      "id": "l4l7",
+      "product": "L4/L7 load balancer",
+      "cells": {
+        "workload": "Spread TCP/HTTP across healthy backends. Connection or request dispatch.",
+        "consistency": "No data consistency. Session affinity is a routing hint, not a shard map.",
+        "latency": "Sub-ms to a few ms plus health-check lag for membership.",
+        "scaling": "Horizontal backends. Cross-AZ balancer is still one region unless you say otherwise.",
+        "failure": "Unhealthy member drained after check interval. Dead member can still get traffic during TTL of the check.",
+        "costOps": "Cheap relative to compute. Need health, TLS policy, and capacity headroom.",
+        "whenNot": "When you needed a uniqueness boundary, a ledger, or multi-region failover. A VIP is not fencing."
+      }
+    },
+    {
+      "id": "gateway",
+      "product": "API gateway / BFF",
+      "cells": {
+        "workload": "Authn, rate limit, request shaping, protocol translation in front of services.",
+        "consistency": "Authz decisions are per request. Cached JWKS/keys can be stale.",
+        "latency": "Adds hops; p99 includes auth and quota checks.",
+        "scaling": "Stateless replicas plus a quota store. The quota store has its own consistency story.",
+        "failure": "Gateway outage is a total brownout unless you have a bypass that you named.",
+        "costOps": "Policy cardinality and cert rotation dominate. Misconfigured rate limits amplify retries.",
+        "whenNot": "Putting the TokenX ledger in the gateway. Gateways authorize; they do not settle."
+      }
+    },
+    {
+      "id": "k8s",
+      "product": "Kubernetes Service / Deployment",
+      "cells": {
+        "workload": "Process placement and kube-proxy/IPVS/Envoy membership for pods.",
+        "consistency": "Endpoint slices lag. Not a data model.",
+        "latency": "Cluster DNS + kube-proxy. Not a substitute for a regional LB at the edge.",
+        "scaling": "HPA/VPA change replica counts from derived metrics. Scale-to-zero drops in-flight work.",
+        "failure": "Pod death is SIGTERM + grace; not lossless. Cluster control plane loss is a different failure.",
+        "costOps": "Control plane, node pools, and HPA flapping cost real money.",
+        "whenNot": "Treating replica count as RPO=0 or using etcd as your application database."
+      }
+    }
+  ],
+  "assumptions": [
+    "Single region unless a cell says otherwise.",
+    "Balancer membership is derived from health checks; stale members receive traffic until the check fails.",
+    "Kubernetes replica count is not durability of in-flight requests."
+  ]
+}

@@ -1,0 +1,92 @@
+{
+  "id": "alb-nlb-nginx-haproxy",
+  "title": "ALB vs NLB vs NGINX vs HAProxy vs Cloudflare",
+  "description": "Pick an admission hop from protocol, who operates the process, and whether the work is regional VPC traffic or a global edge cache. This is not a speed ranking.",
+  "landscape": "scalability",
+  "relatedSlugs": ["load-balancing-deep-dive", "cdns-and-edge-architecture", "dns-and-service-discovery"],
+  "columns": [
+    { "id": "workload", "label": "Workload" },
+    { "id": "consistency", "label": "Consistency" },
+    { "id": "latency", "label": "Latency" },
+    { "id": "scaling", "label": "Scaling" },
+    { "id": "failure", "label": "Failure" },
+    { "id": "costOps", "label": "Cost / ops" },
+    { "id": "whenNot", "label": "When not to choose" }
+  ],
+  "rows": [
+    {
+      "id": "alb",
+      "product": "AWS Application Load Balancer",
+      "cells": {
+        "workload": "HTTP/HTTPS, HTTP/2, gRPC, and WebSocket APIs that need host/path/header routing, TLS termination, and target groups (instance, IP, Lambda) in one AWS region. Not arbitrary TCP.",
+        "consistency": "Derived routing state. Sticky cookies do not create read-your-writes on a replica. The balancer does not own TokenX balances or billed-click identity.",
+        "latency": "L7 parse and idle timeout are extra hop cost versus L4. In-region added latency is typically low milliseconds. Cross-AZ bytes add RTT and egress. Idle timeout is a request-budget owner, not TCP keepalive.",
+        "scaling": "AWS-managed nodes per AZ. You scale targets (pods/instances), not the balancer OS. Deregistration delay drains in-flight work up to a timeout; it does not add ledger writers.",
+        "failure": "HTTP health can pass while a shared database is down, or empty the pool if every target deep-checks that database. Unhealthy targets stop taking new work; remaining requests RST after drain. Target death is not fencing of a primary.",
+        "costOps": "Load Balancer Capacity Unit billing (new connections, processed bytes, rule evaluations) plus WAF association if used. You operate health, drain, certs, and retry policy. You do not patch the balancer OS.",
+        "whenNot": "Non-HTTP protocols (Kafka, game TCP, TLS passthrough to your terminator), a static Elastic IP at L4, or any design that would retry POST without an idempotency key."
+      }
+    },
+    {
+      "id": "nlb",
+      "product": "AWS Network Load Balancer",
+      "cells": {
+        "workload": "TCP/UDP/TLS at connection scale: Kafka, MQTT, TLS passthrough, millions of concurrent flows, source-IP preservation, static or Elastic IP. Connection is the unit of work, not an HTTP request.",
+        "consistency": "Derived 5-tuple or flow-hash mapping. No HTTP retry and no path routing. Forwarded bytes are not interpreted as a debit or a billed click.",
+        "latency": "Lowest AWS hop in this matrix: no HTTP parse. Planning figure is sub-millisecond forwarding in-region when the target is healthy. Existing connections stay on a dead target until they reset; only new flows move after health fail.",
+        "scaling": "Flow-hashed across AZ nodes; cross-zone is optional. Target capacity is still yours. NLB can front an ALB; that is two hops, not a substitute for HTTP routing on NLB itself.",
+        "failure": "TCP health can pass while the process is wedged on a lock. Optional HTTP health still does not parse the client protocol. Connection termination on unregister is a setting you name. Not a regional evacuation and not fencing.",
+        "costOps": "Network Load Balancer Capacity Unit billing (new flows, active flows, processed bytes). Fewer L7 knobs than ALB. You still own target health semantics and security groups.",
+        "whenNot": "You needed host/path routing, WAF on this hop, Lambda targets, or HTTP header policy. Do not use flow stickiness as a session store."
+      }
+    },
+    {
+      "id": "nginx",
+      "product": "NGINX",
+      "cells": {
+        "workload": "Self-operated reverse proxy and optional HTTP cache: Kubernetes Ingress, TLS, `limit_req`, upstream pools. `http` for L7; `stream` for L4. Choose it when you need config you own outside one cloud ALB feature set.",
+        "consistency": "Routing tables and `proxy_cache` are derived. A cache HIT can be stale after an origin write until TTL or purge. `ip_hash` is affinity, not a consistency model and not read-your-writes.",
+        "latency": "Event-loop workers. p99 from `worker_connections`, upstream time, and cache lock. Reload can be graceful; long-lived connections still pin old workers until they close.",
+        "scaling": "Add processes or Ingress replicas. Size `worker_connections` × workers with Little's Law at this hop. Cache memory/disk is a separate bound. NGINX does not autoscale your primary database.",
+        "failure": "Open source often uses passive `max_fails` (active probes are Plus or a sidecar). `proxy_next_upstream` can retry a non-idempotent POST. Upstream 502 is not a ledger rollback. Process crash loses in-memory cache.",
+        "costOps": "Cheap instances, expensive operators: CVE patching, cert rotation, keepalive tuning, reload. NGINX Plus adds active health and a license. You own high availability of the proxy fleet.",
+        "whenNot": "You wanted a managed regional VIP with no proxy fleet, or a global anycast edge. Do not treat NGINX cache as TokenX authority or as billed-click ingest."
+      }
+    },
+    {
+      "id": "haproxy",
+      "product": "HAProxy",
+      "cells": {
+        "workload": "Self-operated L4/L7 with precise timeouts and stick-tables. Common in front of PostgreSQL, Redis, Kafka, or HTTP APIs when you need runtime disable of a server without a cloud console. Mode `tcp` vs `http` is the protocol choice.",
+        "consistency": "Stick-tables and cookies are derived tracking. Mode `tcp` does not invent HTTP semantics. Core HAProxy is not an HTTP object cache.",
+        "latency": "Very small added hop as a pass-through when timeouts are named. `timeout connect/client/server` are the budget owners. Queueing inside HAProxy is extra W you must bound.",
+        "scaling": "Add proxy nodes; peer stick-tables if you need shared tracking. HAProxy selects among servers you declared. It is not HPA and it does not split a hot ledger row.",
+        "failure": "Active health checks are available in open source. `retry-on` can duplicate POSTs. Marking a server down stops new work; drain still needs a timeout. Two unpaired HAProxy hosts with different views is an ops failure, not a feature.",
+        "costOps": "You run the process, stats socket, and config. Strong session/queue observability. No managed capacity-unit bill; you own high availability of the proxy pair itself.",
+        "whenNot": "You needed a global CDN, an HTTP object cache, Lambda targets, or a serverless VIP. A single HAProxy host is a single point of failure until you pair it."
+      }
+    },
+    {
+      "id": "cloudflare",
+      "product": "Cloudflare",
+      "cells": {
+        "workload": "Public HTTP(S) at a global anycast edge: TLS, WAF, DDoS, CDN cache, optional Load Balancing to origins, Workers. Sits in front of an origin ALB/NLB/NGINX. Not east-west L4 inside a private VPC.",
+        "consistency": "POP cache is derived. Purge is eventually consistent across points of presence. Orange-cloud DNS is not fencing. Origin steering health is HTTP liveness, not proof a primary is writable.",
+        "latency": "HIT at a nearby POP is typically tens of milliseconds for cacheable GET. MISS pays POP plus the full origin path. Anycast is not a linearizable cutover when a POP or origin dies.",
+        "scaling": "Edge fan-out. Origin shield coalesces MISSes. Workers scale at the edge as untrusted derived execution. Does not add PostgreSQL writers or Kafka partitions.",
+        "failure": "Poisoned content until purge; origin outage (stale-if-error is a product choice); BGP convergence when a POP is withdrawn (seconds-class routing, not fenced ledger failover). Edge rate-limit counters are not uniqueness keys.",
+        "costOps": "Request, bandwidth, and add-on WAF / Load Balancing / Workers pricing. Cache-key and WAF rule design is the operator burden. You do not SSH the POP.",
+        "whenNot": "Private TCP (Kafka, Postgres), source-IP preservation inside a VPC, spendable TokenX reads, or billed-click POST ingest on a cacheable GET. Do not treat Workers KV as the ledger."
+      }
+    }
+  ],
+  "assumptions": [
+    "ALB and NLB numbers are single-region AWS unless a cell says global. Cross-AZ is extra RTT and egress, not a second region.",
+    "NGINX and HAProxy are self-hosted processes you patch. Plus/Enterprise features (active health, extra modules) are named when used; they are not assumed.",
+    "Cloudflare means orange-cloud reverse proxy plus optional Load Balancing. Grey-cloud DNS-only is a different product and is not this row.",
+    "A legal production path is Cloudflare → ALB or NLB or NGINX/HAProxy → pods. Rows compare one hop, not a mandate to pick only one box.",
+    "Health checks are liveness. They are not fencing, not WAL position, and not proof the primary is writable.",
+    "Latency figures are order-of-magnitude interview planning numbers, not SLOs from a named production fleet.",
+    "L7 retries (ALB idle timeout aside, NGINX proxy_next_upstream, HAProxy retry-on) can duplicate a POST unless the write carries an idempotency key."
+  ]
+}

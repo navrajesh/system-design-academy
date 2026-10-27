@@ -246,7 +246,7 @@
       "id": "outbox-kafka",
       "layerId": "streaming",
       "title": "Outbox and workers",
-      "product": "Transactional outbox plus optional log (Kafka-class, not required in Phase A)",
+      "product": "Transactional outbox plus optional Kafka-class log",
       "ownership": "derived",
       "optional": true,
       "alternativeGroup": null,

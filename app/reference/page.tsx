@@ -9,7 +9,7 @@ import {
 
 export const metadata: Metadata = {
   title: "Architecture reference",
-  description: "Technology landscape for production systems, starting with Storage & Data.",
+  description: "Technology landscapes, comparison matrices, and named failure walkthroughs for production systems.",
 };
 
 export default function ReferenceHubPage() {
@@ -17,9 +17,10 @@ export default function ReferenceHubPage() {
   const deepDives = getDeepDives();
   const matrices = getMatrices();
   const failures = getFailureWalkthroughs();
+  const failureHrefs = new Map((catalog.failures ?? []).map((item) => [item.id, item.href]));
   return (
     <div className="mx-auto max-w-4xl px-5 py-10 sm:px-8 sm:py-14">
-      <p className="text-[10px] font-bold uppercase tracking-[0.2em] text-cobalt">Phase 2A</p>
+      <p className="text-[10px] font-bold uppercase tracking-[0.2em] text-cobalt">Architecture reference</p>
       <h1 className="mt-3 font-display text-4xl font-semibold tracking-tight text-ink">{catalog.title}</h1>
       <p className="mt-4 max-w-2xl text-lg leading-8 text-slate-600">{catalog.description}</p>
       <p className="mt-3 text-sm leading-6 text-slate-500">
@@ -33,10 +34,21 @@ export default function ReferenceHubPage() {
           .map((item) => (
             <HubCard key={item.id} href={item.href!} title={item.title} body={item.description} />
           ))}
-        {failures.map((item) => (
-          <HubCard key={item.id} href={catalog.failureHref} title={item.title} body={item.description} />
-        ))}
       </div>
+
+      <section className="mt-12">
+        <h2 className="font-display text-2xl font-semibold text-ink">Failure walkthroughs</h2>
+        <div className="mt-4 grid gap-4 sm:grid-cols-2">
+          {failures.map((item) => (
+            <HubCard
+              key={item.id}
+              href={failureHrefs.get(item.id) ?? `/reference/failures/${item.id}`}
+              title={item.title}
+              body={item.description}
+            />
+          ))}
+        </div>
+      </section>
 
       <section className="mt-12">
         <h2 className="font-display text-2xl font-semibold text-ink">Deep dives</h2>
@@ -54,28 +66,14 @@ export default function ReferenceHubPage() {
 
       <section className="mt-12">
         <h2 className="font-display text-2xl font-semibold text-ink">Comparison matrices</h2>
-        <p className="mt-2 text-sm text-slate-600">Rendered on the Storage & Data landscape with assumption footnotes.</p>
         <ul className="mt-4 list-disc pl-5 text-sm text-slate-700">
           {matrices.map((matrix) => (
             <li key={matrix.id}>
-              <Link className="font-semibold text-cobalt" href="/reference/landscapes/storage">
+              <Link className="font-semibold text-cobalt" href={`/reference/landscapes/${matrix.landscape ?? "storage"}`}>
                 {matrix.title}
               </Link>
             </li>
           ))}
-        </ul>
-      </section>
-
-      <section className="mt-12">
-        <h2 className="font-display text-2xl font-semibold text-ink">Later landscapes</h2>
-        <ul className="mt-4 space-y-2 text-sm text-slate-600">
-          {catalog.landscapes
-            .filter((item) => item.status === "later")
-            .map((item) => (
-              <li key={item.id}>
-                <span className="font-semibold text-ink">Module {item.module}: {item.title}</span> — {item.description}
-              </li>
-            ))}
         </ul>
       </section>
     </div>

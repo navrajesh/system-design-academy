@@ -1,0 +1,87 @@
+{
+  "id": "kafka-streams-flink",
+  "title": "Kafka consumer vs Kafka Streams vs Flink",
+  "description": "Three ways to process a partitioned log. Watermarks, idle partitions, and sink idempotency decide correctness.",
+  "landscape": "kafka-fault-tolerance",
+  "relatedSlugs": [
+    "stream-processing-and-windows",
+    "kafka-internals",
+    "retries-dead-letters-and-replay"
+  ],
+  "columns": [
+    {
+      "id": "workload",
+      "label": "Workload"
+    },
+    {
+      "id": "consistency",
+      "label": "Consistency"
+    },
+    {
+      "id": "latency",
+      "label": "Latency"
+    },
+    {
+      "id": "scaling",
+      "label": "Scaling"
+    },
+    {
+      "id": "failure",
+      "label": "Failure"
+    },
+    {
+      "id": "costOps",
+      "label": "Cost / ops"
+    },
+    {
+      "id": "whenNot",
+      "label": "When not"
+    }
+  ],
+  "rows": [
+    {
+      "id": "consumer",
+      "product": "Kafka consumer group",
+      "cells": {
+        "workload": "Pull records, process, commit offsets. Dual owner: coordinator + assignment.",
+        "consistency": "Offset commit is not the sink commit. Read-your-write only inside the processing you named.",
+        "latency": "Poll interval + processing. Rebalance pauses partitions.",
+        "scaling": "Partitions cap parallelism. Hot keys stay hot.",
+        "failure": "Rebalance, poison pill, lag. Replay from offset is the recovery, with duplicates unless idempotent.",
+        "costOps": "Consumer lag dashboards, DLQ, rebalance storms.",
+        "whenNot": "Exactly-once money without a sink uniqueness boundary. Offset != ledger."
+      }
+    },
+    {
+      "id": "kstreams",
+      "product": "Kafka Streams",
+      "cells": {
+        "workload": "Partitioned stream/table, changelog, state stores colocated with tasks.",
+        "consistency": "Changelog restore is derived from the log. Stream-time is max observed, not wall clock.",
+        "latency": "Local state is fast; restore after rebalance is the tail.",
+        "scaling": "Input partitions. Standby tasks trade disk for restore time.",
+        "failure": "Task migration restores from changelog. Idle partitions stall stream-time unless max.task.idle.ms is named.",
+        "costOps": "State store disk, changelog topics, restore SLOs.",
+        "whenNot": "Event-time windows that require min watermark across idle sources — that is the Flink story."
+      }
+    },
+    {
+      "id": "flink",
+      "product": "Apache Flink",
+      "cells": {
+        "workload": "Event-time windows, watermarks, checkpoints to durable storage.",
+        "consistency": "Checkpoint barrier alignment. Min watermark; withIdleness needed for idle sources.",
+        "latency": "Checkpoint interval vs end-to-end. Two-phase commit sinks have a cost.",
+        "scaling": "Keyed parallelism independent of Kafka partitions if you reshuffle — and then you pay network.",
+        "failure": "Restore from checkpoint. Unaligned checkpoints and unacked sinks are UNKNOWN.",
+        "costOps": "JobManager/TaskManager, checkpoint storage, watermark delay as a product SLO.",
+        "whenNot": "A thin consumer would have been enough, or TokenX settlement inside a window operator."
+      }
+    }
+  ],
+  "assumptions": [
+    "Produce durability is a separate matrix: RF, acks, minISR.",
+    "At-least-once to the sink unless the sink is idempotent on a named key.",
+    "Flink min watermark + withIdleness vs Kafka Streams max stream-time + max.task.idle.ms are not interchangeable slogans."
+  ]
+}

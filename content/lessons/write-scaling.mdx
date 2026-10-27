@@ -149,7 +149,7 @@ Retain: **own the key, fence the identity, ACK only what committed, treat aggreg
 
 </RealExamples>
 
-<InterviewTraps title="Write-scaling slogans that fail at IC6">
+<InterviewTraps title="Write-scaling slogans that fail in staff+ interviews">
 
 - **“More writers mean more throughput.”** Not on one row, one sequence, or one partition. That is a longer queue.
 - **“Async ACK is just as durable if we replicate the cache.”** Replication of derived state does not create a WAL. Loss window remains until the authority commits.
@@ -203,7 +203,7 @@ Correctness of TokenX balances and billed-click identity is not a throughput kno
   scenario="A candidate proposes: TokenX returns 200 as soon as the debit hits a local write-behind buffer (flush every 50 ms to Postgres). Transfers use a UUID but no unique constraint. Ad Click stores only 1-minute aggregated counts to ‘scale writes,’ and collector retries are unkeyed batches. They add 30 write APIs because CPU is 20%."
   question="What must you change so money and invoices survive crash and retry?"
   options={[
-    { label: "Keep write-behind; just fsync Redis every 5 ms so the loss window is ‘small enough’ for IC6 money.", feedback: "A smaller window is still a loss window, and it is still not the ledger uniqueness boundary." },
+    { label: "Keep write-behind; just fsync Redis every 5 ms so the loss window is ‘small enough’ for staff+ money.", feedback: "A smaller window is still a loss window, and it is still not the ledger uniqueness boundary." },
     { label: "Commit (tenant, transfer_id) plus the ledger mutation before ACK. ACK billed clicks after the fact log. Keep window tables derived. Stop adding APIs to the hot row; own keys instead.", feedback: "Sync ACK to the authority, identity for retries, aggregates as projections, ownership instead of replica count." },
     { label: "Move the TokenX debit onto Kafka with acks=0 so writes scale, and bill ads from the in-memory aggregator to avoid log amplification.", feedback: "acks=0 is an async ACK. In-memory aggregates are not billed facts. Both violate the durability bound." },
     { label: "Enable read replicas for TokenX writes so each API can commit locally, and compact the click log so only the latest campaign total remains.", feedback: "Read replicas are not write owners. Compacting facts into a total destroys invoice identity." }

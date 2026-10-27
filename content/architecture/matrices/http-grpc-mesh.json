@@ -1,0 +1,87 @@
+{
+  "id": "http-grpc-mesh",
+  "title": "HTTP/JSON vs gRPC vs service mesh",
+  "description": "Protocol and proxy placement. TLS/mTLS is identity on the wire, not authorization of money.",
+  "landscape": "networking",
+  "relatedSlugs": [
+    "http-apis-and-protocol-choice",
+    "service-mesh-and-proxies",
+    "network-security-boundaries"
+  ],
+  "columns": [
+    {
+      "id": "workload",
+      "label": "Workload"
+    },
+    {
+      "id": "consistency",
+      "label": "Consistency"
+    },
+    {
+      "id": "latency",
+      "label": "Latency"
+    },
+    {
+      "id": "scaling",
+      "label": "Scaling"
+    },
+    {
+      "id": "failure",
+      "label": "Failure"
+    },
+    {
+      "id": "costOps",
+      "label": "Cost / ops"
+    },
+    {
+      "id": "whenNot",
+      "label": "When not"
+    }
+  ],
+  "rows": [
+    {
+      "id": "http",
+      "product": "HTTP/JSON over TLS",
+      "cells": {
+        "workload": "Public and service APIs, caches, browsers, idempotent GETs.",
+        "consistency": "HTTP semantics do not create a consistency model. POST retries need keys.",
+        "latency": "JSON encode plus TLS. HTTP/2 multiplexing helps; head-of-line still exists at the app.",
+        "scaling": "Stateless handlers. CDN can cache GETs only.",
+        "failure": "4xx vs 5xx vs timeout. 429 needs a Retry-After you honor.",
+        "costOps": "Easy to observe. Schema drift is a product problem.",
+        "whenNot": "Tight streaming fan-in where protobuf + HTTP/2 streams are the budget, or treating 200 as commit."
+      }
+    },
+    {
+      "id": "grpc",
+      "product": "gRPC",
+      "cells": {
+        "workload": "Service-to-service RPCs, streaming, deadlines as first-class.",
+        "consistency": "Deadlines abort the RPC, not the server-side commit.",
+        "latency": "Protobuf + HTTP/2. Tail from server processing, not JSON.",
+        "scaling": "Client load-balancing policies. Long streams pin memory.",
+        "failure": "UNAVAILABLE vs DEADLINE_EXCEEDED vs UNKNOWN. Retries need idempotency.",
+        "costOps": "Codegen, deadline propagation, and debug with traces not curl-only.",
+        "whenNot": "Browser-first public APIs without a gateway, or unbounded bidirectional streams as a queue."
+      }
+    },
+    {
+      "id": "mesh",
+      "product": "Service mesh sidecar",
+      "cells": {
+        "workload": "mTLS, retries, outlier detection, telemetry around existing apps.",
+        "consistency": "Retry policies can duplicate non-idempotent writes. Outlier ejection is membership, not fencing.",
+        "latency": "Extra hop per sidecar. Warm connections help; cold start hurts.",
+        "scaling": "Sidecar CPU/RAM per pod. Control plane push lag.",
+        "failure": "Sidecar crash blackholes the pod. Control plane loss freezes config.",
+        "costOps": "Highest ops burden of the three. Cert rotation and retry storms.",
+        "whenNot": "A gateway plus library retries would have been enough, or auto-retry of TokenX POSTs."
+      }
+    }
+  ],
+  "assumptions": [
+    "Timeouts are UNKNOWN, not rollback.",
+    "mTLS does not replace application authorization.",
+    "Mesh sidecar outage is an independent failure from the app process."
+  ]
+}

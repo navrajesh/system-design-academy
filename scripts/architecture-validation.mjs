@@ -28,12 +28,89 @@ const FAILOVER_STEPS = ["normal", "detection", "in-flight", "promotion", "client
 const OWNERSHIP = new Set(["authoritative", "derived"]);
 const EDGE_KIND = new Set(["sync", "async"]);
 const FORBIDDEN_CLAIM = /instantaneous failover|lossless failover|transparent failover|failover is instantaneous|instantaneous failover is lossless|linearizable by default/i;
-const PHASE_A_SLUGS = [
+export const PHASE_A_SLUGS = [
   "relational-vs-nosql-selection",
   "indexes-and-query-execution",
   "caching-patterns-and-invalidation",
   "replication-and-failover",
   "transactions-across-boundaries",
+];
+
+export const LANDSCAPE_REQUIRED_SLUGS = {
+  storage: PHASE_A_SLUGS,
+  scalability: [
+    "load-balancing-deep-dive",
+    "scaling-read-heavy-services",
+    "write-scaling",
+    "autoscaling-and-capacity-planning",
+    "fan-out-architectures",
+  ],
+  "kafka-fault-tolerance": [
+    "kafka-internals",
+    "kafka-delivery-and-failure",
+    "consumer-groups-and-rebalancing",
+    "retries-dead-letters-and-replay",
+    "stream-processing-and-windows",
+  ],
+  performance: [
+    "latency-throughput-and-queues",
+    "caching-patterns-and-invalidation",
+    "tail-latency-control",
+    "performance-budgets-and-slos",
+    "backpressure-and-overload",
+  ],
+  networking: [
+    "dns-and-service-discovery",
+    "tcp-quic-and-connection-lifecycle",
+    "http-apis-and-protocol-choice",
+    "network-security-boundaries",
+    "service-mesh-and-proxies",
+  ],
+  consistency: [
+    "cap-and-consistency-models",
+    "consensus-and-leader-election",
+    "distributed-locks-and-leases",
+    "distributed-transactions",
+    "idempotency-and-deduplication",
+  ],
+  composition: [
+    "design-tokenx",
+    "design-an-ad-click-aggregator",
+    "driving-a-system-design-interview",
+    "architecture-review-practice",
+    "graceful-degradation",
+  ],
+};
+
+const REQUIRED_LIBRARY_FILES = [
+  "graph.json",
+  "catalog.json",
+  "summaries.json",
+  "landscapes/storage.mdx",
+  "landscapes/scalability.mdx",
+  "landscapes/kafka-fault-tolerance.mdx",
+  "landscapes/performance.mdx",
+  "landscapes/networking.mdx",
+  "landscapes/consistency.mdx",
+  "landscapes/composition.mdx",
+  "technologies/postgresql.mdx",
+  "technologies/redis.mdx",
+  "technologies/dynamodb.mdx",
+  "matrices/postgres-dynamodb-cassandra.json",
+  "matrices/cache-replica-cdn.json",
+  "matrices/lb-gateway-k8s.json",
+  "matrices/kafka-streams-flink.json",
+  "matrices/http-grpc-mesh.json",
+  "matrices/quorum-consensus-crdt.json",
+  "matrices/consensus-quorum-crdt.json",
+  "matrices/tokenx-vs-ads.json",
+  "matrices/tokenx-ads-chat.json",
+  "failures/database-failover.json",
+  "failures/cache-outage.json",
+  "failures/kafka-consumer-lag.json",
+  "failures/network-partition.json",
+  "failures/overload.json",
+  "failures/multi-region-failure.json",
 ];
 
 export function extractLessonCrossLinkSlugs(content) {
@@ -145,9 +222,9 @@ export function validateMatrix(matrix, filename = "matrix.json", knownSlugs = ne
   return errors;
 }
 
-export function validateFailover(walkthrough, filename = "database-failover.json", knownSlugs = new Set()) {
+export function validateFailover(walkthrough, filename = "walkthrough.json", knownSlugs = new Set()) {
   const errors = [];
-  if (walkthrough?.id !== "database-failover") errors.push(filename + ": id must be database-failover");
+  if (!walkthrough?.id || !walkthrough?.title) errors.push(filename + ": missing id or title");
   if (!Array.isArray(walkthrough?.assumptions) || !walkthrough.assumptions.length) errors.push(filename + ": assumptions required");
   const ids = new Set((walkthrough?.steps ?? []).map((step) => step.id));
   for (const id of FAILOVER_STEPS) {
@@ -181,7 +258,8 @@ export function validateLandscapeText(raw, filename, knownSlugs = new Set()) {
     if (!data[field]) errors.push(filename + ": missing frontmatter field '" + field + "'");
   }
   const slugs = new Set([...(data.relatedSlugs ?? []), ...extractLessonCrossLinkSlugs(content)]);
-  for (const slug of PHASE_A_SLUGS) {
+  const requiredSlugs = LANDSCAPE_REQUIRED_SLUGS[data.landscape] ?? PHASE_A_SLUGS;
+  for (const slug of requiredSlugs) {
     if (!slugs.has(slug)) errors.push(filename + ": must LessonCrossLink '" + slug + "'");
   }
   for (const slug of slugs) {
@@ -197,21 +275,9 @@ export async function validateArchitectureLibrary({ architectureDirectory, lesso
   const charts = [];
   const deepDiveFiles = [];
 
-  const required = [
-    "graph.json",
-    "catalog.json",
-    "summaries.json",
-    "landscapes/storage.mdx",
-    "technologies/postgresql.mdx",
-    "technologies/redis.mdx",
-    "technologies/dynamodb.mdx",
-    "matrices/postgres-dynamodb-cassandra.json",
-    "matrices/cache-replica-cdn.json",
-    "failures/database-failover.json",
-  ];
-  for (const relative of required) {
+  for (const relative of REQUIRED_LIBRARY_FILES) {
     if (!fs.existsSync(path.join(architectureDirectory, relative))) {
-      errors.push("Phase A missing required file content/architecture/" + relative);
+      errors.push("library missing required file content/architecture/" + relative);
     }
   }
 
@@ -251,10 +317,16 @@ export async function validateArchitectureLibrary({ architectureDirectory, lesso
     }
   }
 
-  const landscapePath = path.join(architectureDirectory, "landscapes", "storage.mdx");
-  if (fs.existsSync(landscapePath)) {
-    const result = validateLandscapeText(fs.readFileSync(landscapePath, "utf8"), "landscapes/storage.mdx", knownSlugs);
-    errors.push(...result.errors);
+  const landscapesDir = path.join(architectureDirectory, "landscapes");
+  if (fs.existsSync(landscapesDir)) {
+    for (const file of fs.readdirSync(landscapesDir).filter((name) => name.endsWith(".mdx"))) {
+      const result = validateLandscapeText(
+        fs.readFileSync(path.join(landscapesDir, file), "utf8"),
+        "landscapes/" + file,
+        knownSlugs,
+      );
+      errors.push(...result.errors);
+    }
   }
 
   const matricesDir = path.join(architectureDirectory, "matrices");
@@ -264,9 +336,31 @@ export async function validateArchitectureLibrary({ architectureDirectory, lesso
     }
   }
 
-  const failoverPath = path.join(architectureDirectory, "failures", "database-failover.json");
-  if (fs.existsSync(failoverPath)) {
-    errors.push(...validateFailover(JSON.parse(fs.readFileSync(failoverPath, "utf8")), "database-failover.json", knownSlugs));
+  const failuresDir = path.join(architectureDirectory, "failures");
+  if (fs.existsSync(failuresDir)) {
+    for (const file of fs.readdirSync(failuresDir).filter((name) => name.endsWith(".json"))) {
+      errors.push(
+        ...validateFailover(JSON.parse(fs.readFileSync(path.join(failuresDir, file), "utf8")), file, knownSlugs),
+      );
+    }
+  }
+
+  const catalogPath = path.join(architectureDirectory, "catalog.json");
+  if (fs.existsSync(catalogPath)) {
+    const catalog = JSON.parse(fs.readFileSync(catalogPath, "utf8"));
+    const available = (catalog.landscapes ?? []).filter((item) => item.status === "available");
+    if (available.length !== 7) errors.push("catalog.json: expected 7 available landscapes, found " + available.length);
+    const failureIds = new Set((catalog.failures ?? []).map((item) => item.id));
+    for (const id of [
+      "database-failover",
+      "cache-outage",
+      "kafka-consumer-lag",
+      "network-partition",
+      "overload",
+      "multi-region-failure",
+    ]) {
+      if (!failureIds.has(id)) errors.push("catalog.json: missing failure '" + id + "'");
+    }
   }
 
   const summariesPath = path.join(architectureDirectory, "summaries.json");

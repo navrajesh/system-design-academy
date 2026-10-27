@@ -15,7 +15,7 @@ objectives:
   - "Structure a 45-minute design discussion"
   - "Turn product requirements into explicit invariants"
   - "Quantify scale before selecting components"
-  - "Defend failure, recovery, and evolution decisions at IC6 depth"
+  - "Defend failure, recovery, and evolution decisions at staff+ interview depth"
 ---
 
 <BigPicture title="The interview tests judgment in motion">
@@ -157,7 +157,7 @@ The ledger commits, but the response is lost. The client resends the same idempo
 
 </RealExamples>
 
-<InterviewTraps title="IC6 follow-ups and a defensible rubric">
+<InterviewTraps title="Staff+ follow-ups and a defensible rubric">
 
 ### Questions the interviewer should be able to ask
 
@@ -169,7 +169,7 @@ The ledger commits, but the response is lost. The client resends the same idempo
 - Which data can be stale, and how is that staleness communicated?
 - How would you prove backups restore both balances and their audit trail?
 
-### IC6 scoring rubric
+### Staff+ scoring rubric
 
 - **Requirements:** separates authoritative transfer semantics from derived views and explicitly excludes unsupported product scope.
 - **Quantification:** converts daily volume to peak rate, storage, read amplification, and a testable capacity target.
@@ -232,7 +232,7 @@ This design becomes inappropriate when regulatory isolation forbids one ledger r
     { label: "Move balances to the analytics store because it already scales reads.", feedback: "A stale derived store cannot authorize spending." }
   ]}
   correct={0}
-  explanation="IC6 judgment includes resisting premature distribution while preparing keys, measurements, and a safe migration path."
+  explanation="Staff+ judgment includes resisting premature distribution while preparing keys, measurements, and a safe migration path."
 />
 
 <InterviewAnswer>

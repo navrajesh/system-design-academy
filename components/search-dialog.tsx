@@ -12,6 +12,7 @@ export type SearchRecord = {
   moduleTitle: string;
   tags: string[];
   searchText: string;
+  href?: string;
 };
 
 export function SearchDialog({ records, open, onClose }: { records: SearchRecord[]; open: boolean; onClose: () => void }) {
@@ -72,24 +73,24 @@ export function SearchDialog({ records, open, onClose }: { records: SearchRecord
 
   if (!open) return null;
 
-  const visit = (slug: string) => {
+  const visit = (record: SearchRecord) => {
     onClose();
     setQuery("");
-    router.push(`/learn/${slug}`);
+    router.push(record.href ?? `/learn/${record.slug}`);
   };
 
   return (
     <div className="fixed inset-0 z-50 flex items-start justify-center bg-ink/45 px-4 pt-[10vh] backdrop-blur-sm" role="presentation" onMouseDown={onClose}>
-      <section ref={dialogRef} className="w-full max-w-2xl overflow-hidden rounded-2xl border border-white/30 bg-white shadow-2xl" role="dialog" aria-modal="true" aria-label="Search lessons" onMouseDown={(event) => event.stopPropagation()}>
+      <section ref={dialogRef} className="w-full max-w-2xl overflow-hidden rounded-2xl border border-white/30 bg-white shadow-2xl" role="dialog" aria-modal="true" aria-label="Search lessons and reference" onMouseDown={(event) => event.stopPropagation()}>
         <div className="flex items-center gap-3 border-b border-slate-200 px-5">
           <Search aria-hidden="true" className="h-5 w-5 text-slate-400" />
-          <input ref={inputRef} value={query} onChange={(event) => setQuery(event.target.value)} className="h-16 flex-1 bg-transparent text-base text-ink outline-none placeholder:text-slate-400" placeholder="Search partitioning, consistency, Kafka…" aria-label="Search lessons" />
+          <input ref={inputRef} value={query} onChange={(event) => setQuery(event.target.value)} className="h-16 flex-1 bg-transparent text-base text-ink outline-none placeholder:text-slate-400" placeholder="Search partitioning, consistency, Kafka…" aria-label="Search lessons and reference" />
           <button onClick={onClose} className="rounded-lg p-2 text-slate-500 hover:bg-slate-100" aria-label="Close search"><X className="h-5 w-5" /></button>
         </div>
         <div className="max-h-[62vh] overflow-y-auto p-2">
           {results.length ? results.map((record) => (
-            <button key={record.slug} onClick={() => visit(record.slug)} className="group flex w-full items-center gap-4 rounded-xl px-4 py-3 text-left hover:bg-slate-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cobalt">
-              <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-slate-100 text-xs font-semibold text-slate-600">{String(record.module).padStart(2, "0")}</span>
+            <button key={`${record.href ?? "lesson"}:${record.slug}`} onClick={() => visit(record)} className="group flex w-full items-center gap-4 rounded-xl px-4 py-3 text-left hover:bg-slate-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cobalt">
+              <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-slate-100 text-xs font-semibold text-slate-600">{record.href ? "AR" : String(record.module).padStart(2, "0")}</span>
               <span className="min-w-0 flex-1">
                 <span className="block font-semibold text-ink">{record.title}</span>
                 <span className="block truncate text-sm text-slate-500">{record.description}</span>

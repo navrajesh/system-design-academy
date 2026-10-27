@@ -1,0 +1,57 @@
+---
+kind: landscape
+id: networking
+title: "Networking landscape"
+description: "Where Module 5 path and protocol products sit, which state they own, and which lessons teach DNS, TCP/QUIC, HTTP, edge, mesh, rate limits, and realtime channels."
+landscape: networking
+relatedSlugs:
+  - dns-and-service-discovery
+  - tcp-quic-and-connection-lifecycle
+  - http-apis-and-protocol-choice
+  - cdns-and-edge-architecture
+  - service-mesh-and-proxies
+  - network-security-boundaries
+  - rate-limiting
+  - real-time-connections
+---
+
+This landscape is a **catalog of path and protocol classes**, not a 65th lesson. DNS, TCP/QUIC, HTTP/gRPC, CDN/edge, mesh/proxy, rate limiters, and realtime channels are hops on the way to a store. None of them is the TokenX ledger. Compare REST vs gRPC vs WebSocket vs SSE on the matrix below. Partition behavior is a named walkthrough: TokenX **rejects writes** without a 2-of-3 majority; it does **not** last-writer-wins spendable balances.
+
+Authoritative vs derived:
+
+- **Authoritative for money and billed facts:** TokenX ledger uniqueness; Ad Click billed-fact log after `click_id` append.
+- **Derived routing and policy:** DNS answers, VIP membership, service-registry copies, mesh xDS, CDN objects, rate-limit counters, presence TTLs, notification resume buffers.
+- **Derived transport:** TCP/QUIC connection tables, TLS sessions, sticky cookies. Re-dial rebuilds them. A RST after commit is **UNKNOWN**, not rollback.
+
+Synchronous edges wait inside the caller deadline (HTTP/gRPC to the API, SQL to the ledger). Asynchronous edges (outbox to notify, SSE/WS push, CDN purge) return before every POP or every phone has the bytes.
+
+### Path classes and independent failure
+
+**DNS and discovery** are stacked TTLs. A 60 s TTL is a stale-answer budget, not a failover SLO. Empty discovery for TokenX spendable routing **fail-closes**. Ad Click uniqueness still lives at the log, not at CoreDNS. See <LessonCrossLink slug="dns-and-service-discovery" />.
+
+**TCP/QUIC** preserves byte order **on one connection**. HTTP/2-over-TCP still head-of-line blocks on loss; QUIC multiplexes streams. Pools amortize handshake; they are not session correctness. TLS **0-RTT** is replayable: TokenX must not put spendable debits in early data. See <LessonCrossLink slug="tcp-quic-and-connection-lifecycle" />.
+
+**HTTP APIs** choose REST/JSON vs gRPC from clients, evolution, and deadlines—not from a belief that protobuf is a commit. POST `/debits` is not idempotent without `transfer_id`. Timeout is UNKNOWN. Ad Click 2xx means unique append, not “enqueued in memory.” See <LessonCrossLink slug="http-apis-and-protocol-choice" />.
+
+**CDN/edge** is a photocopy warehouse. Purge is best-effort across POPs, not a linearizable delete. TokenX balances stay `Cache-Control: private, no-store`. Billed ingest is a POST to a collector, never a cacheable GET. See <LessonCrossLink slug="cdns-and-edge-architecture" />.
+
+**Service mesh** is an east-west policy clerk: mTLS identity, timeouts, retry budgets. Automatic retries of unkeyed TokenX POSTs duplicate money. Mesh + app + edge retries multiply. TokenX payment sidecars **fail-closed** if the sidecar crash-loops; ad collectors may fail-open to a **bounded** local buffer. See <LessonCrossLink slug="service-mesh-and-proxies" />.
+
+**Network security boundaries** separate TLS/mTLS identity from application authorization from ledger commit. A certificate or private link is not uniqueness. TokenX **fail-closes** when identity cannot be established. See <LessonCrossLink slug="network-security-boundaries" />.
+
+**Rate limiters** are admission (token bucket, leaky bucket, sliding window). They are not uniqueness and not a once-only processing boundary. If the limiter store is down, TokenX **fail-closes** when you claimed an abuse cap; Ad Click may use a local degraded cap and keep ingesting. See <LessonCrossLink slug="rate-limiting" />.
+
+**Realtime connections** (WebSocket, SSE, long poll) notify. Presence expires. Resume is a derived `{epoch, last_seq}` buffer. Money stays keyed HTTP/gRPC. See <LessonCrossLink slug="real-time-connections" />.
+
+### Partition policy
+
+A network cut is not a storage engine. During a partition, **each operation** chooses: TokenX debits require a **2-of-3** replica majority and **reject** on the isolated minority. Portfolio reads may return labeled stale data. Do not merge spendable balances with last-writer-wins. Walk the [network partition](/reference/failures/network-partition) steps. CAP here is that operation-level choice, not a product logo that permanently picked two letters.
+
+<MermaidDiagram
+  title="Derived DNS, edge, mesh, and sockets around keyed ledger calls"
+  chart={"flowchart LR\n  CLI[Client] --> DNS[DNS derived]\n  DNS --> EDGE[CDN or origin]\n  EDGE --> GW[LB and gateway]\n  GW --> MESH[Mesh proxy derived]\n  MESH --> API[API]\n  API -->|REST or gRPC keyed| LED[(Ledger authoritative)]\n  API -->|WS or SSE| NOTE[Notify path derived]"}
+/>
+
+Start with the [layered explorer](/reference/architecture), the REST vs gRPC vs WebSocket vs SSE matrix on this page, and the [network partition walkthrough](/reference/failures/network-partition).
+
+Mechanism lessons: <LessonCrossLink slug="dns-and-service-discovery" />, <LessonCrossLink slug="tcp-quic-and-connection-lifecycle" />, <LessonCrossLink slug="http-apis-and-protocol-choice" />, <LessonCrossLink slug="cdns-and-edge-architecture" />, <LessonCrossLink slug="service-mesh-and-proxies" />, <LessonCrossLink slug="network-security-boundaries" />, <LessonCrossLink slug="rate-limiting" />, <LessonCrossLink slug="real-time-connections" />.

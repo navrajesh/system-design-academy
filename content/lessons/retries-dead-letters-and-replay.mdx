@@ -162,7 +162,7 @@ The source partition log is authoritative for record bytes until time or size re
 
 </RealExamples>
 
-<InterviewTraps title="Retry slogans that fail at IC6">
+<InterviewTraps title="Retry slogans that fail in staff+ interviews">
 
 1. **“Kafka retries give us exactly-once.”** Retries increase delivery count. Exactly-once would require a named atomic boundary with the sink. Producer idempotence is not a business event id.
 2. **“We skip poison messages so the partition does not stall.”** Valid only when later records do not depend on this key’s prior state. TokenX accounts and campaign-config streams usually do.

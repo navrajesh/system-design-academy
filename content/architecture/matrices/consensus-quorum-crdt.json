@@ -1,0 +1,72 @@
+{
+  "id": "consensus-quorum-crdt",
+  "title": "Linearizable consensus vs Dynamo quorum vs CRDT/LWW",
+  "description": "Three write-coordination classes. Overlap arithmetic, gossip merge, and a Raft majority are not interchangeable. TokenX money needs a fenced single history; ads metadata may converge.",
+  "landscape": "consistency",
+  "relatedSlugs": [
+    "cap-and-consistency-models",
+    "consensus-and-leader-election",
+    "consistency-models",
+    "conflict-resolution",
+    "distributed-locks-and-leases",
+    "idempotency-and-deduplication"
+  ],
+  "columns": [
+    { "id": "workload", "label": "Workload" },
+    { "id": "consistency", "label": "Consistency" },
+    { "id": "latency", "label": "Latency" },
+    { "id": "scaling", "label": "Scaling" },
+    { "id": "failure", "label": "Failure" },
+    { "id": "costOps", "label": "Cost / ops" },
+    { "id": "whenNot", "label": "When not to choose" }
+  ],
+  "rows": [
+    {
+      "id": "linearizable-consensus",
+      "product": "Linearizable consensus log",
+      "cells": {
+        "workload": "Single ordered command stream: TokenX ledger mutations, lock/lease metadata, chat per-conversation seq if you put the sequencer on a Raft group. Not a high-ingest click firehose.",
+        "consistency": "One history. Writes commit after a current-term majority (2-of-3 in a three-replica group: leader plus either follower). Linearizable reads need ReadIndex or a bounded-clock lease plus apply wait. CAP here is partition policy: the minority cannot commit. Not a two-letter product sticker.",
+        "latency": "Commit RTT to a majority plus fsync. p99 includes election and serialize-on-leader. A no-op commit is not a standing license for later local reads.",
+        "scaling": "Vertical then shard by key into many groups. One group is one hot leader. Membership change is a protocol (joint consensus), not an autoscale replace.",
+        "failure": "Leader crash: new election, fencing by term/epoch. Isolated minority rejects linearizable writes. Uncommitted suffix may be overwritten. Client timeout is UNKNOWN; retry the same idempotency key. Do not auto-replay request logs.",
+        "costOps": "You operate quorum health, disk, and epoch fencing. Three or five failure-independent nodes per group. Cross-region consensus adds WAN RTT to every commit.",
+        "whenNot": "When the invariant can converge without a single order (campaign labels, presence) or when ingest needs multi-master availability more than conservation. Do not call a health-check VIP 'consensus'."
+      }
+    },
+    {
+      "id": "dynamo-quorum",
+      "product": "Dynamo-style quorum store",
+      "cells": {
+        "workload": "Partition-key item access at high write availability: session blobs, shopping-cart documents, Ad Click campaign metadata. Query tables designed up front. Not SQL joins.",
+        "consistency": "Tunable W/R with W+R>N overlap under stable membership. Overlap is not linearizability. Sloppy quorums, hinted handoff, and concurrent versions need a named repair (vector or LWW). Default DynamoDB eventual reads are a different API from Cassandra QUORUM.",
+        "latency": "Low ms in-region when the preference list is healthy. p99 from hinted replay, read repair, hot partitions, and cross-DC ALL/LOCAL_QUORUM choice.",
+        "scaling": "Hash partitions / vnodes. Add nodes for write fan-out. You still own the partition key; celebrity keys throttle one vnode.",
+        "failure": "Node loss is expected. Unavailable only if you chose ALL or cannot form the named quorum. Repair and hinted handoff reconcile later. A reachable minority is not a 2-of-3 consensus majority.",
+        "costOps": "Compaction, repair, tombstones, and capacity alarms. Managed offerings remove JVM toil, not the model. Multi-DC multiplies repair.",
+        "whenNot": "Spendable TokenX balances, unique allocation that must not fork, or any object you would LWW by wall clock. Conditional writes can occupy a key; they do not make default quorum linearizable."
+      }
+    },
+    {
+      "id": "crdt-lww",
+      "product": "CRDT / last-write-wins",
+      "cells": {
+        "workload": "Concurrent edits that have a meaningful join: grow-only tags, observed counters, presence last-seen, Ad Click dashboard labels. Clients write without waiting for a leader.",
+        "consistency": "Replicas accept concurrent versions. CRDTs converge by associative, commutative, idempotent merge. LWW picks a timestamp or version tuple and discards siblings. Convergence is not business validity. Session/causal guarantees need extra metadata.",
+        "latency": "Local-write p50. Merge and anti-entropy add lag before readers agree. Clock skew makes LWW order an operational assumption, not physics.",
+        "scaling": "Any replica can take writes. Metadata (version vectors, tombstones) grows with replica/device identity unless compacted.",
+        "failure": "Partition is normal: both sides write. After heal, merge or LWW runs. An observed-remove set can resurrect a concurrent add. Tombstone GC too early reintroduces deletes.",
+        "costOps": "You test the merge under permutations and replay. You operate tombstone frontiers and identity compaction. Cheap to start; expensive when the type was wrong.",
+        "whenNot": "TokenX balances, reservations, or any conservation invariant. Do not LWW money, max() two replica balances, or treat a CRDT counter as a unique click_id. Security revocation usually needs monotonic-deny, not add-wins."
+      }
+    }
+  ],
+  "assumptions": [
+    "Three-replica consensus majority is 2-of-3 in one region unless a cell says otherwise. Five-node groups use 3-of-5.",
+    "CAP is per-operation partition policy (TokenX debit rejects without proven authority; labeled stale reads may continue). It is not a permanent two-of-three letter choice.",
+    "Dynamo-style row means client-tunable quorum plus eventual repair, not DynamoDB ConsistentRead and not Raft.",
+    "CRDT/LWW row assumes multi-master writes with a named merge. LWW uses a clock or version tuple you must state.",
+    "Latency figures are order-of-magnitude interview planning numbers, not SLOs from a named fleet.",
+    "TokenX exclusive terminals and idempotency keys are required on money paths regardless of which class you pick; picking CRDT/LWW for balances is still wrong."
+  ]
+}

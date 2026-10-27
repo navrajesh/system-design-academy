@@ -1,0 +1,98 @@
+{
+  "id": "multi-region-failure",
+  "title": "Region loss and traffic shift",
+  "description": "Walk a region outage. DNS/anycast shift is not a lossless cutover of a single-primary database. RPO is the replication you actually had.",
+  "relatedSlugs": [
+    "multi-region-design",
+    "disaster-scenarios",
+    "backup-restore-and-disaster-recovery",
+    "replication-and-failover"
+  ],
+  "assumptions": [
+    "Active-passive SQL primary in region A with async replica in region B unless a step says sync majority.",
+    "DynamoDB global tables and Cosmos-style multi-master are a different conflict story — not silently mixed in.",
+    "TokenX single-writer ledger does not become multi-master because DNS flipped."
+  ],
+  "steps": [
+    {
+      "id": "normal",
+      "title": "Healthy dual region",
+      "timeline": "t0: writes in region A. Replica in B lagged (example: 0.5–5 s async). Reads may be local-with-lag.",
+      "inFlight": "Writes wait on A. Cross-region reads optional.",
+      "consistency": "B is not linearizable with A under async.",
+      "durability": "Acknowledged on A. On B only after apply.",
+      "userVisible": "Local read latency in B if you allowed stale.",
+      "recovery": "Measure lag continuously. Lag is the RPO."
+    },
+    {
+      "id": "detection",
+      "title": "Detect region A loss",
+      "timeline": "t1: A is unreachable (AZ/region event). Health and DNS still advertise A until TTL/health.",
+      "inFlight": "Clients to A time out.",
+      "consistency": "No writer if you do not promote. Stale B reads if you fail open reads.",
+      "durability": "Unreplicated tail on A is the RPO.",
+      "userVisible": "Errors for writes. Reads depend on policy.",
+      "recovery": "Human or automated fence of A before B writes."
+    },
+    {
+      "id": "in-flight",
+      "title": "In-flight cross-region",
+      "timeline": "t1–t2: commits on A not on B.",
+      "inFlight": "UNKNOWN to clients. Those rows may be gone if A never returns and B is promoted.",
+      "consistency": "Do not read B as proof A failed the commit.",
+      "durability": "RPO > 0 for async. Sync majority across regions is a different latency tax you must have paid before.",
+      "userVisible": "Money APIs must say UNKNOWN, not declined.",
+      "recovery": "Idempotent retry after a new epoch only if the key store survived."
+    },
+    {
+      "id": "promotion",
+      "title": "Promote region B",
+      "timeline": "t2: fence A (disable routes, revoke lease). Promote B. DNS/anycast cutover.",
+      "inFlight": "DNS TTL still sends some traffic to A.",
+      "consistency": "New epoch. Old A must not accept writes if it returns.",
+        "durability": "Tail lost if async. That is not an instantaneous, lossless cutover.",
+      "userVisible": "Write errors until cutover; then possible missing last seconds of data.",
+      "recovery": "STONITH equivalent for the old region’s writer."
+    },
+    {
+      "id": "client-retry",
+      "title": "Clients follow DNS",
+      "timeline": "t2–t3: retries hit B with same keys.",
+      "inFlight": "Keys applied on B if the original never committed on B — correct. If A had committed and later heals, conflict.",
+      "consistency": "Fencing prevents dual apply.",
+      "durability": "Depends on fence.",
+      "userVisible": "Success after retry or persistent UNKNOWN if key state lost.",
+      "recovery": "Sticky regional identity in the key."
+    },
+    {
+      "id": "consistency",
+      "title": "Conflict if A returns",
+      "timeline": "t3: A heals with unreplicated commits.",
+      "inFlight": "Must rewind A or reconcile row-by-row. Not automatic.",
+      "consistency": "Split brain if both writable.",
+      "durability": "Backups of A may hold the only copy of the tail — restore vs discard is a business call.",
+      "userVisible": "Possible missing transfers vs duplicate — this is why TokenX is single-writer.",
+      "recovery": "Run reconciliation. Ads can drop a window; money cannot guess."
+    },
+    {
+      "id": "recovery",
+      "title": "Rebuild topology",
+      "timeline": "t4: new replica in healed A. Lag catch-up from B.",
+      "inFlight": "Do not dual-write during catch-up.",
+      "consistency": "A is derived replica until you fail back with another fence.",
+      "durability": "Failback is another promotion event with the same eight steps.",
+      "userVisible": "Capacity and latency return.",
+      "recovery": "Game-day this path. DNS TTL is part of RTO."
+    },
+    {
+      "id": "user-visible",
+      "title": "User-visible outcome",
+      "timeline": "End: writes in B, RPO of async tail, RTO of detect+fence+DNS.",
+      "inFlight": "UNKNOWN keys reconciled.",
+      "consistency": "Not linearizable across the event.",
+      "durability": "Not lossless under async replica.",
+      "userVisible": "Outage minutes, possible lost un-replicated writes, successful keyed retries.",
+      "recovery": "If you needed RPO=0 you needed sync majority and its latency before the incident."
+    }
+  ]
+}

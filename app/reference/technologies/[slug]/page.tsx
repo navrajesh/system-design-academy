@@ -4,7 +4,7 @@ import { notFound } from "next/navigation";
 import { MDXRemote } from "next-mdx-remote/rsc";
 import { architectureMdxComponents } from "@/components/architecture/mdx-components";
 import { LessonCrossLink } from "@/components/architecture/lesson-cross-link";
-import { getDeepDive, getDeepDives } from "@/lib/architecture";
+import { getArchitectureCatalog, getDeepDive, getDeepDives } from "@/lib/architecture";
 
 type Props = { params: Promise<{ slug: string }> };
 
@@ -23,12 +23,14 @@ export default async function TechnologyDeepDivePage({ params }: Props) {
   const { slug } = await params;
   const page = getDeepDive(slug);
   if (!page) notFound();
+  const landscapeTitle =
+    getArchitectureCatalog().landscapes.find((item) => item.id === page.landscape)?.title ?? page.landscape;
   return (
     <article>
       <header className="border-b border-slate-200 bg-white">
         <div className="mx-auto max-w-4xl px-5 py-10 sm:px-8 sm:py-14">
-          <Link href="/reference/landscapes/storage" className="text-sm font-medium text-slate-500 hover:text-ink">
-            Back to Storage & Data
+          <Link href={`/reference/landscapes/${page.landscape}`} className="text-sm font-medium text-slate-500 hover:text-ink">
+            Back to {landscapeTitle}
           </Link>
           <p className="mt-6 text-xs font-bold uppercase tracking-[0.18em] text-cobalt">Library deep dive · not a curriculum lesson</p>
           <h1 className="mt-3 font-display text-4xl font-semibold tracking-tight text-ink sm:text-5xl">{page.title}</h1>

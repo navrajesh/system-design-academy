@@ -145,7 +145,7 @@ Retain: **match threads to downstream occupancy, never block the I/O loop, put C
 
 </RealExamples>
 
-<InterviewTraps title="Concurrency slogans that fail at IC6">
+<InterviewTraps title="Concurrency slogans that fail in staff+ interviews">
 
 - **“Async is faster.”** Async is a **scheduling** model. A blocking 80 ms query still takes 80 ms; you only freed a loop thread you should not have blocked.
 - **“More threads use more cores.”** For wait-bound JDBC, extra threads increase memory and lock queues. Cores help CPU-bound workers.

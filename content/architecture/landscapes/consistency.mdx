@@ -1,0 +1,26 @@
+---
+kind: landscape
+id: consistency
+title: "CAP and consistency landscape"
+description: "Where quorum, consensus, leases, and CRDTs sit relative to a primary, and which slogans are illegal without a named boundary."
+landscape: consistency
+relatedSlugs:
+  - cap-and-consistency-models
+  - consensus-and-leader-election
+  - distributed-locks-and-leases
+  - distributed-transactions
+  - idempotency-and-deduplication
+---
+
+This landscape is a **catalog of correctness hops**, not a 65th lesson. CAP is a per-operation policy under a named partition, not a permanent C/A/P sticker. Linearizability is not the default of PostgreSQL READ COMMITTED, DynamoDB eventual indexes, or Kafka.
+
+Authoritative vs derived:
+
+- **Authoritative:** the store or log whose uniqueness/fencing boundary the product named (SQL constraint, DynamoDB conditional write, consensus log, ledger terminal).
+- **Derived:** caches, search, replica reads without a token, lock services used as caches.
+
+Leases expire. Distributed locks are not mutexes across partitions unless the lock service is the consensus boundary and every writer checks the epoch. Cross-boundary transactions need exclusive terminals and idempotency; 2PC without a recovery story is a slogan.
+
+Start with the [layered explorer](/reference/architecture), the [quorum vs consensus vs CRDT](/reference/landscapes/consistency) matrix, and [database failover](/reference/failures/database-failover) plus [multi-region failure](/reference/failures/multi-region-failure).
+
+Mechanism lessons: <LessonCrossLink slug="cap-and-consistency-models" />, <LessonCrossLink slug="consensus-and-leader-election" />, <LessonCrossLink slug="distributed-locks-and-leases" />, <LessonCrossLink slug="distributed-transactions" />, <LessonCrossLink slug="idempotency-and-deduplication" />.

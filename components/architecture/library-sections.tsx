@@ -41,7 +41,7 @@ export function FailureModes(props: SectionProps) {
   return <Section {...props} eyebrow="Failure modes and operational tradeoffs" icon={TriangleAlert} tone="#d05f42" />;
 }
 export function LibraryInterviewTraps(props: SectionProps) {
-  return <Section {...props} eyebrow="IC6 interview traps" icon={AlertTriangle} tone="#d05f42" />;
+  return <Section {...props} eyebrow="Interview insights" icon={AlertTriangle} tone="#d05f42" />;
 }
 export function LibraryMentalModel(props: SectionProps) {
   return <Section {...props} eyebrow="Mental model to retain" icon={Brain} tone="#1e7160" />;

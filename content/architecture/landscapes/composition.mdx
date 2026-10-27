@@ -1,0 +1,31 @@
+---
+kind: landscape
+id: composition
+title: "Architecture and interview composition"
+description: "How TokenX, Ad Click Aggregator, and other mock systems assemble these products without adding a 65th lesson or a new interview prompt."
+landscape: composition
+relatedSlugs:
+  - design-tokenx
+  - design-an-ad-click-aggregator
+  - driving-a-system-design-interview
+  - architecture-review-practice
+  - graceful-degradation
+---
+
+This landscape is a **composition map**, not a new mock interview. Module 7 prompts stay in `content/lessons/`. Here we only show which library hops those designs must name.
+
+TokenX (fail-closed ledger):
+
+- Authoritative: ledger rows with exclusive terminals (credited vs cancelled) and durable idempotency keys.
+- Derived: Redis balances, search, analytics, Kafka copies.
+- Illegal: treating a signed request log, a cache hit, or a 200 from an UNKNOWN timeout as proof of settlement.
+
+Ad Click Aggregator (high-volume, fail-open ingest):
+
+- Authoritative: deduped click identity (`click_id`) at the uniqueness store you name.
+- Derived: windows, leaderboards, “almost real-time” dashboards.
+- Illegal: stealing TokenX isolation for ads, or ads' lossy windows for money.
+
+Start with the [layered explorer](/reference/architecture), the [TokenX vs ads](/reference/landscapes/composition) matrix, and [multi-region failure](/reference/failures/multi-region-failure). Progress stays in `sda:completed-lessons:v1` and is not written by this library.
+
+Mechanism lessons: <LessonCrossLink slug="design-tokenx" />, <LessonCrossLink slug="design-an-ad-click-aggregator" />, <LessonCrossLink slug="driving-a-system-design-interview" />, <LessonCrossLink slug="architecture-review-practice" />, <LessonCrossLink slug="graceful-degradation" />.

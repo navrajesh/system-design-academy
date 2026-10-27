@@ -21,7 +21,7 @@ export function BigPicture(props: SectionProps) { return <Section {...props} eye
 export function UnderTheHood(props: SectionProps) { return <Section {...props} eyebrow="Under the hood" icon={Sparkles} tone="#8157c9" />; }
 export function MentalModel(props: SectionProps) { return <Section {...props} eyebrow="Mental model to retain" icon={Brain} tone="#1e7160" />; }
 export function RealExamples(props: SectionProps) { return <Section {...props} eyebrow="Real examples" icon={Network} tone="#238275" />; }
-export function InterviewTraps(props: SectionProps) { return <Section {...props} eyebrow="IC6 interview traps" icon={AlertTriangle} tone="#d05f42" />; }
+export function InterviewTraps(props: SectionProps) { return <Section {...props} eyebrow="Interview insights" icon={AlertTriangle} tone="#d05f42" />; }
 export function Tradeoffs(props: SectionProps) { return <Section {...props} eyebrow="Trade-offs" icon={Scale} tone="#df8d1b" />; }
 
 export function ArchitectureDiagram({ chart, title, children }: { chart: string; title?: string; children?: React.ReactNode }) {

@@ -128,6 +128,7 @@ test("failover walkthrough requires named steps and rejects lossless slogans", (
   const ok = validateFailover(
     {
       id: "database-failover",
+      title: "Primary failure",
       assumptions: ["sync commit on primary"],
       relatedSlugs: ["replication-and-failover"],
       steps: ids.map((id) => ({ id, ...step })),
@@ -136,9 +137,22 @@ test("failover walkthrough requires named steps and rejects lossless slogans", (
     known,
   );
   assert.deepEqual(ok, []);
+  const named = validateFailover(
+    {
+      id: "cache-outage",
+      title: "Cache outage",
+      assumptions: ["cache is derived"],
+      relatedSlugs: ["caching-patterns-and-invalidation"],
+      steps: ids.map((id) => ({ id, ...step })),
+    },
+    "cache-outage.json",
+    known,
+  );
+  assert.deepEqual(named, []);
   const bad = validateFailover(
     {
       id: "database-failover",
+      title: "Primary failure",
       assumptions: ["x"],
       relatedSlugs: [],
       steps: ids.map((id) => ({ id, ...step, recovery: "instantaneous failover is lossless" })),

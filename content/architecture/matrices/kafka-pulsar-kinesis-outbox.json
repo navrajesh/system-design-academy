@@ -1,0 +1,77 @@
+{
+  "id": "kafka-pulsar-kinesis-outbox",
+  "title": "Kafka vs Pulsar-class vs Kinesis-class vs DB outbox-only",
+  "description": "Pick a log or skip the log from access pattern and the durability envelope you can name. TokenX money is the ledger, not the topic.",
+  "landscape": "kafka-fault-tolerance",
+  "relatedSlugs": ["kafka-delivery-and-failure", "kafka-internals", "transactions-across-boundaries", "stream-processing-and-windows"],
+  "columns": [
+    { "id": "workload", "label": "Workload" },
+    { "id": "consistency", "label": "Consistency" },
+    { "id": "latency", "label": "Latency" },
+    { "id": "scaling", "label": "Scaling" },
+    { "id": "failure", "label": "Failure" },
+    { "id": "costOps", "label": "Cost / ops" },
+    { "id": "whenNot", "label": "When not to choose" }
+  ],
+  "rows": [
+    {
+      "id": "kafka",
+      "product": "Kafka partitioned log",
+      "cells": {
+        "workload": "Durable append-only facts, independent consumer groups, replay inside retention, partition-key order. TokenX settlement commands and Ad Click billed facts after an outbox or collector append.",
+        "consistency": "Append order per partition, not event-time. At-least-once to consumers unless you name a produce-plus-offset transaction boundary. Offsets are group progress, not ledger proof. Not a linearizable money store.",
+        "latency": "Produce p50 often low-ms in-region after ISR ack. Consume lag is HW minus applied offset. Page-cache append is not an fsync certificate.",
+        "scaling": "Partitions cap one group's parallelism. Hot keys pin one partition. Add partitions only as a key-mapping change.",
+        "failure": "ISR shrink vs minISR=2 rejects writes. Unclean election can drop acknowledged offsets. Retention deletes. Consumer lag and dual-owner rebalance are independent of broker failover.",
+        "costOps": "You run brokers, disks, ISR, controller/KRaft, retention, consumer groups, DLQ ownership. Replication bytes ≈ produce × RF.",
+        "whenNot": "When the only consumer is a couple of workers on the primary, or you cannot staff RF=3 / acks=all / minISR=2 / ISR-only election. Do not treat the log as TokenX balances."
+      }
+    },
+    {
+      "id": "pulsar",
+      "product": "Pulsar-class segmented log",
+      "cells": {
+        "workload": "Multi-tenant topics, many independent subscriptions (cursors) per topic, optional segment offload to object storage, geo-replication as a named cluster feature.",
+        "consistency": "Per-partition (bundle) append order. Each subscription has its own cursor. Still at-least-once at external sinks. Segmented storage does not make event-time order. Not TokenX conservation.",
+        "latency": "Produce waits on bookie ack-quorum, not Kafka ISR by that name. Catch-up can read sealed segments/object offload instead of one broker's whole partition file.",
+        "scaling": "Brokers (compute/serving) and bookies (durable segments) scale on different axes. Bundles split for topic load.",
+        "failure": "Ack-quorum not met rejects the write. Bookie loss is a storage-plane failure; broker loss is a serving-plane failure; metadata store loss is a third plane. Name ensemble / write quorum / ack quorum.",
+        "costOps": "Two storage planes plus metadata. BookKeeper disks, offload, and tenant quotas. Operational surface is larger than a small Kafka cluster.",
+        "whenNot": "A small team that cannot staff brokers + bookies + metadata. Spendable balances as a Pulsar topic. Assuming geo-replication is a synchronous ledger."
+      }
+    },
+    {
+      "id": "kinesis",
+      "product": "Kinesis-class managed shards",
+      "cells": {
+        "workload": "AWS-centric ingest with partition keys, Lambda/Firehose/consumers, you do not SSH the broker. Replay only inside the retention you pay for.",
+        "consistency": "Per-shard sequence order. Shared GetRecords throughput versus enhanced fan-out. No Kafka consumer-group coordinator you operate. Iterator position is progress, not a SQL commit.",
+        "latency": "Standard GetRecords is poll-and-wait (often hundreds of ms). Enhanced fan-out lowers that tax. Not a sub-ms cache.",
+        "scaling": "Split/merge shards or on-demand mode. Classic provisioned planning: on the order of 1 MB/s or 1,000 records/s ingest per shard—measure the current account limits.",
+        "failure": "You do not tune ISR. Provisioned throttling, expired iterators after falling behind retention, regional impairment. No unclean-election knob; also no on-disk hexdump of your log.",
+        "costOps": "Shard-hour or on-demand plus PUT and extended retention. Default retention is 24 h unless you pay to extend (up to a long window the vendor names). Replay dies when retention dies.",
+        "whenNot": "You needed self-managed multi-week offset replay, Kafka-class consumer groups, or a log you restore from your own disks. TokenX money still belongs in a ledger, not a shard."
+      }
+    },
+    {
+      "id": "db-outbox",
+      "product": "DB outbox-only",
+      "cells": {
+        "workload": "Primary already commits the business row. A few workers need at-least-once fan-out (notify, search, analytics) without a partitioned log product.",
+        "consistency": "Commit order of the source database. No independent consumer groups on a durable multi-reader log. CDC/outbox apply is a second boundary: at-least-once plus an idempotent sink.",
+        "latency": "Poll interval or CDC slot lag, often hundreds of ms to seconds, not ISR round-trip.",
+        "scaling": "One publisher until WAL/slot or poller CPU saturates. Many independent replayable consumers are why you add a log, not more threads on the same poller.",
+        "failure": "Poller crash delays fan-out; the ledger row remains. Dual-write without an outbox can commit money and lose the event, or the reverse. Replication slot fill can halt the primary.",
+        "costOps": "No broker cluster. You still own the publisher, the outbox table or CDC slot, idempotent sinks, and backpressure into the primary.",
+        "whenNot": "Partition parallelism, many independent groups, or replay measured in days. Do not skip the outbox and dual-write Kafka 'for speed.' TokenX ACK still waits on the ledger transaction, not on the poller."
+      }
+    }
+  ],
+  "assumptions": [
+    "Kafka planning default: RF=3, acks=all, min.insync.replicas=2, producer idempotence, ISR-only leader election, finite retention. HW is the exclusive ISR read gate; LEO can sit ahead; KIP-101 truncates diverged followers by leader epoch.",
+    "Pulsar-class: brokers plus BookKeeper-class bookies; name ensemble, write quorum, and ack quorum per topic. Metadata is a separate authority.",
+    "Kinesis-class: managed shards, vendor AZ replication, retention you pay for (24 h unless extended). Throughput numbers are order-of-magnitude planning, not a named fleet SLO.",
+    "Outbox-only: business row and outbox row in one primary transaction; publisher is async. No claim that CDC is atomic with the sink.",
+    "All four classes deliver at-least-once to external sinks unless a named boundary (unique key, Kafka produce-plus-offset transaction, SQS FIFO queue-window dedup) is in force. None is TokenX money."
+  ]
+}

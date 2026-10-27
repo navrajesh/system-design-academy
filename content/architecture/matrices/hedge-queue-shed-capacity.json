@@ -1,0 +1,84 @@
+{
+  "id": "hedge-queue-shed-capacity",
+  "title": "Hedge vs bounded queue vs shed vs raise capacity",
+  "description": "Four ways to keep waiting finite. They are not interchangeable: hedge spends spare replicas, a bound caps W, shed refuses work, and capacity adds cashiers after warm-up.",
+  "landscape": "performance",
+  "relatedSlugs": [
+    "tail-latency-control",
+    "latency-throughput-and-queues",
+    "backpressure-and-overload",
+    "autoscaling-and-capacity-planning"
+  ],
+  "columns": [
+    { "id": "workload", "label": "Workload" },
+    { "id": "consistency", "label": "Consistency" },
+    { "id": "latency", "label": "Latency" },
+    { "id": "scaling", "label": "Scaling" },
+    { "id": "failure", "label": "Failure" },
+    { "id": "costOps", "label": "Cost / ops" },
+    { "id": "whenNot", "label": "When not to choose" }
+  ],
+  "rows": [
+    {
+      "id": "hedge",
+      "product": "Hedged / speculative read",
+      "cells": {
+        "workload": "Read fan-out where the parent waits on max-of-N: portfolio pages, operator dashboards, replica-tolerant GET. Same logical read, second replica after a delay. Not a write path unless the two copies share one idempotency key.",
+        "consistency": "Duplicate derived reads. A replica answer is bounded-stale, not the latest committed ledger row. Hedging a TokenX debit without the same transfer_id is a double-apply path. Dashboards may be partial; spendable money may not.",
+        "latency": "Cuts independent tails if you wait until child p95 then send a second copy (extra offered load ≈ the tail mass, about 5%, not 2×). Immediate hedge is 2× load. Correlated tails (one hot row, one GC, one AZ) do not improve; they double waiters.",
+        "scaling": "Spends spare replica capacity. Does not add servers, partitions, or a second primary. Extra QPS lands in the same load-balancer pools the first copy used.",
+        "failure": "If you close the client socket without cancelling the loser, both queries keep locks and pool slots (orphaned work). Hedge into an already overloaded pool amplifies brownout. Timeout on a write is UNKNOWN, not a safe rollback.",
+        "costOps": "Extra replica CPU and often cross-AZ bytes. You operate deadline propagation, real cancel (query abort, not just RST), and a named duplicate-load budget. Telemetry must count hedged copies separately from user requests.",
+        "whenNot": "Spendable writes, billed-click identity, correlated locks, or a pool already at saturation. Hedging is not a capacity plan and not a substitute for a bounded queue."
+      }
+    },
+    {
+      "id": "bounded-queue",
+      "product": "Bounded queue",
+      "cells": {
+        "workload": "Any hop that absorbs a short burst: API in-flight slots, Kafka producer buffer, ingress wait queue, thread pool. Name the boundary. Smooths surplus only while burst duration × surplus ≤ K.",
+        "consistency": "Does not change commit rules. Queueing a debit after the client deadline is orphan production, not a safer commit. A full buffer is not uniqueness and not exactly-once.",
+        "latency": "Admitted waiting time is capped. Little's Law at this hop: pick λ and target W, then K ≈ λW. Unbounded queues donate p99 even when mean service time is flat. Block-until-timeout converts a downstream stall into user latency.",
+        "scaling": "Does not create cashiers. Protects the current pool so queue depth is a leading autoscale signal instead of a memory bomb. Autoscaling still needs warm-up; the bound holds during that window.",
+        "failure": "When full you must reject or block with a short timeout. An unbounded LinkedBlockingQueue you forgot to cap OOMs. Kafka `max.block.ms` of tens of seconds pins API threads. Timeout while queued is UNKNOWN if the handler may have started.",
+        "costOps": "Cheap: config plus memory for K slots. You operate the overflow metric and the policy. Cost shows up when you skip the bound and pay incident minutes plus retry amplification.",
+        "whenNot": "Surplus longer than the bound (shed the excess). As a substitute for provisioned primary IOPS or partition count. TokenX if a queue timeout is treated as a rollback."
+      }
+    },
+    {
+      "id": "shed",
+      "product": "Load shed / admission 429",
+      "cells": {
+        "workload": "Overload and brownout: offered λ above sustainable μ for longer than a bound can absorb. Drop or 429 the excess class so admitted work keeps the SLO. Priority: TokenX transfers and billed facts outrank debug and fan-out refresh.",
+        "consistency": "HTTP 429 (or equivalent) is proven non-accept: the server did not apply the debit. Timeout is UNKNOWN. Rate limits are admission, not uniqueness. Limiter-store down: fail-closed on a claimed TokenX abuse cap; fail-open with a local degraded cap for Ad Click ingest is a named product choice.",
+        "latency": "Fast no. Protects admitted p99 by refusing work that would wait past the deadline. Shedding uniqueness checks to 'save the database' is an integrity bug, not a latency win.",
+        "scaling": "Preserves useful goodput of the current pool. Pairs with raise-capacity: shed during the warm-up window; do not wait for pods that are not Ready. Does not add replicas by itself.",
+        "failure": "Clients that retry 429 without jitter refill the pool. Shed at the edge while the app still has an unbounded queue is a lie. One hot tenant can consume all of K unless keys and fairness are named. 503 from an empty balancer pool is a different failure than an application 429.",
+        "costOps": "Lost optional work versus saved incident minutes. You operate Retry-After, priority lanes, limiter keys, and the fail-open vs fail-closed choice. Edge rate-limit billing is separate from origin compute.",
+        "whenNot": "When the miss is a missing floor of warm replicas you could have pre-provisioned for a known peak. When you 429 the authoritative money path instead of failing closed with a named reason. When a 30 s spike would fit in a honest K."
+      }
+    },
+    {
+      "id": "raise-capacity",
+      "product": "Raise capacity (HPA / KEDA / provision)",
+      "cells": {
+        "workload": "Sustained or predicted growth of a homogeneous pool: stateless API, collectors, consumers (capped at partition count). HPA on wait or lag; KEDA on queue depth, Kafka lag, or cron; scheduled floor for seasonal peaks. Not a 30-second tail hedge.",
+        "consistency": "More replicas of derived compute. Does not add a PostgreSQL primary, shard count, or a split of one hot ledger row. New pods with empty Redis caches can stampede the primary and serve stale fills until warm.",
+        "latency": "Improves waiting only after warm-up (JIT, connection pools, cache fill). Planning default in the autoscaling lesson is on the order of 90 s before a replica is useful. Cold start and scale-to-zero on a debit path add seconds to p99 before they help.",
+        "scaling": "This is the scale-out of the pool. Availability-zone floor is ceil(N / (z − 1)) math, not hope. Extra consumers above partition count idle. Authorities (primary, partitions, broker disk) are provisioned on a longer lead time.",
+        "failure": "Lagging CPU scales too late while offered load is already queued. Aggressive scale-in dumps pools and caches. HPA on the database Deployment is the wrong target. Dual-region writes are a conflict-rule problem, not 'more pods.'",
+        "costOps": "Instance-hours, bin packing, reserved versus on-demand. Headroom is paid idle so the next burst fits before warm-up. Cache-fill and uniqueness QPS from cold pods are amplification costs, not free.",
+        "whenNot": "Bottleneck is a lock, a single primary, or partition skew. A short spike is cheaper to bound-and-shed than to wait for pods. Hedging a read is cheaper than doubling the fleet for independent tails."
+      }
+    }
+  ],
+  "assumptions": [
+    "Illustrative rates match the curriculum planning envelope: TokenX on the order of 2,000 commits/s; Ad Click peak ingest as in the autoscaling lesson. Not a measured fleet.",
+    "Hedge delay is at child p95 unless a cell says immediate. Independence of tails is the optimistic bound; shared locks correlate.",
+    "Bounded queue K is in-flight at one named hop (API, producer buffer, or ingress), not whole-path concurrency.",
+    "Shed means 429/503 with Retry-After, preferably before a uniqueness insert on writes. Timeout is not treated as rollback.",
+    "Raise capacity means HPA, KEDA, or provisioned replicas of a stateless pool. It does not mean adding a second ledger primary or splitting a hot row.",
+    "Warm-up uses a 90-second planning default when a cell mentions it. Ready is not warm.",
+    "These four controls compose: bound K, shed the surplus, hedge only replica-tolerant reads with a budget, raise capacity from a leading queue. They are not ranked as universally better."
+  ]
+}

@@ -1,0 +1,26 @@
+---
+kind: landscape
+id: performance
+title: "Performance landscape"
+description: "Where CDN, cache, queues, admission, tails, and profiling sit, and which of those hops are allowed to be stale."
+landscape: performance
+relatedSlugs:
+  - latency-throughput-and-queues
+  - caching-patterns-and-invalidation
+  - tail-latency-control
+  - performance-budgets-and-slos
+  - backpressure-and-overload
+---
+
+This landscape is a **catalog of latency hops**, not a 65th lesson. Profiling backends and traces are **derived telemetry**. They never become the TokenX ledger.
+
+Authoritative vs derived:
+
+- **Authoritative:** primary commit, object PUT acknowledgement, Kafka produce acknowledgement under the named ISR policy.
+- **Derived:** Redis, CDN, read replicas, aggregation windows, dashboards, p99 traces.
+
+Synchronous wait is the caller timeout. Queues convert load into delay; they do not create durability. Hedged requests and retries multiply work unless bounded. SLO miss budget is a named event, window, and percentile — not “we are 99.9%.”
+
+Start with the [layered explorer](/reference/architecture), storage's [cache vs replica vs CDN](/reference/landscapes/storage) matrix (derived-read options), and the [overload](/reference/failures/overload) plus [cache outage](/reference/failures/cache-outage) walkthroughs.
+
+Mechanism lessons: <LessonCrossLink slug="latency-throughput-and-queues" />, <LessonCrossLink slug="caching-patterns-and-invalidation" />, <LessonCrossLink slug="tail-latency-control" />, <LessonCrossLink slug="performance-budgets-and-slos" />, <LessonCrossLink slug="backpressure-and-overload" />.

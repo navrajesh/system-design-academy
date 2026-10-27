@@ -1,0 +1,97 @@
+{
+  "id": "cache-outage",
+  "title": "Redis cache outage",
+  "description": "Walk a derived-cache loss. Primary remains authoritative. Stampede and stale-if-error are product choices, not magic.",
+  "relatedSlugs": [
+    "caching-patterns-and-invalidation",
+    "graceful-degradation",
+    "backpressure-and-overload"
+  ],
+  "assumptions": [
+    "Redis is derived. PostgreSQL (or the selected primary) owns rows.",
+    "Cache-aside: miss hits the primary. Write-through is not this walkthrough.",
+    "TokenX settlement is not served from Redis."
+  ],
+  "steps": [
+    {
+      "id": "normal",
+      "title": "Healthy cache-aside",
+      "timeline": "t0: app reads Redis then primary on miss. TTL or explicit versioning.",
+      "inFlight": "GET cache; on miss GET primary then SET cache.",
+      "consistency": "Hits can be stale up to TTL. Primary is source of truth.",
+      "durability": "Cache is rebuildable. Primary WAL/commit is unchanged.",
+      "userVisible": "p99 includes cache RTT on hit; miss includes primary.",
+      "recovery": "Not in this step. Watch hit rate and primary QPS."
+    },
+    {
+      "id": "detection",
+      "title": "Detect cache unavailability",
+      "timeline": "t1: Redis process, shard, or network dies. Timeouts exceed the cache budget (example: 50–200 ms).",
+      "inFlight": "In-flight GETs to Redis fail. App must fail open to primary or fail closed per API.",
+      "consistency": "No cache does not mean the primary is wrong.",
+      "durability": "No cache durability loss of authoritative rows.",
+      "userVisible": "Latency spike if every request hits primary. Errors if the app treats cache as required.",
+      "recovery": "Do not failover the primary because Redis died."
+    },
+    {
+      "id": "in-flight",
+      "title": "In-flight cache operations",
+      "timeline": "t1–t2: SET/GET in flight have no cache outcome.",
+      "inFlight": "Lost SETs are fine. Lost GETs must fall through. Write-behind queues if any are a separate RPO.",
+      "consistency": "Clients may see mix of stale hits (before death) and fresh primary reads.",
+      "durability": "Write-behind not yet on primary is a loss window you must have named earlier — illegal for TokenX.",
+      "userVisible": "Timeouts then slower 200s, or 5xx if fail-closed on cache.",
+      "recovery": "Drop write-behind if you cannot prove primary apply."
+    },
+    {
+      "id": "promotion",
+      "title": "No cache promotion",
+      "timeline": "t2: there is no replica of Redis that becomes authoritative.",
+      "inFlight": "Do not promote a replica cache as a ledger.",
+      "consistency": "Primary remains the only write authority.",
+      "durability": "Unchanged on primary.",
+      "userVisible": "Degraded mode banner optional; correctness banner required if you shed.",
+      "recovery": "Keep serving from primary with admission control."
+    },
+    {
+      "id": "client-retry",
+      "title": "Client and app retries",
+      "timeline": "t2–t3: clients retry GETs. Write retries still need idempotency keys.",
+      "inFlight": "Retry amplification onto the primary is the real failure.",
+      "consistency": "Retries of reads are safe. Retries of writes are not unless keyed.",
+      "durability": "Primary commits as usual.",
+      "userVisible": "429 if you shed. UNKNOWN on write timeouts.",
+      "recovery": "Bound retries, jitter, and a primary concurrency limiter."
+    },
+    {
+      "id": "consistency",
+      "title": "Consistency during stampede",
+      "timeline": "t3: thundering herd on popular keys.",
+      "inFlight": "Many concurrent primary reads for one key.",
+      "consistency": "Single-flight / request coalescing is optional but recommended. Still not linearizable across clients.",
+      "durability": "Primary load, not data loss.",
+      "userVisible": "p99 collapse, possible 503.",
+      "recovery": "Coalesce, serve stale-if-error only if the product allows stale."
+    },
+    {
+      "id": "recovery",
+      "title": "Restore Redis",
+      "timeline": "t4: Redis returns empty or with leftover TTL data.",
+      "inFlight": "Warm from primary on miss. Do not bulk-load stale snapshots as truth.",
+      "consistency": "Cold cache is cache misses, not wrong commits.",
+      "durability": "Unchanged.",
+      "userVisible": "Latency returns as hit rate recovers.",
+      "recovery": "Controlled warm-up; watch primary QPS."
+    },
+    {
+      "id": "user-visible",
+      "title": "User-visible outcome",
+      "timeline": "End state: primary survived; some users saw slowness or shed reads.",
+      "inFlight": "None required to be replayed for cache GETs.",
+      "consistency": "If you served stale-if-error, say so. TokenX never did.",
+      "durability": "Authoritative rows intact.",
+      "userVisible": "Degraded catalog OK; money APIs fail closed without cache only if you wrongly required it.",
+      "recovery": "Incident review: why cache was on the critical path."
+    }
+  ]
+}

@@ -171,7 +171,7 @@ The log commits seq 18, the response is lost, and the WebSocket is already dead.
 
 </RealExamples>
 
-<InterviewTraps title="IC6 follow-ups and a defensible rubric">
+<InterviewTraps title="Staff+ follow-ups and a defensible rubric">
 
 ### Questions the interviewer should be able to ask
 
@@ -185,7 +185,7 @@ The log commits seq 18, the response is lost, and the WebSocket is already dead.
 - Why is the WebSocket not the commit path, and how does reconnect avoid creating duplicate seqs?
 - TokenX product asks to “confirm a transfer in the chat socket.” What do you refuse?
 
-### IC6 scoring rubric
+### Staff+ scoring rubric
 
 - **Requirements:** 1:1 and group as membership plus one conversation log; encryption, media, receipts, and presence have named owners.
 - **Quantification:** daily messages to peak commits, storage, ping QPS, and write amplification for groups.
@@ -239,7 +239,7 @@ This design becomes inappropriate when a room has celebrity-scale membership wit
     { label: "Committing TokenX on the pay frame is fine if the gateway uses sticky sessions.", feedback: "Stickiness is not a unique index and not a ledger. Sockets drop on restart." }
   ]}
   correct={0}
-  explanation="IC6 chat design keeps the log, the radio, the heartbeat, and the notary on separate contracts. E2E limits what the server can read; it does not make receipts or sockets authoritative for money."
+  explanation="Staff+ chat design keeps the log, the radio, the heartbeat, and the notary on separate contracts. E2E limits what the server can read; it does not make receipts or sockets authoritative for money."
 />
 
 <ScenarioCheck

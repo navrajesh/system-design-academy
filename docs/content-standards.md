@@ -9,7 +9,7 @@ Every lesson must teach through five complementary modes while preserving the ni
 1. **Big Picture** — explain why the concept matters, where it fits, and preview the relevant architecture and state boundaries.
 2. **Under the Hood** — walk through execution, data flow, calculations, failure scenarios, and technical trade-offs step by step.
 3. **Mental Model to Retain** — provide a simple analogy plus a compact, transferable takeaway.
-4. **IC6 Interview Traps** — include challenging questions, likely follow-ups, and defensible answers or decision criteria.
+4. **Interview Traps** — include challenging questions, likely follow-ups, and defensible answers or decision criteria.
 5. **Practical Learning** — use concrete systems such as TokenX, the Ad Click Aggregator, or another technically appropriate production example.
 
 ## Mandatory frontmatter
@@ -46,7 +46,7 @@ Every lesson must use these sections in this order. Custom titles are encouraged
 3. `<MentalModel>` — give the learner a simple analogy and compact reasoning framework that transfers to new systems.
 4. `<ArchitectureDiagram>` — include a Mermaid diagram and prose that explains ownership, consistency boundaries, state, failure, and recovery paths.
 5. `<RealExamples>` — ground the mechanism in at least two credible product or infrastructure examples.
-6. `<InterviewTraps>` — identify mistakes, ambiguous claims, challenging follow-ups, and defensible responses expected at IC6 depth.
+6. `<InterviewTraps>` — identify mistakes, ambiguous claims, challenging follow-ups, and defensible responses expected at staff+ interview depth.
 7. `<Tradeoffs>` — compare alternatives across correctness, latency, availability, cost, and operational complexity.
 8. `<KnowledgeCheck>` — include at least one scored multiple-choice question with an explanation. Prefer two for lessons longer than 30 minutes.
 9. `<InterviewAnswer>` — end with a concise, spoken-style answer that a candidate could adapt, not memorize blindly.

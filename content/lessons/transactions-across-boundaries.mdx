@@ -143,7 +143,7 @@ The cross-shard subgraph is a pair of exclusive forks, not a chain. B is `ABSENT
 5. **“Retry on timeout.”** A timeout means unknown outcome. Retry with the same identity and query the durable workflow state. For TokenX, do not release a source reservation until B has committed `CANCELLED`.
 6. **“2PC guarantees availability.”** Prepared transactions can hold locks while a coordinator is unavailable; discuss recovery tooling and participant support.
 
-IC6 answers state the invariant first, minimize its atomic scope, then describe every ambiguous crash point.
+Staff+ answers state the invariant first, minimize its atomic scope, then describe every ambiguous crash point.
 
 </InterviewTraps>
 

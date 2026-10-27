@@ -1,0 +1,77 @@
+{
+  "id": "rest-grpc-websocket-sse",
+  "title": "REST vs gRPC vs WebSocket vs SSE",
+  "description": "Choose a protocol from retry safety, duplex need, and the commit boundary. Encoding is not a ledger.",
+  "landscape": "networking",
+  "relatedSlugs": ["http-apis-and-protocol-choice", "real-time-connections", "tcp-quic-and-connection-lifecycle"],
+  "columns": [
+    { "id": "workload", "label": "Workload" },
+    { "id": "consistency", "label": "Consistency" },
+    { "id": "latency", "label": "Latency" },
+    { "id": "scaling", "label": "Scaling" },
+    { "id": "failure", "label": "Failure" },
+    { "id": "costOps", "label": "Cost / ops" },
+    { "id": "whenNot", "label": "When not to choose" }
+  ],
+  "rows": [
+    {
+      "id": "rest",
+      "product": "REST / JSON HTTP",
+      "cells": {
+        "workload": "Public and partner APIs, browser and mobile JSON, resource-shaped reads and keyed writes. TokenX POST /debits and Ad Click POST /clicks.",
+        "consistency": "Each request is its own contract. GET may be cached. POST is not idempotent without a body key. HTTP 200 is a statement about a response, not proof unless the handler waited on the commit.",
+        "latency": "JSON encode/decode plus HTTP/1.1 or HTTP/2. Debuggable. Compression trades CPU for WAN bytes.",
+        "scaling": "Stateless handlers. Cacheable GET at CDN/edge. Writes scale with the store, not with the courier brand.",
+        "failure": "Client timeout is UNKNOWN if the handler might have committed. Gateway retry of unkeyed POST duplicates effects. 409 on a unique key is stored success, not a ban.",
+        "costOps": "OpenAPI, additive field evolution, gateway auth and rate limit. Easy to inspect on the wire.",
+        "whenNot": "Duplex chatter (typing, shared cursors) or a fleet that already speaks protobuf stubs and needs per-RPC deadlines as default. Never put spendable GET balances on a shared CDN."
+      }
+    },
+    {
+      "id": "grpc",
+      "product": "gRPC",
+      "cells": {
+        "workload": "Internal unary and streaming RPCs, protobuf schemas, deadlines, service-to-service. Same TokenX handler as JSON when you transcode.",
+        "consistency": "Unary is still one RPC. Deadlines cancel the caller, not the ledger. Stub retries without transfer_id mint a second command. Not a commit protocol. Streaming frames are not money.",
+        "latency": "Compact codec and HTTP/2 (or HTTP/3) multiplexing. Wins only if you do not JSON-transcode at the edge. TCP loss still HOL-blocks HTTP/2 streams.",
+        "scaling": "Many RPCs on one connection. Server streaming for feeds of derived events. Does not replace a partitioned log.",
+        "failure": "UNAVAILABLE plus automatic retries. Proto tag reuse breaks old binaries. Transcoding bugs are a second parser.",
+        "costOps": "Codegen, proto compatibility, grpc-web or a JSON gateway for browsers. You operate deadlines and retry budgets in stub + mesh + app.",
+        "whenNot": "Public JSON-only clients with no stub story, or a claim that binary encoding makes retries safe. TokenX unkeyed unary retries are the same bug as REST."
+      }
+    },
+    {
+      "id": "websocket",
+      "product": "WebSocket",
+      "cells": {
+        "workload": "Duplex notifications, typing, presence, operator consoles that send frames. TokenX receipts after the ledger commit; not the debit itself.",
+        "consistency": "Frames are transport. Presence is last_seen plus TTL, not authorization. Resume tokens ({connection_epoch, last_seq}) address a derived buffer. Missed seq means fetch status from the API.",
+        "latency": "After upgrade, low per-frame cost. Reconnect gap is a buffer, not a rollback. Handshake still pays TCP/TLS unless you already had a warm connection.",
+        "scaling": "Concurrent sockets, sticky L7 or a connection-aware router, ping QPS. Fan-out amplification is a separate budget. Slow consumers need a bound, then disconnect or coalesce.",
+        "failure": "Deploy drain and proxy idle timeouts RST live sockets. Unbounded send buffers are a memory incident. Partition shows presence ghosts until TTL.",
+        "costOps": "Connection-aware load balancing, drain, resume buffers, backpressure. Sticky affinity still breaks on restart.",
+        "whenNot": "TokenX debit as a WS message type without the same (tenant, transfer_id) as HTTP. Presence as a spendable lock. Billed Ad Click ingest on a socket ACK."
+      }
+    },
+    {
+      "id": "sse",
+      "product": "Server-Sent Events",
+      "cells": {
+        "workload": "Server-to-client event streams: Ad Click operator dashboards, one-way TokenX notifications, last-event-id resume. Client need not send frames.",
+        "consistency": "Last-Event-ID resumes a derived stream. Dashboards are labeled-stale views of the billed log. Not duplex, not a ledger, not read-your-writes unless you wait on the source.",
+        "latency": "HTTP response stream. First byte after commit+outbox lag. Proxies that buffer turn a stream into one dump.",
+        "scaling": "One direction, often cheaper than WebSocket if the client is silent. Still one handler occupancy per waiter unless the runtime is event-loop idle-friendly.",
+        "failure": "Intermediary buffering, dropped connections, resume gaps. Same drain story as other long HTTP. Fail-open dashboards must label delay; they must not ACK billed clicks.",
+        "costOps": "Fewer moving parts than WebSocket (no ping protocol of your own if the client uses EventSource). You still own Last-Event-ID buffers and proxy config.",
+        "whenNot": "The client must send frames (use WebSocket) or you need a request/response commit (use REST/gRPC). Do not CDN-cache the event stream as a shared GET of money."
+      }
+    }
+  ],
+  "assumptions": [
+    "Protocols are contracts. TokenX POST/unary commits only after the ledger unique insert; Ad Click 2xx only after unique log append. Timeouts are UNKNOWN.",
+    "gRPC here is HTTP/2 or HTTP/3 plus protobuf and deadlines. It is not automatically faster than JSON and does not provide end-to-end once-only effects.",
+    "WebSocket and SSE are notification paths. Presence and resume buffers are derived and expire. Sticky L7 is transport, not fencing.",
+    "TCP HOL, QUIC, and 0-RTT replay sit in the connection-lifecycle lesson. TLS 0-RTT is forbidden for TokenX debits.",
+    "Latency figures are order-of-magnitude interview planning numbers, not SLOs from a named production fleet."
+  ]
+}
