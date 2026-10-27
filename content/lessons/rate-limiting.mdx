@@ -1,0 +1,161 @@
+---
+title: "Rate Limiting"
+description: "Use token buckets and distributed counters as admission control with explicit fail-closed money versus fail-open ads behavior—never as uniqueness or exactly-once."
+module: 5
+moduleTitle: "Networking"
+order: 7
+duration: 36
+difficulty: "Intermediate"
+tags:
+  - rate limiting
+  - token bucket
+  - sliding window
+  - fairness
+  - Redis
+objectives:
+  - Choose token bucket, leaky bucket, or sliding window from burst and fairness needs
+  - Place limiter keys at tenant, API key, IP, or campaign and name the hot-key risk
+  - "State limiter-store failure: TokenX fail-closed on a claimed abuse cap; Ad Click local degraded limits"
+  - Keep rate limits distinct from uniqueness, Kafka acks, and Module 7 mock interviews
+---
+
+<BigPicture title="A turnstile, not a unique stamp">
+
+[Backpressure and overload](/learn/backpressure-and-overload) already treated rate limits as **admission**, not uniqueness. [Graceful degradation](/learn/graceful-degradation) decided **what you stop first**. This lesson is the **mechanism**: token bucket, leaky bucket, fixed window, sliding window / sliding log, local versus Redis versus eventual counters, and key choice.
+
+Module 7 **Design a Rate Limiter** is a later mock interview. Here you learn the algorithms and failure modes so that mock is not a vocabulary quiz.
+
+A 100 req/s cap does **not** make TokenX transfers unique. It does not make Ad Click `click_id` unique. If the limiter store is down, you must say whether you **fail closed** (refuse work you promised to cap) or **fail open** with a local degraded cap (keep billed ingest).
+
+</BigPicture>
+
+<UnderTheHood title="Buckets, windows, keys, then the store is down">
+
+### Algorithms
+
+- **Token bucket:** tokens refill at rate *r*, bucket holds burst *b*. A request costs 1 (or N) tokens. Allows bursts of *b*, then steady *r*. Good default for APIs.
+- **Leaky bucket:** queue leaks at *r*. Burst is queue depth. Shapes traffic smoother; adds latency (a queue) instead of instant 429.
+- **Fixed window:** count in wall-clock 1 s bins. Cheap. Burst of 2× at the window edge (last ms of T plus first ms of T+1).
+- **Sliding window / sliding log:** approximate or exact counts over the last T seconds. Fairer; more memory (log of timestamps) or more Redis ops.
+
+<Calculation label="Tenant cap and a Redis race (illustrative)">
+
+TokenX tenant cap **100 req/s**, burst **20**, window 1 s. Token bucket: refill 100 tokens/s, capacity 120 if you fold burst into the bucket, or capacity 20 plus rate 100—**say the parameters**. At 2,000 global req/s and 50 tenants, mean 40 rps/tenant; a celebrity tenant at 400 rps is 429 after burst.
+
+Redis `INCR` + `EXPIRE` without a transaction: a crash after INCR before PTTL can leak a key that never expires (**permanent 0 rps** if you treat existence as a lock) or, with GET+SET, lose counts. Use atomic `INCR` with `EXPIRE NX` on first increment, or a Lua script. Clock skew on sliding windows across replicas: a 200 ms skew on a 1 s window is a **20%** fairness error. Label it.
+
+Hot key: one campaign_id at 50k rps into one Redis shard. The limiter becomes the bottleneck. Shard by key; do not make the limiter a global lock for all ads.
+
+</Calculation>
+
+### Where it runs
+
+Edge / mesh / app / gateway can all 429. Pick **one** user-visible limiter for a class, or you stack 429s without a coherent Retry-After. Local in-process limits survive Redis loss but do not coordinate across replicas: *N* replicas × 100 rps = **100N** rps. Central Redis coordinates and adds a failure mode.
+
+**Limiter store down:**
+
+- **TokenX abuse/fraud cap you advertised:** **fail closed**. Unlimited spendable POSTs during a Redis outage is a product incident. 503 with Retry-After is honest.
+- **Ad Click public ingest:** often **fail-open** to a **local** degraded cap (e.g. 10% of normal, or a static per-pod cap) so a Redis outage does not drop the billed path. Uniqueness stays at the log. Dashboards may miss sampled debug.
+
+This is the same fail-closed money / fail-open ingest split as degradation, applied to the turnstile.
+
+<ExecutionTimeline
+  title="One TokenX transfer through a tenant bucket"
+  steps={[
+    { title: "Key", detail: "Limiter key is tenant_id, not client IP. NAT would share one IP across many tenants.", state: "Counter is derived admission state.", failure: "IP key 429s a whole office; one abusive tenant is not contained." },
+    { title: "Take token", detail: "Atomic Redis script: if tokens remaining, decrement; else 429 with Retry-After.", state: "No ledger write yet.", failure: "Non-atomic GET/SET loses burst or stuck-expires." },
+    { title: "Commit", detail: "On allow, unique insert plus debit. A 429 never reached the ledger.", state: "Ledger remains authority.", failure: "Treating 429 as uniqueness or treating allow as commit." },
+    { title: "Redis down", detail: "TokenX returns 503 on the money path because the advertised fraud cap cannot be enforced. Ads ingest switches to per-pod local caps.", state: "Policy named in the contract.", failure: "Fail-open TokenX ‘so payments stay up’ during a fraud event." }
+  ]}
+/>
+
+Fairness: isolate TokenX transfer class from debug, and billed clicks from scrape bots. Weighted fair queues belong with backpressure; here, **separate keys and separate buckets**.
+
+<InteractiveCalculation mode="little-law" title="429 versus queue: admitted rate times hold time" />
+
+If you queue instead of 429, occupancy is the leaky-bucket depth. That is extra latency, not extra uniqueness.
+
+</UnderTheHood>
+
+<MentalModel title="A nightclub turnstile">
+
+The bucket is a turnstile that lets 100 people per second and 20 in a rush. Redis is the shared clicker. If the clicker breaks, a bank (TokenX) closes the door; a stadium (ads ingest) uses a local usher with a lower number. The turnstile never stamps tickets—that is uniqueness at the vault.
+
+Retain: **rate is admission, keys define fairness, the store’s outage needs a named fail mode, and 429 is not a commit.**
+
+</MentalModel>
+
+<ArchitectureDiagram title="Edge bucket, Redis counter, and paths that skip or fail closed" chart={"flowchart LR\n  CLI[TokenX client] --> LIM[Tenant token bucket]\n  LIM -->|allow| API[TokenX API]\n  API --> LED[(Authoritative ledger)]\n  LIM -->|429| CLI\n  RED[(Redis counts)] --> LIM\n  RED -. down .-> FC[Fail closed 503]\n  ADS[Ad Click] --> ALIM[Campaign or IP bucket]\n  ALIM --> COL[Collector]\n  COL --> LOG[(Billed-fact log)]\n  RED -. down .-> LOC[Local degraded cap]\n  LOC --> COL"}>
+
+**Authoritative:** ledger uniqueness; billed-fact log. **Derived:** Redis counts, local clocks, Retry-After, mesh 429s. Solid edges are allow-then-commit. Dashed edges are limiter-store failure: TokenX 503, ads local cap. Recovery is atomic scripts, shard hot keys, do not stack three limiters with different windows, and never use the counter as a unique index.
+
+</ArchitectureDiagram>
+
+<RealExamples title="TokenX tenant fail-closed; ads local fail-open">
+
+**TokenX.** 100 rps/tenant, burst 20, key `tenant_id`. Fraud team requires the cap even during Redis loss → fail closed. Transfers that got through still need `transfer_id`. Rate limit does not replace [idempotency](/learn/idempotency-and-deduplication).
+
+**Ad Click.** Per-campaign 10k rps plus a global bot IP list. Redis outage: each collector enforces 2k rps local. Some campaigns exceed the global cap until Redis returns—**named**. Billed `click_id` still unique. Debug produce is sampled first ([graceful degradation](/learn/graceful-degradation)).
+
+<FailureScenario
+  title="The counter lies"
+  prompt="Fixed 1 s windows. A tenant sends 100 rps at 0.999 s and 100 rps at 1.001 s. Redis is also the uniqueness store in a proposal."
+  choices={[
+    { label: "Call 200 rps ‘within 100 rps’ because each window is legal; merge uniqueness into INCR.", impact: "Edge burst is 2×. INCR is not a ledger unique row.", recovery: "Token bucket or sliding window; uniqueness stays SQL/log." },
+    { label: "Switch to token bucket burst 20; keep uniqueness on the ledger; fail closed if Redis is the only abuse cap.", impact: "Burst is explicit. Stores are separate.", recovery: "Atomic refill script." },
+    { label: "Key only by IP so NAT’d mobile users share fairness with a botnet.", impact: "Wrong isolation unit.", recovery: "Tenant and API key for money; campaign plus IP for ads." }
+  ]}
+/>
+
+</RealExamples>
+
+<InterviewTraps title="Limiter folklore">
+
+- **“Rate limiting gives exactly-once.”** It gives 429s.
+- **“Redis INCR is a ledger.”** It is a counter with a TTL.
+- **“Fail-open is always more available.”** For TokenX fraud caps it is more stealable.
+- **“One global key is simplest.”** It is a hot shard and a fairness disaster.
+- **“Fixed windows are equivalent to token buckets.”** Edge burst of ~2× disagrees.
+- **“This lesson is the Module 7 rate limiter design.”** That mock still needs distributed config, multi-DC, and interview narrative.
+
+</InterviewTraps>
+
+<Tradeoffs title="Coordination, burst, and who suffers the 429">
+
+- **Local versus Redis versus gossip:** correctness of the cap versus availability of the path versus approximate fairness.
+- **Burst versus smooth leak:** UX for mobile retries versus queueing delay.
+- **IP versus tenant versus campaign:** NAT and bots versus hot keys.
+- **Fail closed versus local degraded:** fraud versus ingest availability.
+
+</Tradeoffs>
+
+<KnowledgeCheck
+  question="Redis limiter is down. TokenX advertised a fraud cap of 100 rps/tenant. What is the curriculum default?"
+  options={[
+    "Fail-open all POSTs because money must be available",
+    "Fail-closed spendable POSTs with 503 until the cap can be enforced; uniqueness would still apply if you did allow",
+    "ACK debits from the rate-limit key TTL",
+    "Switch to GET so CDNs rate-limit for you"
+  ]}
+  correct={1}
+  explanation="A cap you claimed is part of the product. Uniqueness is a different store and still required if traffic is allowed. Ads ingest may local-fail-open; that is a different path."
+/>
+
+<ScenarioCheck
+  scenario="Ad Click Redis cluster fails. Collectors can either drop all clicks, accept unlimited clicks, or enforce 2,000 rps per pod locally. TokenX Redis (same cache cluster) also fails. Finance fears both lost revenue and fraud."
+  question="Which split is consistent with this academy?"
+  options={[
+    { label: "Drop both TokenX and ads until Redis returns, so limits stay exact.", feedback: "Exact caps are not more important than a named ads ingest SLO. TokenX fail-closed is enough for money." },
+    { label: "TokenX 503 fail-closed on spendable APIs; ads ingest local per-pod caps with click_id uniqueness on the log; dashboards may undercount.", feedback: "Admission degrades differently per invariant. Uniqueness is not Redis INCR." },
+    { label: "Fail-open both; put uniqueness in the token bucket so one system remains.", feedback: "Buckets overflow and reset. They are not unique indexes." },
+    { label: "Have the mesh retry 429s automatically so users never see admission.", feedback: "Retrying 429s without jitter recreates overload. 429 is the point." }
+  ]}
+  correct={1}
+  explanation="Same invariant split as graceful degradation. Rate limiting stays admission. Module 7 can still drill a full distributed design later."
+/>
+
+<InterviewAnswer>
+
+“I use a token bucket as the default: rate r, burst b, key on tenant or campaign—not a shared NAT IP unless I am fighting bots. Fixed windows hide a 2× edge burst; sliding windows cost more storage and care about clock skew. Redis INCR must be atomic with expiry; the counter is derived admission, not a ledger. If Redis dies, TokenX fail-closes spendable APIs because we advertised a fraud cap; Ad Click collectors fail-open onto a local degraded cap so ingest survives, with click_id uniqueness still on the log. 429 is not uniqueness, not Kafka acks, and not exactly-once. I do not stack edge, mesh, and app limiters with three different windows without naming one user-visible policy.”
+
+</InterviewAnswer>

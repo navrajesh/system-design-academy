@@ -1,0 +1,162 @@
+---
+title: "Service Mesh and Proxies"
+description: "Treat sidecar and ambient proxies as an east-west policy hop: mTLS identity, timeouts, and retry budgets that must not retry unkeyed TokenX POSTs or replace Maglev math."
+module: 5
+moduleTitle: "Networking"
+order: 6
+duration: 38
+difficulty: "Advanced"
+tags:
+  - service mesh
+  - sidecar
+  - mTLS
+  - retries
+  - xDS
+objectives:
+  - Separate data-plane proxies from the control plane and from ledger authority
+  - Cap retries, timeouts, and outlier ejection so mesh plus app plus LB do not amplify
+  - Choose sidecar, ambient, or library proxy from identity and operational cost, not from a vendor slogan
+  - Fail closed on TokenX unkeyed POST retries; keep Ad Click retries on a stable click_id
+---
+
+<BigPicture title="A sidecar is a policy clerk, not the bank">
+
+[Load balancing deep dive](/learn/load-balancing-deep-dive) owns north-south VIP, Maglev, drain, and L4 versus L7. [Graceful degradation](/learn/graceful-degradation) owns bulkheads, breakers, and fail-closed money. This lesson is the **east-west proxy**: sidecar, ambient, or library, with mTLS, timeouts, retry budgets, outlier ejection, telemetry, and traffic shifting.
+
+The data-plane proxy is a hop. The control plane (xDS) is **derived policy**. Neither is the TokenX ledger. An mTLS certificate proves a **workload identity**, not authorization to debit. Automatic retries at mesh + application + edge L7 multiply the same UNKNOWN into duplicate POSTs unless the body carries `(tenant, transfer_id)`.
+
+</BigPicture>
+
+<UnderTheHood title="Where the proxy sits, what it may retry, what it costs">
+
+### Sidecar versus ambient versus library
+
+- **Sidecar:** a proxy process per pod. Strong per-workload identity and policy. Cost is RAM/CPU per replica and a blast radius when the sidecar crash-loops.
+- **Ambient / shared node proxy:** fewer processes, coarser identity unless you add a per-pod layer. Cheaper, noisier neighbor.
+- **Library (Finagle, gRPC interceptors):** no extra hop, policy in the binary. Every language must implement it. You cannot patch retry defaults without a deploy.
+
+mTLS between workloads authenticates **who is talking**. TokenX still authorizes **what they may do** in the API and still commits in the ledger. A stolen pod identity with a valid cert is a real threat; a valid cert on a debug pod must not be a debit capability. See [network security boundaries](/learn/network-security-boundaries).
+
+### Retry amplification is multiplicative
+
+If the edge retries twice, the mesh retries twice, and the stub retries twice, a 502 becomes up to 8× offered load. [Retries, dead letters, and replay](/learn/retries-dead-letters-and-replay) owns taxonomy. Here the rule is **one owner of retry** for a given RPC class, with a budget, jitter, and **idempotency context**.
+
+TokenX `POST /debits` without a key: mesh retry **off**. With a key: retry only on connection errors before a response, still bounded. Ad Click ingest: retry only with the same `click_id`; fail-open to another collector is availability, not a second bill.
+
+Outlier ejection (consecutive 5xx, latency) must keep a **min-healthy** floor. Ejecting every pod because the shared ledger 500s converts a dependency outage into an empty mesh—the same deep-health trap as the LB lesson.
+
+<Calculation label="Sidecar cost and retry tree (illustrative)">
+
+2,000 TokenX pods, sidecar 0.1 vCPU + 128 MB each → 200 vCPU and 256 GB RAM of proxy tax, before policy. At $0.04 / vCPU-hour (illustrative), sidecar CPU alone is ~$6k / month. That tax must buy identity and a **safe** retry default, not a hidden POST retry.
+
+One 502 on an unkeyed debit with 2×2×2 retries: 8 POSTs. If even two lack the same `transfer_id`, you double-spend. Retry budget of **one** retry at the mesh, none at the app, none at the edge, plus a key, is 2× load in the failure case, not 8×.
+
+</Calculation>
+
+<ExecutionTimeline
+  title="East-west debit through mesh policy"
+  steps={[
+    { title: "Admit", detail: "Inbound sidecar checks mTLS peer, deadline, and concurrency. Debug class can 429 while transfer class proceeds.", state: "Admission only. No ledger row.", failure: "Fail-open sidecar on payments skips uniqueness when the sidecar is down." },
+    { title: "Route", detail: "Outbound sidecar picks an endpoint from xDS. xDS is a photocopy of Ready. Empty set 503s.", state: "Derived membership. See DNS and service discovery.", failure: "Retrying POST to the next endpoint with a new UUID." },
+    { title: "Timeout", detail: "Remaining deadline 40 ms; mesh will not start the RPC. In-flight work still needs cancellation.", state: "UNKNOWN if a prior hop may have committed.", failure: "Mesh retry after the handler committed, no key." },
+    { title: "Shift", detail: "Canary 1% via xDS weights. Drain old version above p99. Telemetry is derived.", state: "Both versions write the same ledger uniqueness.", failure: "Traffic shift as a substitute for schema compatibility." }
+  ]}
+/>
+
+Control-plane outage: stale xDS. Endpoints may be wrong. TokenX should fail closed on empty or untrusted sets, not pin last endpoints forever. Ads collectors may keep local last-known collectors for ingest with uniqueness at the log.
+
+<InteractiveCalculation mode="little-law" title="Mesh retries are extra arrivals at the ledger pool" />
+
+</UnderTheHood>
+
+<MentalModel title="A court clerk who stamps passports, not contracts">
+
+The mesh clerk checks the passport (mTLS), the appointment length (deadline), and whether to knock again (retry). The contract is signed in the vault. If the clerk knocks twice with two contract numbers, you signed twice. If the clerk’s office burns down (sidecar crash), TokenX does not let people walk into the vault unstamped.
+
+Retain: **one retry owner, certs are identity not money, xDS is derived, fail closed when the clerk is gone on the payment door.**
+
+</MentalModel>
+
+<ArchitectureDiagram title="Edge, mesh, xDS, and the ledger that retries must not fork" chart={"flowchart LR\n  CLI[Client] --> EDGE[North-south L7]\n  EDGE --> IN[Inbound sidecar]\n  IN --> API[TokenX API]\n  API --> OUT[Outbound sidecar]\n  OUT --> LED[(Authoritative ledger)]\n  CP[Control plane xDS] -.-> IN\n  CP -.-> OUT\n  OUT -. unkeyed retry .-> DUP[Duplicate POST]\n  IN -. sidecar down fail-open .-> SKIP[Skip uniqueness]\n  COL[Ad Click] --> MSH[Mesh]\n  MSH --> LOG[(Billed-fact log)]"}>
+
+**Authoritative:** TokenX ledger plus `(tenant, transfer_id)`; Ad Click billed log plus `click_id`. **Derived:** xDS endpoint sets, retry counters, outlier scores, traces, circuit state in the proxy. Solid edges are a single keyed attempt. Dashed edges are control-plane photocopies, forbidden unkeyed retry, and fail-open sidecar. Recovery is fail-closed injection for money, retry budget of one owner, min-healthy outlier, drain on shift, and [graceful degradation](/learn/graceful-degradation) bulkheads inside the process.
+
+<ArchitectureWalkthrough
+  title="Policy layers that must not all retry"
+  stages={[
+    { name: "Edge", owner: "North-south L7", state: "TLS, WAF, path routing", boundary: "No unkeyed POST retry.", failure: "Gateway retry on 502 after commit.", recovery: "Retry budget zero on /debits." },
+    { name: "Mesh", owner: "Sidecar", state: "mTLS, timeout, outlier", boundary: "Identity and admission, not authorization of money.", failure: "Default retryOn 5xx.", recovery: "Retry connect-failure only, require key." },
+    { name: "App", owner: "Handler", state: "Unique insert plus debit", boundary: "The only commit.", failure: "Stub retries with new ids.", recovery: "Stable id; 409 replay." }
+  ]}
+/>
+
+</ArchitectureDiagram>
+
+<RealExamples title="TokenX fail-closed sidecar; Ad Click keyed retry">
+
+**TokenX.** Sidecar `retryPolicy` off for POST. `timeout` less than the caller’s remaining budget. Outlier ejection with min 2 healthy. If the sidecar dies, **fail closed** (iptables reject or pod unready), not iptables ALLOW that bypasses mTLS and uniqueness. Traffic shifting 1% canary still hits the same uniqueness table.
+
+**Ad Click.** Mesh may retry ingest **once** on connection reset with the same `click_id`. Fail-open to another collector if this one is ejected. Do not retry debug analytics produce into the billed topic. Telemetry cardinality: do not put `click_id` on a high-cardinality mesh label.
+
+<FailureScenario
+  title="A default retry that spends twice"
+  prompt="A platform team enables mesh retryOn: 5xx, 2 attempts, for all cluster RPCs. TokenX p99 is 1.8 s. Drain is 1 s. Canary pods return 502 after commit."
+  choices={[
+    { label: "Keep global 5xx retries; uniqueness will save us even with new UUIDs in the client interceptor.", impact: "New UUIDs are new money. Global retries 8× with the edge.", recovery: "Per-route policy. Keyed only. One owner." },
+    { label: "Disable 5xx retries on POST /debits; require transfer_id; raise drain above p99; fail-closed sidecar.", impact: "502s become UNKNOWN, not a second POST.", recovery: "Min-healthy outliers so a ledger 500 does not empty the mesh." },
+    { label: "Move TokenX off the mesh so Maglev L4 retries are safe.", impact: "L4 does not HTTP-retry, but clients still might. Maglev is membership, not uniqueness.", recovery: "L4 is fine; still need keys." }
+  ]}
+/>
+
+</RealExamples>
+
+<InterviewTraps title="Mesh folklore">
+
+- **“mTLS means the debit is authorized.”** Identity ≠ authorization ≠ commit.
+- **“The mesh gives exactly-once.”** It gives retries, which are the opposite unless keyed.
+- **“xDS is strongly consistent membership.”** It is a pushed photocopy.
+- **“Sidecar down should fail open so we stay available.”** For TokenX that skips the clerk. Fail closed.
+- **“Mesh replaces the load balancer.”** North-south Maglev math and drain remain. Mesh is east-west policy.
+- **“Outlier ejection is health.”** It is a heuristic. Shared-dependency 5xx will eject everyone without a floor.
+
+</InterviewTraps>
+
+<Tradeoffs title="Uniform policy versus hop cost versus blast radius">
+
+- **Sidecar versus ambient versus library:** isolation and identity versus RAM versus per-language discipline.
+- **Default-deny mTLS versus allow exceptions:** safety versus break-glass and health-checker pain.
+- **Rich retry versus none:** availability of reads versus duplicate writes.
+- **Control plane centralization:** one place to patch policy; one place to misconfigure the fleet.
+
+</Tradeoffs>
+
+<KnowledgeCheck
+  question="Why must TokenX disable mesh retries on unkeyed POST /debits even when mTLS is on?"
+  options={[
+    "mTLS already provides linearizable exactly-once",
+    "A second POST is a second command unless transfer_id uniqueness catches a stable id; a cert does not",
+    "Sidecars cannot send POST",
+    "Retries are only dangerous on GET"
+  ]}
+  correct={1}
+  explanation="Certificates authenticate the caller. They do not deduplicate effects. GET retry is usually safer; POST is the hazard."
+/>
+
+<ScenarioCheck
+  scenario="Control plane is down. Sidecars freeze last xDS. Half the endpoints are dead. A proposal: fail-open iptables for TokenX so payments continue, and let ads ingest retry without click_id so revenue is not lost."
+  question="Which policy matches Modules 3 and 5?"
+  options={[
+    { label: "Fail-open TokenX and unkeyed ads retries; availability is the SLO.", feedback: "Fail-open payments skip uniqueness. Unkeyed ads retries double-bill." },
+    { label: "TokenX fail-closed on empty/untrusted endpoint sets; ads ingest may fail-open to remaining collectors with stable click_id; dashboards lag.", feedback: "Same fail-closed money / fail-open derived-or-keyed-ingest split as graceful degradation." },
+    { label: "Eject every endpoint that 5xxs, including all ledger pods, then pin last-known-good IPs for 24 h.", feedback: "Shared ledger 5xx plus last-known-good is empty set then stale money routing." },
+    { label: "Turn the mesh into the uniqueness store using a sidecar cache of transfer_ids.", feedback: "Sidecar RAM is not the ledger and does not survive reschedule." }
+  ]}
+  correct={1}
+  explanation="xDS staleness is a discovery failure. Money 503s. Ads keep keyed ingest. The mesh is not a database."
+/>
+
+<InterviewAnswer>
+
+“I treat the mesh as an east-west clerk: mTLS identity, deadlines, one retry budget, outlier ejection with a min-healthy floor. xDS is derived membership, not Maglev and not the ledger. TokenX POST /debits does not get 5xx retries; sidecar death fail-closes so we do not skip uniqueness. Ad Click may retry once with the same click_id or fail-open to another collector. I will not stack edge, mesh, and stub retries. Sidecar tax is real CPU and RAM; I pay it for identity and safe defaults, not for hidden POST amplification. North-south load balancing still owns VIP drain and L4/L7. Certificates are not authorization to move money.”
+
+</InterviewAnswer>

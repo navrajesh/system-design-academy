@@ -1,0 +1,157 @@
+---
+title: "Network Security Boundaries"
+description: "Separate TLS identity, network segmentation, and application authorization so a certificate or private link cannot stand in for the TokenX ledger or billed-click uniqueness."
+module: 5
+moduleTitle: "Networking"
+order: 8
+duration: 37
+difficulty: "Advanced"
+tags:
+  - TLS
+  - mTLS
+  - zero trust
+  - segmentation
+  - DDoS
+objectives:
+  - Separate transport identity from application authorization and from ledger commit
+  - Place segmentation, private connectivity, and L7 policy as routing constraints with named failure modes
+  - Rotate certificates and secrets with overlap so expiry is not an outage and not a fencing token
+  - Fail closed on TokenX when identity cannot be established; keep Ad Click billed identity on the log
+---
+
+<BigPicture title="A passport is not a signed check">
+
+TLS and mTLS answer **who is on the wire**. Application authorization answers **what that principal may do**. The TokenX ledger answers **whether money moved**. Mixing these three is the IC6 trap.
+
+This lesson is conceptual: certificates, rotation, segmentation, zero trust versus perimeter, WAF-class L7 policy, volumetric versus application-layer overload, and secret rotation. It does **not** teach how to break TLS, write payloads, or bypass controls.
+
+A private link or IP allowlist is a **routing constraint**. It is not a unique index. A WAF is a derived filter. DDoS defense is capacity and anycast, not exactly-once. [Service mesh](/learn/service-mesh-and-proxies) already used mTLS as identity; here we put that identity in a trust map.
+
+</BigPicture>
+
+<UnderTheHood title="Identity, then segmentation, then rotation without a cliff">
+
+### Three questions on every TokenX debit
+
+1. **Transport:** Did we complete TLS 1.3 with a name we trust (or mTLS with a workload SAN we trust)? If not, **fail closed**. Do not debit over plaintext “because we are in the VPC.”
+2. **Authorization:** Is this principal allowed `debits:create` for this tenant? A valid mesh cert on a metrics scraper is still a no.
+3. **Commit:** Unique `(tenant, transfer_id)` in the ledger transaction.
+
+Ad Click public ingest lives in a more exposed zone: signed click tokens (capability with expiry), TLS to collectors, uniqueness on the log. Dashboards stay derived and stay off the public ingest zone.
+
+### Perimeter versus zero trust
+
+Perimeter thinking: VPN and a fat trusted LAN. Anything inside may call the ledger. That fails when a debug box shares the LAN.
+
+Zero trust thinking: authenticate every hop, least privilege, assume the network is hostile. You still need **segmentation** so a compromised ingest collector cannot open a SQL session to the TokenX vault. Zones are blast-radius bounds, not identity.
+
+Volumetric floods are [rate limiting](/learn/rate-limiting) plus capacity and anycast at the edge ([CDNs](/learn/cdns-and-edge-architecture)). Application-layer floods are expensive POSTs. TokenX fail-closes with 503/429 rather than forging 200. Ads ingest may shed bots and keep keyed billed clicks.
+
+<Calculation label="Certificate overlap and DDoS occupancy (illustrative)">
+
+Leaf cert lifetime 48 h, rotate at 24 h, overlap 24 h so verifiers accept old and new. If rotation is a hard cut at expiry with 5-minute clock skew, a replica with a slow clock rejects the new cert and fail-closes—the correct money behavior, but an **availability** incident you caused. Overlap is the recovery.
+
+Volumetric 10 Gb/s at an edge that terminates TLS: 10e9 / 8 / 1500 ≈ **833k packets/s** if full MTU, worse if small packets. That is capacity planning, not an application unique-id problem. If 50k of those packets are POST /debits without keys, the API must 429/fail closed **before** the ledger pool fills ([backpressure](/learn/backpressure-and-overload)).
+
+</Calculation>
+
+<ExecutionTimeline
+  title="A debit that presents a cert but must still fail closed"
+  steps={[
+    { title: "TLS", detail: "Client and gateway complete 1-RTT TLS. 0-RTT is disabled on this hostname.", state: "Peer name bound. No debit yet.", failure: "Skipping TLS on RFC1918 because ‘private link is enough.’" },
+    { title: "Authorize", detail: "Gateway maps identity to tenant scopes. Scraper identity is denied.", state: "Policy engine is derived; source of truth is the IAM store you named.", failure: "Allow because mTLS succeeded." },
+    { title: "Commit", detail: "Handler inserts unique transfer_id and debits. Secrets for DB are short-lived, rotated with overlap.", state: "Ledger authoritative.", failure: "Using the TLS cert serial as the idempotency key." },
+    { title: "Rotate", detail: "New leaf issued; old remains valid until overlap ends. Workloads reload without dropping Ready.", state: "Two valid certs during overlap. Not two ledgers.", failure: "Hard-cut rotation that flaps Ready and retriggers unkeyed client retries." }
+  ]}
+/>
+
+Secret rotation (DB passwords, HMAC keys for click tokens) needs **dual-accept** then **drop old**. A click token HMAC hard-cut invalidates in-flight beacons; those clicks can retry with a new token **and the same click_id**. New click_id on rotation is a double-bill path.
+
+<InteractiveCalculation mode="little-law" title="Application-layer floods occupy handlers, not just NICs" />
+
+</UnderTheHood>
+
+<MentalModel title="Airport ID, boarding pass, then the bank">
+
+TLS is checking a passport. Authorization is the boarding pass for that flight. The ledger is the bank at the destination. A valid passport for the wrong flight still does not move money. A private jetway (private link) is still not a bank receipt. Rotating passports with overlap means two valid IDs for a day, not two accounts.
+
+Retain: **identity, authorization, and commit are three fences; segmentation limits blast radius; rotation uses overlap; fail closed on money if any fence is missing.**
+
+</MentalModel>
+
+<ArchitectureDiagram title="Exposed ingest zone, private vault, and three fences on a debit" chart={"flowchart LR\n  PUB[Public client] -->|TLS| EDGE[Edge TLS plus L7 policy]\n  EDGE -->|mTLS| API[TokenX API]\n  API -->|authorize| IAM[(IAM policy store)]\n  API -->|unique debit| LED[(Authoritative ledger)]\n  EDGE -. identity fail .-> FC[Fail closed]\n  CLK[Click beacon] -->|TLS plus signed token| COL[Collector zone]\n  COL --> LOG[(Billed-fact log)]\n  COL -. no SQL path .-> LED\n  DASH[(Derived dashboard)] -.-> LOG"}>
+
+**Authoritative:** IAM policy store you named; TokenX ledger; billed-fact log. **Derived:** cert bundles, WAF rules, allowlists, private-link mappings, edge counters. Solid edges are TLS, authorize, commit, and ingest that cannot route to the ledger. Dashed edges are fail-closed identity failure, missing lateral path from collectors, and derived dashboards. Recovery is overlap rotation, deny-by-default east-west, and never treat VPC membership as a debit grant.
+
+</ArchitectureDiagram>
+
+<RealExamples title="TokenX three fences; Ad Click exposed but unique">
+
+**TokenX.** Internet-facing gateway: TLS 1.3, no 0-RTT, WAF for obvious malformed bodies (not a business-rule engine). East-west mTLS to the API. IAM on tenant scope. Ledger in a separate network zone; collectors and CI have no route. Private link from a bank partner is still mTLS + IAM + uniqueness.
+
+**Ad Click.** Beacons hit a public collector zone. Tokens are HMAC-signed with rotating keys (dual-accept). Uniqueness is `click_id` on the log. A volumetric flood is shed at the edge; remaining clicks still unique. Compromised collector can lie about **unbilled** debug fields; it must not obtain ledger credentials.
+
+<FailureScenario
+  title="Private link as a substitute for auth"
+  prompt="A partner wants TokenX over a private link with TLS off ‘because the circuit is private.’ They also want to skip transfer_id because the partner IP is allowlisted."
+  choices={[
+    { label: "Accept: private link is a trusted bank wire.", impact: "Anyone who reaches the circuit, or a mis-aimed packet, can POST money. IP is not a unique key.", recovery: "TLS on; IAM on; transfer_id on. Private link is extra routing, not fewer fences." },
+    { label: "Keep TLS, IAM, and uniqueness; treat private link as a DDoS and data-residency control.", impact: "Fewer public packets; same commit rules.", recovery: "Fail closed if TLS or IAM fails even on the private path." },
+    { label: "Use the partner’s TLS client cert serial as transfer_id.", impact: "All partner debits collide or reuse one identity.", recovery: "Cert is identity. transfer_id is per operation." }
+  ]}
+/>
+
+</RealExamples>
+
+<InterviewTraps title="Security slogans">
+
+- **“We are in a VPC so TLS is optional.”** Identity still matters on the LAN.
+- **“mTLS means authorized.”** Wrong question answered.
+- **“Allowlists are non-repudiation.”** They are routing.
+- **“WAF means the API is safe.”** It is a derived filter with false positives.
+- **“Cert rotation is fencing.”** Fencing tokens are in [distributed locks](/learn/distributed-locks-and-leases). Certs overlap; they do not fence a debit.
+- **“Zero trust means no segmentation.”** You still bound blast radius.
+
+Do not claim a perimeter or TLS configuration is unbreakable. State the fences you actually check.
+
+</InterviewTraps>
+
+<Tradeoffs title="Fewer public packets versus more fences to operate">
+
+- **Private connectivity versus public TLS:** smaller attack surface versus partner operational cost; not fewer application fences.
+- **Short-lived certs versus long:** steal window versus rotation load.
+- **WAF strictness versus false 403s:** safety versus availability of honest clients.
+- **Collecting ads in an exposed zone versus one flat network:** blast radius versus extra hops.
+
+</Tradeoffs>
+
+<KnowledgeCheck
+  question="A TokenX client presents a valid mTLS certificate but no tenant authorization and no transfer_id. The path is a private link. What should happen?"
+  options={[
+    "Debit succeeds because mTLS plus private link is sufficient authenticity of business operations",
+    "Fail closed: identity succeeded, authorization and unique commit did not",
+    "Cache the cert as a one-time token at the CDN",
+    "Issue 200 and reconcile from packet captures"
+  ]}
+  correct={1}
+  explanation="TLS authenticity is transport identity. Private link is routing. Money still needs authorization and uniqueness."
+/>
+
+<ScenarioCheck
+  scenario="HMAC keys for Ad Click tokens rotate with a hard cut. In-flight beacons fail verification. A collector engineer proposes ACK those clicks from memory and mint new click_ids after rotation so revenue is preserved. TokenX certs rotate the same way, overlapping 24 h."
+  question="What is consistent?"
+  options={[
+    { label: "Hard-cut ads ACKs from memory with new ids; TokenX overlap is unnecessary because mTLS is linearizable.", feedback: "Memory ACK is not a billed fact. New ids double-bill. mTLS is not linearizable money." },
+    { label: "Dual-accept old and new click HMAC during overlap; retry beacons with the same click_id; TokenX keeps cert overlap and still requires IAM plus uniqueness; no memory ACK.", feedback: "Rotation without losing identity. Commit boundaries unchanged." },
+    { label: "Put both HMAC and ledger passwords in the mesh config so rotation is one button.", feedback: "One control-plane leak becomes every secret. Mesh is not a vault." },
+    { label: "Disable TLS on ingest during rotation so tokens are not needed.", feedback: "That removes a fence to paper over rotation." }
+  ]}
+  correct={1}
+  explanation="Overlap plus stable click_id preserves uniqueness. TokenX already uses overlap; it still does not skip IAM."
+/>
+
+<InterviewAnswer>
+
+“I split three fences: TLS or mTLS for transport identity, IAM for authorization, and the TokenX ledger unique transfer_id for commit. A VPC or private link is a routing constraint, not a receipt. Segmentation exists so a compromised Ad Click collector has no path to the vault. Ads ingest can sit in a more exposed zone with signed tokens and uniqueness on the billed log; dashboards stay derived. I rotate certs and HMACs with dual-accept overlap so expiry is not a cliff and not a fencing token. If identity cannot be established on a debit, I fail closed. I do not claim TLS authenticates business operations beyond the wire, and I do not teach or rely on bypass folklore.”
+
+</InterviewAnswer>

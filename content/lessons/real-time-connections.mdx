@@ -1,0 +1,162 @@
+---
+title: "Real-Time Connections"
+description: "Choose WebSockets, SSE, or long polling for notifications and presence as derived ephemeral state, and never commit TokenX money on a socket without the same idempotency as HTTP POST."
+module: 5
+moduleTitle: "Networking"
+order: 9
+duration: 36
+difficulty: "Intermediate"
+tags:
+  - WebSockets
+  - SSE
+  - presence
+  - reconnect
+  - fan-out
+objectives:
+  - Choose WebSockets, server-sent events, or long polling from duplex need and proxy behavior
+  - Treat presence as derived state with heartbeat expiry, not as a ledger
+  - Resume streams with tokens and sequence numbers that do not reorder across reconnects without a buffer
+  - Keep TokenX commits on keyed HTTP/gRPC; use sockets for notifications and labeled-stale dashboards
+---
+
+<BigPicture title="A live wire is a notification path">
+
+[Fan-out architectures](/learn/fan-out-architectures) already taught push versus pull of **copies**. This lesson owns the **connection**: WebSockets, SSE, long polling, presence heartbeats, reconnect/resume, ordering, sticky L7 affinity, drain of long sockets, and backpressure on slow consumers.
+
+A socket is transport state. Presence (“online”) is **derived ephemeral** state with a TTL. TokenX money does **not** commit because a WebSocket frame was sent. Ad Click live operator dashboards are **derived**; billed append stays on the log.
+
+[TCP, QUIC, and connection lifecycle](/learn/tcp-quic-and-connection-lifecycle) owns HOL and keepalive. [Load balancing](/learn/load-balancing-deep-dive) already said affinity is for connection-bound protocols and still breaks on restart. Use that; do not re-teach Maglev.
+
+</BigPicture>
+
+<UnderTheHood title="Pick a protocol, expire presence, resume honestly">
+
+### Three shapes
+
+- **Long polling:** client GET that holds until an event or timeout. Works through dumb proxies. Occupies a handler per waiter. Simple resume: last event id in the next GET.
+- **SSE:** server-to-client event stream over HTTP. Good enough when the client need not send frames. Proxies must not buffer indefinitely.
+- **WebSockets:** duplex frames after HTTP upgrade. Needed when both sides chatter (typing, shared cursors). Sticky L7 or a connection-aware router is common; restart still drops the socket.
+
+Do not upgrade TokenX `POST /debits` to a WS message type without the **same** `(tenant, transfer_id)` and ledger transaction. Prefer HTTP/gRPC for commits; WS for “your transfer 409’d / completed” notifications.
+
+### Presence and reconnect
+
+Presence is `last_seen` with expiry (e.g. 45 s after a 15 s ping). It is not linearizable “is online.” A partition shows ghosts until TTL. A reconnect resume token is `{connection_epoch, last_seq}` for a **notification buffer** (derived). Missed sequences mean “gap; fetch from source,” not “the ledger rolled back.”
+
+<Calculation label="Sockets, pings, and fan-out (illustrative)">
+
+1,000,000 concurrent notification sockets, ping every **30 s**. Ping QPS = 1e6 / 30 ≈ **33,000**/s of tiny frames, plus TCP/TLS overhead. At 50,000 events/s of fan-out into those sockets, if each event hits 20 subscribers, egress frames = **1e6/s**—usually impossible; you **batch**, **sample**, or **shard** presence and use the fan-out lesson’s celebrity skip.
+
+Slow consumer: if a client reads 1 event/s and you enqueue 100/s, buffer depth after 10 s is 1,000 events. Bound the buffer; disconnect or coalesce. Unbounded WS buffers are the queueing lesson in costume.
+
+Drain: LB timeout 30 s with p99 session 30 min means you **will** RST live sockets on deploy. Clients must reconnect with resume tokens. That is expected, not an outage of money—if money was not on the socket.
+
+</Calculation>
+
+<ExecutionTimeline
+  title="Notify a TokenX user; do not debit on the wire"
+  steps={[
+    { title: "Upgrade", detail: "Client opens WS to a notification gateway. Sticky cookie keeps the socket on one pod until drain.", state: "Transport only. Ledger untouched.", failure: "Sending debit frames on this socket without transfer_id." },
+    { title: "Commit elsewhere", detail: "Mobile app POSTs /debits with transfer_id. Ledger commits. Outbox emits a notification event.", state: "Money authoritative on the ledger. Outbox is the async edge.", failure: "Treating WS ack from the phone as the commit." },
+    { title: "Push", detail: "Gateway writes a frame. Client may be reconnecting. Buffer holds last N seqs per user.", state: "Notification buffer derived. Presence TTL ticking.", failure: "Unbounded buffer during a 1e6-socket celebrity blast." },
+    { title: "Resume", detail: "Reconnect with last_seq. Gaps trigger a GET of transfer status from the API, not a new debit.", state: "Status read may be replica-stale; label it.", failure: "Minting a new transfer_id because the socket dropped." }
+  ]}
+/>
+
+<InteractiveCalculation mode="little-law" title="Held long-polls are in-flight occupancy" />
+
+1e6 long polls holding 30 s is 1e6 concurrent handlers if you are naive. Event loops and idle sockets exist because threads do not ([concurrency models](/learn/concurrency-models)).
+
+</UnderTheHood>
+
+<MentalModel title="A walkie-talkie, not a notary">
+
+A WebSocket is a walkie-talkie. Presence is “I heard you in the last 45 seconds.” The notary is the HTTP POST with a form number. If the radio dies, you do not sign a second contract; you ask the notary what already happened, then you turn the radio back on.
+
+Retain: **sockets notify, presence expires, resume is a derived buffer, money stays keyed HTTP, dashboards stay labeled derived.**
+
+</MentalModel>
+
+<ArchitectureDiagram title="Keyed HTTP commit, derived sockets, expiring presence" chart={"flowchart LR\n  APP[Client] -->|POST transfer_id| API[TokenX API]\n  API --> LED[(Authoritative ledger)]\n  LED --> OUT[(Outbox)]\n  OUT -->|async| GW[Notification gateway]\n  APP -->|WS or SSE| GW\n  GW --> PRES[(Presence TTL)]\n  GW --> BUF[(Resume buffer)]\n  APP -. reconnect last_seq .-> GW\n  OPS[Operator UI] -->|SSE| DASH[(Derived live dashboard)]\n  DASH -.-> LOG[(Billed-fact log)]"}>
+
+**Authoritative:** TokenX ledger; billed-fact log. **Derived:** gateway sockets, presence TTLs, resume buffers, live dashboards, sticky cookies. Solid edges are POST commit and async notify. Dashed edges are reconnect and dashboard tailing of the log. Recovery is expire presence, bound buffers, drain with client reconnect, query the API on gaps, never debit on frame receipt.
+
+<ArchitectureWalkthrough
+  title="What the live path is allowed to own"
+  stages={[
+    { name: "Commit", owner: "HTTP/gRPC API", state: "Unique id plus ledger or log", boundary: "Only commit.", failure: "WS debit opcode.", recovery: "Reject; tell client to POST." },
+    { name: "Notify", owner: "Gateway", state: "Frames plus bounded buffer", boundary: "Best-effort derived.", failure: "Unbounded queues.", recovery: "Coalesce, disconnect slow peers." },
+    { name: "Presence", owner: "TTL map", state: "last_seen", boundary: "Ephemeral.", failure: "Treating presence as authorization to spend.", recovery: "Expire; do not fence money with a heartbeat." }
+  ]}
+/>
+
+</ArchitectureDiagram>
+
+<RealExamples title="TokenX outbox notify; ads operator SSE">
+
+**TokenX.** Transfers stay POST. The app keeps a WS for receipts, device push fallback, and “balance changed” hints. Hints are not spendable; the next GET/replica read is labeled. Reconnect uses last notification seq; a gap triggers `GET /transfers/{id}`.
+
+**Ad Click.** Operator console uses SSE of windowed counts. The stream is behind consumer apply lag. A dropped SSE is not a lost bill. Presence of operators is a TTL for collaborative cursors, nothing in finance.
+
+<FailureScenario
+  title="Deploy RSTs a million sockets"
+  prompt="A notification mesh drain is 5 s. Average session is hours. After deploy, clients reconnect and replay POSTs of un-acked debit opcodes they had sent on WS."
+  choices={[
+    { label: "Lengthen drain to infinity so sockets never drop.", impact: "You cannot deploy. Stickiness plus infinite drain is a forever pod.", recovery: "Clients must reconnect. Debits must not be WS opcodes." },
+    { label: "Keep drain finite; clients resume notifications; debits are HTTP with transfer_id so RST cannot mint money; bound resume buffers.", impact: "Deploys drop radios, not notaries.", recovery: "Same as LB drain for long connections: expected RST, designed reconnect." },
+    { label: "Sticky Maglev so reconnects always hit the same buffer replica, proving no gaps.", impact: "Restart still loses process RAM. Buffer must be external or gaps must fetch from the API.", recovery: "Do not confuse affinity with durability." }
+  ]}
+/>
+
+</RealExamples>
+
+<InterviewTraps title="Realtime folklore">
+
+- **“WebSockets are faster so they should carry payments.”** Faster notify, not a commit protocol.
+- **“SSE is obsolete because WS exists.”** SSE is simpler when duplex is unused.
+- **“Presence is truth.”** It is a TTL.
+- **“Sticky sessions make reconnect lossless.”** Stickiness dies on restart.
+- **“Long polling does not need backpressure.”** Held requests *are* occupancy.
+- **“Exactly-once delivery over WS.”** Frames retry; without ids you duplicate notifications—and worse, effects.
+
+</InterviewTraps>
+
+<Tradeoffs title="Duplex and occupancy versus proxy friendliness">
+
+- **WS versus SSE versus long poll:** duplex and efficiency versus proxy and retry simplicity.
+- **Sticky versus connectionless GET:** live routing versus easy scale-out.
+- **Large resume buffers versus fetch-on-gap:** RAM versus extra reads to the source of truth.
+- **Aggressive ping versus NAT idle:** detect death versus 33k pings/s at a million sockets.
+
+</Tradeoffs>
+
+<KnowledgeCheck
+  question="A TokenX WebSocket drops after the client sent a debit frame with no transfer_id. What is the safe recovery?"
+  options={[
+    "Resend the frame on reconnect because TCP will not duplicate",
+    "Do not debit on WS; POST with a stable transfer_id; use the socket only to hear the result",
+    "Mark presence offline, which rolls back the debit",
+    "Ask the CDN to replay the upgrade"
+  ]}
+  correct={1}
+  explanation="Sockets drop. Presence is not a transaction. Debits need HTTP/gRPC uniqueness. Notifications resume separately."
+/>
+
+<ScenarioCheck
+  scenario="Ad Click wants a live map of clicks as WS events from collectors. Product asks to ACK billing when the operator UI receives the frame, to ‘feel realtime.’ Presence of the operator is proposed as the authorization to pause a campaign."
+  question="Which design matches this curriculum?"
+  options={[
+    { label: "ACK bills on WS receive; operator presence authorizes pauses because they are ‘online.’", feedback: "UI frames are derived. Presence TTL is not IAM. You will drop or double bills on reconnect." },
+    { label: "Collectors append click_id to the log first; SSE/WS is a derived tail with lag labels; campaign pause is a keyed HTTP/IAM call; presence expires.", feedback: "Live is a view. Authority stays log and IAM." },
+    { label: "Long-poll GET with click_id in the URL so CDNs can HIT live events.", feedback: "Cacheable GET ingest was forbidden in the CDN lesson." },
+    { label: "Sticky WS to the collector that accepted the click, as the uniqueness store.", feedback: "A socket to a process is not a unique index." }
+  ]}
+  correct={1}
+  explanation="Realtime connections decorate the log and the ledger; they do not replace them. Fan-out math still applies to who receives the frames."
+/>
+
+<InterviewAnswer>
+
+“I pick long polling, SSE, or WebSockets from whether I need duplex and how proxies behave—not from a belief that WS is the modern payment protocol. TokenX commits stay keyed HTTP or gRPC; the socket carries receipts from an outbox. Presence is a heartbeat with a TTL, not authorization and not money. Reconnect uses a last_seq into a bounded derived buffer; gaps fetch status from the API. Drain will RST long sessions, so clients must be designed to resume. At a million sockets I budget ping QPS and fan-out amplification from the fan-out lesson, and I disconnect slow consumers instead of growing RAM. Ad Click live dashboards are labeled-stale views of the billed log.”
+
+</InterviewAnswer>

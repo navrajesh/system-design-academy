@@ -1,0 +1,155 @@
+---
+title: "CDNs and Edge Architecture"
+description: "Place POPs, cache keys, purge, and origin shields as derived hops that cut bytes to origin without ever becoming TokenX authority or a billed-click ingest path."
+module: 5
+moduleTitle: "Networking"
+order: 5
+duration: 36
+difficulty: "Intermediate"
+tags:
+  - CDN
+  - edge
+  - cache keys
+  - origin shield
+  - purge
+objectives:
+  - Design cache keys, Vary, and TTL so authorization-personalized money never becomes a shared HIT
+  - Bound purge and stale-if-error as best-effort freshness, not linearizable delete
+  - Use origin shielding and request collapse to protect origin with explicit stampede math
+  - Keep TokenX balances off the CDN and Ad Click ingest off cacheable GET
+---
+
+<BigPicture title="The edge is a photocopy warehouse, not the vault">
+
+[Caching patterns and invalidation](/learn/caching-patterns-and-invalidation) already split CDN, application Redis, and database buffer cache. This lesson owns **edge topology**: points of presence, anycast, cache keys, surrogate keys, purge versus TTL, origin shielding, TLS termination, signed URLs, stale-if-error, and edge compute as **untrusted derived execution**.
+
+A POP HIT never consulted Redis and never consulted the TokenX ledger. Purge is a best-effort rumor across POPs. It is **not** linearizable delete. Origin shield is a coalescing hop that can itself fail.
+
+Spendable TokenX balances and Authorization-personalized receipts do **not** belong on a shared CDN cache. Public campaign creatives and hashed static assets do. Billed click ingest is a **POST to a collector**, never a cacheable GET.
+
+</BigPicture>
+
+<UnderTheHood title="Keys, shields, purge, then what the edge must not see">
+
+### Cache key is the unit of sharing
+
+Default key is scheme+host+path+query, modified by **Vary** (Accept-Encoding, rarely Cookie). Cookie in the key fragments the cache to one user per object and still risks leaking if Vary is wrong. Authorization in a **shared** cache is a cross-tenant incident. TokenX `GET /balances` with a bearer token must be `Cache-Control: private, no-store`.
+
+Immutable assets use content-hashed names (`app.9f3a2.js`) with long TTL. HTML that references them can be short TTL. Surrogate keys let you purge a campaign’s creatives without waiting on TTL.
+
+**Signed URLs** (expiring signatures for object storage) authorize a **download**, not a TokenX debit. Signature expiry is a capability clock, not a ledger fence. See [object storage](/learn/object-storage-and-large-files) for multipart and checksums.
+
+### Origin shield and collapse
+
+Without a shield, 200 POPs on a miss all hit origin. With a shield, POPs miss to one regional shield, which misses to origin. Stampede control is request coalescing: one origin fill per key.
+
+<Calculation label="HIT ratio versus origin (illustrative)">
+
+50,000 asset GETs/s, 95% HIT, mean object 80 KB.
+
+Edge egress: 50,000 × 80 KB = 4.0 GB/s toward users (WAN). Origin without shield: 5% × 50,000 = **2,500** GETs/s. With a shield that collapses duplicate misses, origin might see closer to **unique keys/s**, not 2,500—if 80% of misses are the same hot object, origin could fall to ~500 GETs/s. Cold-cache event: HIT 0%, origin 50,000 GETs/s until filled. That is the stampede [caching](/learn/caching-patterns-and-invalidation) already named; the edge just makes the herd global.
+
+stale-if-error: serve a 60 s stale copy if origin 502s. That is **derived availability**. It is legal for creatives. It is forbidden for spendable balances.
+
+</Calculation>
+
+<ExecutionTimeline
+  title="Creative HIT, HTML miss, forbidden money cache"
+  steps={[
+    { title: "Anycast", detail: "User DNS/anycast lands on a nearby POP. TLS may terminate at the edge.", state: "POP has photocopies. Not the ledger.", failure: "Terminating TLS at a shared cache that also keys on Authorization." },
+    { title: "Key lookup", detail: "Hashed JS is HIT. Campaign HTML is MISS, forwarded to origin shield.", state: "Shield coalesces concurrent MISSes for that URL.", failure: "Query string with click_id on a GET makes the CDN store billed identifiers or serve someone else’s click." },
+    { title: "Purge", detail: "Operator purges surrogate key campaign:9. Some POPs still HIT the old HTML until purge or TTL.", state: "Purge is async, best-effort.", failure: "Claiming purge is linearizable global delete." },
+    { title: "Origin death", detail: "Shield uses stale-if-error for public HTML. TokenX API at the same hostname is no-store and fails closed.", state: "Creatives stay derived-available. Money does not.", failure: "stale-if-error on /debits receipts." }
+  ]}
+/>
+
+<InteractiveCalculation mode="cache-load" title="Origin QPS is the miss rate times edge QPS" />
+
+Edge compute (Workers-class) runs **your** JS at the POP. Treat it as an untrusted derived worker: it can sign redirects and strip cookies; it must not be the uniqueness store. A POP is not a Raft group.
+
+</UnderTheHood>
+
+<MentalModel title="Newsstands, not the printing press">
+
+POPs are newsstands. The printing press is origin (and the ledger is not even the press—it is the bank). Recalling an edition is calling every newsstand; some still sell yesterday’s paper until the truck arrives. That delay is purge. A shield is a regional warehouse that collapses orders so the press is not hit by every stand at once.
+
+Retain: **keys define sharing, purge is rumor, shield is coalescing, money is no-store, ingest is not a GET.**
+
+</MentalModel>
+
+<ArchitectureDiagram title="POPs, shield, origin, and no-store money" chart={"flowchart LR\n  U[User] -->|anycast TLS| POP[POP cache]\n  POP -->|HIT asset| U\n  POP -->|MISS| SH[Origin shield]\n  SH -->|coalesced fill| ORG[(Origin object store)]\n  POP -. purge rumor .-> SH\n  TX[TokenX client] -->|no-store| API[TokenX API]\n  API --> LED[(Authoritative ledger)]\n  CLK[Click POST] --> COL[Collector]\n  COL --> LOG[(Billed-fact log)]\n  POP -. must not cache .-> TX\n  DASH[(Derived dashboard)] -.-> LOG"}>
+
+**Authoritative:** object-store bytes for public assets (with checksums); TokenX ledger; billed-fact log. **Derived:** POP objects, shield objects, purge queues, edge-worker output, dashboards. Solid edges are HIT/MISS fill and money/ingest paths that skip the shared cache. Dashed edges are purge, forbidden TokenX caching, and derived dashboards. Recovery is hashed immutable names, private no-store on APIs, collectors for POST ingest, and origin capacity for a 0% HIT event.
+
+</ArchitectureDiagram>
+
+<RealExamples title="Hashed creatives; TokenX no-store; clicks not GET">
+
+**Ad Click creatives.** Images and video segments live in object storage, hashed, long TTL, HTTPS at the POP. Campaign landing HTML uses short TTL plus surrogate-key purge when legal copy changes. Purge lag of tens of seconds is accepted in the contract. Operator dashboards are **not** this path.
+
+**TokenX.** `api.tokenx.example` is not on the marketing CDN zone, or it is on a separate configuration with `private, no-store` and auth at origin. Edge compute may rate-limit (see [rate limiting](/learn/rate-limiting)) but must fail closed if it cannot reach the ledger—never HIT a cached 200 debit receipt.
+
+**Ingest.** Clicks are POST to collectors. A tracking pixel GET that encodes `click_id` in the URL will be stored at POPs, shared, and prefetch-duplicated. That is how you invent bills or leak ids.
+
+<FailureScenario
+  title="An origin outage at the edge"
+  prompt="Origin is down. The CDN offers stale-if-error for all hostnames on the zone, including api.tokenx.example and ingest.ads.example."
+  choices={[
+    { label: "Enable stale-if-error globally so the site stays up, including last week’s cached debit 200s.", impact: "Users see forged success. Finance sees missing or duplicated ads if GET ingest was cached.", recovery: "stale-if-error only on public immutable or explicitly stale HTML. APIs no-store. Ingest POST." },
+    { label: "Keep creatives stale-if-error; TokenX fail-closed; ingest fail-open to other collectors, never to a cached GET.", impact: "Derived availability for bytes; money and bills keep their commit boundaries.", recovery: "Split zones or cache config by path." },
+    { label: "Purge everything so the outage cannot serve stale, then pin TokenX balances at the POP with a 1 s TTL.", impact: "Purge during origin down just creates a stampede when origin returns. 1 s TTL on balances is still a shared cache of money.", recovery: "no-store for money. Shield plus origin capacity for thaw." }
+  ]}
+/>
+
+</RealExamples>
+
+<InterviewTraps title="Edge folklore">
+
+- **“Purge is instant globally.”** It is best-effort per POP.
+- **“CDN makes the API multi-region.”** It makes **bytes** multi-region. Writes still need a region story from [multi-region design](/learn/multi-region-design).
+- **“Vary: Cookie is personalization.”** It is fragmentation and a leak surface.
+- **“Edge compute is a database.”** It is a derived worker.
+- **“Signed URL expiry is fencing.”** It is a download capability, not a TokenX epoch.
+- **“Hit ratio 99% means origin is safe.”** Cold-cache and purge-all disagree.
+
+</InterviewTraps>
+
+<Tradeoffs title="Freshness, origin safety, and what you must never share">
+
+- **Long TTL plus hash versus short TTL plus purge:** immutable safety versus operational recall.
+- **Many POPs versus few:** latency versus origin-fanout unless you shield.
+- **TLS at edge versus origin:** CPU offload versus trusting the CDN’s certificate operation.
+- **stale-if-error versus fail closed:** derived pages versus money.
+
+</Tradeoffs>
+
+<KnowledgeCheck
+  question="You purge surrogate key campaign:9. A user in Sydney still sees old HTML 40 s later. What does that prove?"
+  options={[
+    "The object store rolled back the new HTML",
+    "Purge is not a linearizable global delete; that POP still has a photocopy",
+    "Anycast failed so DNS is authoritative for content",
+    "You must cache TokenX receipts so users see consistent money with HTML"
+  ]}
+  correct={1}
+  explanation="POP state is derived. Origin bytes plus the ledger are separate authorities. Caching money to ‘match HTML’ forges success."
+/>
+
+<ScenarioCheck
+  scenario="A growth team wants one global hostname. They enable the CDN in front of TokenX, Ad Click ingest, and creatives. Cache key is URL including query. Ingest is GET /t?click_id=. TokenX GET /balances is public-cacheable for speed. Purge-all is the invalidation plan."
+  question="Which redesign matches this lesson?"
+  options={[
+    { label: "Keep one cache key scheme; GET ingest is fine if click_id is unique; balances TTL 1 s is almost real-time.", feedback: "Prefetch and shared HIT still duplicate or leak. 1 s money cache is still a photocopy of spendable state." },
+    { label: "Split config: hashed creatives long TTL plus shield; TokenX no-store to origin; ingest POST to collectors; purge is best-effort for HTML only.", feedback: "Edge accelerates bytes. Authority stays ledger and billed log.", },
+    { label: "Put uniqueness in an edge worker map so POPs can ACK clicks without origin.", feedback: "POP maps are not a durable unique index and partition by geography." },
+    { label: "Disable the shield so every POP talks to origin, which is more consistent.", feedback: "That is a stampede. Consistency of money is the ledger, not more origin QPS." }
+  ]}
+  correct={1}
+  explanation="One hostname without split cache policy puts money and ingest on a shared photocopy. Shield and hashed assets are the origin-protection path."
+/>
+
+<InterviewAnswer>
+
+“I use the CDN as a warehouse of derived bytes: hashed immutable assets, long TTL, origin shield to collapse misses, anycast for RTT. Cache keys must not include secrets or TokenX Authorization. Purge and stale-if-error are freshness and availability budgets, not linearizable delete. TokenX is private no-store to origin; a POP HIT of a debit receipt would be a forged success. Ad Click creatives may be cached; billed ingest is POST to collectors, never a cacheable GET pixel. Edge compute is untrusted derived code. When origin is cold, I size origin for the miss storm rather than claiming 95% HIT is a capacity plan.”
+
+</InterviewAnswer>
