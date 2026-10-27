@@ -60,13 +60,13 @@ Modules 1 and 6 are complete in topic coverage and conform to the automated cont
 
 ## Outstanding technical audit findings
 
-The Modules 1 and 6 audit found **13 items**. The two High findings are remediating on `fix/distributed-systems-audit`; **11 Medium and Low items remain**. Correctness defects and unstated protocol assumptions take priority over editorial improvements.
+The Modules 1 and 6 audit found **13 items**. The two High findings plus Kafka durability (M1) and partition-order (L3) are remediating on `fix/distributed-systems-audit`; **9 Medium and Low items remain**. Correctness defects and unstated protocol assumptions take priority over editorial improvements.
 
 | Priority | Finding | Required remediation |
 | --- | --- | --- |
 | High (this branch) | TokenX saga may release a reservation before a delayed destination credit commits | Exclusive B `CREDITED`/`CANCELLED` and A `FINALIZED`/`RELEASED`; `UNRESOLVED` until B's committed row is known |
 | High (this branch) | A committed Raft no-op is presented as sufficient ongoing read authority | Current-term commit knowledge, ReadIndex or lease, then `lastApplied >= readIndex` before serving |
-| Medium | Kafka durability is described without the complete broker and producer assumptions | State replication factor, `acks=all`, `min.insync.replicas`, idempotence, leader-election, retention, and failure scope |
+| Medium (this branch) | Kafka durability is described without the complete broker and producer assumptions | RF=3, `acks=all`, `min.insync.replicas=2`, producer idempotence, ISR-only election, retention, correlated-failure scope |
 | Medium | A protected resource may accept a stale fencing token before observing the new epoch | Establish and durably retain the new high-water token before protected work |
 | Medium | Local atomic idempotency and recoverable `IN_PROGRESS` workflow idempotency are conflated | Teach them as separate transaction patterns with explicit ownership and takeover rules |
 | Medium | Read-position tokens omit shard/log identity and failover lineage | Include shard, epoch or timeline, and commit position; validate ancestry and current authority |
@@ -75,12 +75,12 @@ The Modules 1 and 6 audit found **13 items**. The two High findings are remediat
 | Medium | The CAP quorum diagram visually implies all three replicas are required | Show leader plus either follower as a 2-of-3 quorum |
 | Low | An idempotency key is called globally unique despite tenant-scoped schema | Describe uniqueness within tenant and operation scope |
 | Low | B-tree height arithmetic uses an ambiguous definition of level | Define branching levels, leaf level, fanout assumptions, and fill factor |
-| Low | Kafka partitioning is said to preserve campaign event order too broadly | Distinguish broker append order from event-time and causal order |
+| Low (this branch) | Kafka partitioning is said to preserve campaign event order too broadly | Broker append/offset order distinguished from event-time and causal order |
 | Low | Several knowledge checks are arithmetic-only or have implausible distractors | Replace selected checks with failure-oriented production scenarios |
 
 ## Next milestone
 
-1. Review the two High remediations on `fix/distributed-systems-audit`, then address the remaining 11 Medium and Low findings.
+1. Review High remediations and Batch 1 (Kafka durability and append order), then continue Medium/Low batches.
 2. Re-run the complete validation suite and review the affected diagrams and exercises on desktop and mobile.
 3. Begin Module 3, **Kafka & Fault Tolerance**, with Kafka Internals, Consumer Groups and Rebalancing, and Ordering and Event Keys before progressing to stream processing and disaster scenarios.
 
