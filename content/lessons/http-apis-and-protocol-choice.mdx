@@ -1,0 +1,166 @@
+---
+title: "HTTP APIs and Protocol Choice"
+description: "Choose REST, gRPC, and error contracts from idempotency, evolution, and commit boundaries—not from a belief that gRPC is always faster."
+module: 5
+moduleTitle: "Networking"
+order: 4
+duration: 37
+difficulty: "Intermediate"
+tags:
+  - HTTP
+  - gRPC
+  - API design
+  - idempotency
+  - error contracts
+objectives:
+  - Match HTTP methods and gRPC RPCs to retry safety and a named commit boundary
+  - Version payloads so additive evolution does not break old clients or forge money
+  - Place compression, streaming, and error classes (4xx, 5xx, 429) with CPU and deadline costs
+  - Keep TokenX POST /debits non-idempotent without transfer_id, and ACK Ad Click only after the log
+---
+
+<BigPicture title="The protocol is a contract, not a speed setting">
+
+[Networking for system design](/learn/networking-for-system-design) placed HTTP on a deadline. [TCP, QUIC, and connection lifecycle](/learn/tcp-quic-and-connection-lifecycle) owns handshake and HOL. This lesson is **what the bytes mean**: REST/JSON, gRPC, GraphQL, streaming, status codes, idempotent methods versus POST with keys, payload evolution, and compression.
+
+gRPC is HTTP/2 (or HTTP/3) with protobuf and deadlines. It is not automatically faster than JSON, and it does not make POST safe to retry. GraphQL is a query language over HTTP; it does not grant a client the right to mutate TokenX without the same uniqueness as REST.
+
+**Authoritative effects** still live in the TokenX ledger and the Ad Click billed-fact log. HTTP 200 is a **statement about a response** that left the handler. If the append is asynchronous, 200 is a lie unless you named a different contract (accepted-for-processing).
+
+</BigPicture>
+
+<UnderTheHood title="Methods, status, evolution, then who may retry">
+
+### Safety is a property of the effect, not the logo
+
+- **GET, HEAD, PUT, DELETE** (when implemented as specified) are intended to be **idempotent** at the resource. PUT of the same body to the same URL should converge. TokenX **balances** as GET of a derived or replica view must label staleness. Spendable **debit** is not a GET.
+- **POST /debits** is not idempotent unless `(tenant, transfer_id)` is in the body and unique in the **same** ledger transaction. 409 means that id already committed; return the stored result. Timeout means **UNKNOWN**—see [idempotency](/learn/idempotency-and-deduplication).
+- **gRPC unary** is RPC-shaped HTTP. Deadlines map well. Automatic client retries in a stub are the same hazard as L7 retries in [load balancing](/learn/load-balancing-deep-dive): off unless the RPC is idempotent or keyed.
+- **Streaming** (HTTP/2, gRPC bidi, SSE) is for long-lived flows. Deep WebSocket design sits in [real-time connections](/learn/real-time-connections). Do not commit money only on a stream without the same key as POST.
+- **GraphQL mutations** that wrap a debit are still POSTs. Persisted queries do not fence uniqueness.
+
+Status contract (illustrative, must match the product):
+
+| Class | Meaning for TokenX debit | Meaning for Ad Click ingest |
+| --- | --- | --- |
+| 2xx | Ledger transaction committed (or 409-as-success replay) | Unique `click_id` durable on the log |
+| 4xx (except 408/429) | Client will not succeed by blind retry | Malformed; do not retry the same bad body |
+| 429 | Admission; Retry-After | Admission; uniqueness still required later |
+| 5xx / 408 | UNKNOWN if the handler might have committed | UNKNOWN if the collector might have appended |
+
+429 is [backpressure](/learn/backpressure-and-overload) and [rate limiting](/learn/rate-limiting), not a ledger.
+
+### Evolution and compression
+
+Additive protobuf fields and optional JSON keys are the safe default. Renaming a field or reusing a tag is a new API. TokenX must not interpret a missing `transfer_id` as “mint one on the server” for old clients—that forks identity.
+
+<Calculation label="JSON versus protobuf plus gzip (illustrative)">
+
+Ad Click ingest 50,000 POSTs/s, JSON body 800 B, gzip to 280 B, protobuf 180 B uncompressed.
+
+JSON gzip CPU: assume 40 µs/req compress+decompress on a collector core → 50,000 × 40e-6 = **2.0** core-seconds per wall second (about two cores) before JSON parse. Protobuf at 10 µs/req → **0.5** cores. Bandwidth: gzip JSON 50k × 280 B = 14 MB/s; protobuf 9 MB/s.
+
+gRPC wins this envelope on CPU and bytes **if** the schema is stable and clients can take a stub. It does not win if you still JSON-transcode at the edge, and it does not make retries safe. HTTP/2 HOL on TCP loss still applies; do not re-teach congestion here.
+
+</Calculation>
+
+<ExecutionTimeline
+  title="POST /debits through status codes"
+  steps={[
+    { title: "Validate", detail: "Require transfer_id. Missing id is 400, not a server-minted UUID.", state: "No ledger write.", failure: "Minting ids server-side makes client retries a new command." },
+    { title: "Commit", detail: "Insert unique row and debit in one transaction. Return 200 with the stored receipt, or 409 with the first receipt.", state: "Ledger is authoritative.", failure: "200 before the unique insert races two POSTs." },
+    { title: "Timeout", detail: "Client deadline fires. Handler may still commit. Client must not parse ‘no JSON’ as rollback.", state: "UNKNOWN until query or identical retry.", failure: "Proxy retries POST without the key." },
+    { title: "Compress", detail: "Response gzip is optional. Compressing a 200-byte receipt is not the bottleneck; compressing a 2 MB GraphQL balance dump can blow the remaining deadline.", state: "Bytes are derived. Money already committed or not.", failure: "Turning gzip off globally to ‘go faster’ without measuring CPU versus WAN." }
+  ]}
+/>
+
+<InteractiveCalculation mode="event-ingress" title="Ingest bytes before protocol overhead" />
+
+Protocol framing, HPACK, and TLS records add to the 800 B event. The calculator is a planning envelope, not a billed-fact ACK.
+
+</UnderTheHood>
+
+<MentalModel title="A form number, not a courier brand">
+
+REST, gRPC, and GraphQL are courier brands. The clerk cares whether the form number was seen. Sending the same form twice by a faster courier is still one stamp. Sending a new form because the first courier was “binary and multiplexed” is two stamps.
+
+Retain: **status codes name uncertainty, keys name identity, evolution is additive, and gRPC is not a commit.**
+
+</MentalModel>
+
+<ArchitectureDiagram title="Clients, transcoding, handler, and the only commit" chart={"flowchart LR\n  WEB[JSON client] --> GW[HTTP gateway]\n  GRPC[gRPC client] --> GW\n  GW -->|deadline plus key| API[TokenX API]\n  API -->|one TX| LED[(Authoritative ledger)]\n  API -. 409 replay .-> WEB\n  GW -. unkeyed POST retry .-> DUP[Duplicate risk]\n  COL[Ad Click POST] -->|click_id| LOG[(Billed-fact log)]\n  COL -. 200 before append .-> LIE[False ACK]\n  DASH[(Derived dashboard)] -.-> LOG"}>
+
+**Authoritative:** ledger unique `(tenant, transfer_id)`; billed log `click_id`. **Derived:** transcoded JSON, protobuf views, GraphQL graphs, gzip buffers, HTTP status if it left the process after a crash. Solid edges are keyed calls that commit. Dashed edges are unkeyed proxy retry, ACK-before-append, and dashboard reads. Recovery is disable unkeyed retries, return stored receipts on 409, query on UNKNOWN, and evolve schemas additively.
+
+</ArchitectureDiagram>
+
+<RealExamples title="TokenX 409 replay; Ad Click ACK after append">
+
+**TokenX.** Public JSON POST and internal gRPC unary share one handler. Both require `transfer_id`. Transcoding is not a second ledger. OpenAPI compatibility: new optional fields only. Compression on the receipt is optional; do not gzip-bomb the remaining 50 ms of deadline with a portfolio blob on the debit RPC.
+
+**Ad Click.** HTTP POST `/clicks` with `click_id`. 2xx means the log append with uniqueness succeeded. An asynchronous Kafka produce of **debug** fields may fail; that does not retract the billed 2xx. If you return 202 Accepted before append, the contract is **not billed yet**—and finance must not use 202 counts. Prefer 200 after durability for billed ingest.
+
+<FailureScenario
+  title="Protocol choice under a timeout"
+  prompt="A mobile client uses gRPC for TokenX because ‘binary is faster.’ The stub retries the unary three times on UNAVAILABLE. The first attempt committed; the retry used a regenerated request id in the interceptor."
+  choices={[
+    { label: "Keep stub retries; gRPC guarantees exactly-once unary.", impact: "New ids double-spend. gRPC has no such guarantee.", recovery: "Stable transfer_id; retry only with that id; cap retries." },
+    { label: "Disable unkeyed retries; propagate deadline; 409 returns the first receipt.", impact: "Speed of protobuf is unchanged; safety matches REST.", recovery: "Same handler for JSON and gRPC." },
+    { label: "Move debits to GET with query params so HTTP caches make retries safe.", impact: "GET of money is a cache and log disaster. CDNs will store receipts.", recovery: "POST plus uniqueness. Never cache spendable effects." }
+  ]}
+/>
+
+</RealExamples>
+
+<InterviewTraps title="API slogans">
+
+- **“gRPC is always faster.”** Measure. Transcoding and HOL can erase the win.
+- **“REST is CRUD so POST is fine to retry.”** POST is not idempotent by default.
+- **“4xx means never retry; 5xx means always retry.”** 409 is a stored success. 500 after possible commit is UNKNOWN.
+- **“Protobuf is schema-safe forever.”** Tag reuse and required-field adds break old binaries.
+- **“HTTP 200 means the click is billed”** when append is async—only if you defined 200 that way, which you should not.
+- **“GraphQL solves overfetch and therefore consistency.”** Overfetch is payload shape, not a ledger.
+
+</InterviewTraps>
+
+<Tradeoffs title="Ergonomics, evolution, and retry surface">
+
+- **JSON/REST versus gRPC:** debugability and browser clients versus stubs, deadlines, and compact codecs.
+- **One resource POST versus many fine RPCs:** chattiness versus blast radius of a fat mutation.
+- **Compression on versus off:** WAN bytes versus CPU and tail latency ([batching and compression](/learn/batching-and-compression)).
+- **Strict 200-after-commit versus 202:** honesty versus apparent availability.
+
+Money chooses keyed POST/unary and honest UNKNOWN over a prettier stub.
+
+</Tradeoffs>
+
+<KnowledgeCheck
+  question="A TokenX POST times out. A later POST with the same transfer_id returns 409 and the original receipt. What happened?"
+  options={[
+    "The first POST rolled back and 409 means the client is forbidden from paying",
+    "The first POST likely committed; 409 is the idempotent replay of the stored result",
+    "gRPC would have returned OK and therefore did not commit",
+    "409 proves the load balancer is the uniqueness store"
+  ]}
+  correct={1}
+  explanation="409 on a unique key is the success path for a retry. The balancer is not the ledger. Protocol choice does not change that."
+/>
+
+<ScenarioCheck
+  scenario="Ad Click wants GraphQL so operators can ‘query clicks live.’ A mutation ingestClick returns 200 after enqueueing memory, and a gateway HTTP retry is enabled on all POSTs because GET is cached at the CDN."
+  question="What is the IC6 repair?"
+  options={[
+    { label: "Keep memory 200; GraphQL subscriptions are the billed log.", feedback: "Subscriptions are derived. Memory is not durable uniqueness." },
+    { label: "Ingest remains a keyed POST/unary that 2xx only after unique log append; disable unkeyed retries; GraphQL reads dashboards as derived; do not CDN-cache ingest.", feedback: "Protocol split: mutations have a commit boundary; queries have a freshness bound." },
+    { label: "Switch ingest to GET with click_id so CDN HIT is exactly-once.", feedback: "Caching GET ingest drops or duplicates bills and stores user URLs at the edge." },
+    { label: "Use protobuf only, which makes gateway retries safe by encoding.", feedback: "Encoding is not an idempotency key." }
+  ]}
+  correct={1}
+  explanation="Choose the protocol for clients, but ACK billed facts at the log and never let a CDN or stub retry mint a second effect."
+/>
+
+<InterviewAnswer>
+
+“I pick REST or gRPC from clients, schema evolution, and codec cost—not from a slogan that binary is always faster. TokenX POST /debits is not idempotent without transfer_id in the same ledger transaction; 200 and 409 both mean the stored receipt, and a timeout is UNKNOWN. I disable unkeyed retries at stub and proxy. Ad Click 2xx means unique click_id is on the billed log, not that a GraphQL layer enqueued RAM. Compression and HTTP/2 multiplexing are performance knobs with CPU and HOL costs taught in neighboring lessons. Additive schema changes only. The courier brand never replaces the form number.”
+
+</InterviewAnswer>

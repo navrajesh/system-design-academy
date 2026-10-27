@@ -43,20 +43,20 @@ Authoritative curriculum state lives in `content/lessons/`. Search data and rend
 | 2. Scalability | 8 | 8 authored; coverage complete |
 | 3. Kafka & Fault Tolerance | 9 | 9 authored; coverage complete |
 | 4. Performance | 9 | 9 authored; coverage complete |
-| 5. Networking | 9 | 1 foundation lesson authored |
+| 5. Networking | 9 | 9 authored; coverage complete |
 | 6. CAP & Consistency | 9 | 9 authored; coverage complete |
 | 7. Architecture & Mock Interviews | 11 | 1 foundation exercise authored |
-| **Total** | **64** | **46 authored, 18 planned** |
+| **Total** | **64** | **54 authored, 10 planned** |
 
-Modules 1, 2, 3, 4, and 6 are complete in topic coverage on `feat/module-4-performance`. Module 2 is merged on `main` at `f09dbb4`. Module 3 is merged on `main` at `8ad26ed`. The Modules 1 and 6 technical audit (13 items) is merged on `main` at `3e5a71e`.
+Modules 1, 2, 3, 4, 5, and 6 are complete in topic coverage. Module 2 is merged on `main` at `f09dbb4`. Module 3 is merged on `main` at `8ad26ed`. Module 4 is merged on `main` at `1a0c2a3`. The Modules 1 and 6 technical audit (13 items) is merged on `main` at `3e5a71e`. Module 5 remaining lessons are on `feat/module-5-networking` and have not been merged.
 
 ## Current progress
 
 - Phase 0 foundation hardening is complete.
 - Phase 1A authored all nine lessons in Module 1 and all nine lessons in Module 6.
-- The repository contains **46 of 64 lessons** after completing Module 4.
+- The repository contains **54 of 64 lessons** after completing Module 5 on this branch.
 - All seven modules have at least one foundation lesson.
-- The future Architecture Reference Library remains Phase 2 and has not been implemented.
+- The future Architecture Reference Library remains Phase 2 and has not been implemented. The plan, including the Technology Landscape & Architecture Reference feature, lives in [phase-2-architecture-reference.md](./phase-2-architecture-reference.md). It does not change the 64-lesson curriculum.
 
 ## Technical audit status
 
@@ -88,10 +88,10 @@ The Modules 1 and 6 audit found **13 items**. All 13 are addressed and merged to
 
 ## Next milestone
 
-1. Pause for approval of Module 4 (9/9) on `feat/module-4-performance`. Do not push, merge, or deploy this branch until a later decision. Do not apply or drop `stash@{0}` until a later decision.
-2. Resume operating lessons in Modules 5 and 7.
+1. Pause for approval of Module 5 (9/9) on `feat/module-5-networking`. Do not push, merge, or deploy this branch until a later decision. Do not apply or drop `stash@{0}` until a later decision.
+2. Resume Module 7 mock-interview lessons after Module 5 is merged.
 
-Phase 2 is explicitly out of scope for this milestone.
+Phase 2 is explicitly out of scope for this milestone. The Phase 2 plan is documented only; do not build library routes, components, or navigation until a later decision.
 
 ## Validation commands
 

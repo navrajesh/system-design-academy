@@ -10,6 +10,7 @@ System Design Academy is a standalone educational application built with Next.js
 - `lib/content.ts` owns catalog loading, parsing, and search normalization.
 - `docs/content-standards.md` is the mandatory lesson contract.
 - `docs/learning-roadmap.md` is the authoritative 64-topic roadmap and progress record.
+- `docs/phase-2-architecture-reference.md` is the future Architecture Reference Library plan, including the Technology Landscape feature. It is not implemented and must not expand the 64-lesson curriculum.
 - `scripts/` and `tests/` enforce content and Mermaid rules.
 
 ## Required workflow

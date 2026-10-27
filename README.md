@@ -63,7 +63,7 @@ Progress is stored under `sda:completed-lessons:v1` in `localStorage`. Clearing 
 
 Mermaid is dynamically imported only when a lesson diagram mounts, keeping it out of the initial dashboard path.
 
-Phase 0 quality hardening is complete for the seven foundation lessons. Phase 1A now completes all nine Storage & Data lessons and all nine CAP & Consistency lessons. The academy contains 23 of 64 planned lessons; 41 remain for later Phase 1 work. Implemented lessons include explicit state ownership, consistency boundaries, failure/recovery paths, challenging scenario checks, and practical TokenX or Ad Click Aggregator reasoning. The Architecture Reference Library remains a future Phase 2 and is not implemented.
+Phase 0 quality hardening is complete for the seven foundation lessons. Phase 1A completes all nine Storage & Data lessons and all nine CAP & Consistency lessons. Modules 2, 3, 4, and 5 are complete on the Module 5 feature branch. The academy contains 54 of 64 planned lessons after Module 5. Implemented lessons include explicit state ownership, consistency boundaries, failure/recovery paths, challenging scenario checks, and practical TokenX or Ad Click Aggregator reasoning. The Architecture Reference Library remains a future Phase 2 and is not implemented. The plan is in [docs/phase-2-architecture-reference.md](docs/phase-2-architecture-reference.md).
 
 ## Authoring content
 

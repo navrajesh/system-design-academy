@@ -1,0 +1,174 @@
+---
+title: "DNS and Service Discovery"
+description: "Treat DNS caches and VIP membership as derived routing hints, and bound failover by TTL, health, and registry truth rather than by hoping names update instantly."
+module: 5
+moduleTitle: "Networking"
+order: 2
+duration: 36
+difficulty: "Intermediate"
+tags:
+  - DNS
+  - service discovery
+  - TTL
+  - health checks
+  - CoreDNS
+objectives:
+  - Bound stale-answer windows from TTL, negative cache, and stacked resolvers with explicit units
+  - Separate registry and instance health from DNS caches and VIP membership
+  - Choose DNS, client-side discovery, or control-plane endpoints from update latency and failure policy
+  - Fail closed on TokenX spendable routing when discovery is empty, and keep Ad Click uniqueness at the log
+---
+
+<BigPicture title="A name is a hint, not a health certificate">
+
+[Networking for system design](/learn/networking-for-system-design) already traced one request through DNS, TCP, TLS, and a load balancer. This lesson is the **name and membership** problem: who is allowed to receive the next TokenX debit or Ad Click ingest packet, how long a dead address can stay cached, and what happens when every cache expires at once.
+
+DNS answers, OS caches, recursive resolvers, browser caches, CoreDNS, Consul-style catalogs, and Kubernetes Endpoints are **derived routing state**. They can be rebuilt. They are not the TokenX ledger, not the billed-click log, and not proof that a process can still commit.
+
+Authoritative for *where work may go* is the **service registry / control plane** plus the instance’s own **health** (and, for money, the ledger’s ability to accept a unique `(tenant, transfer_id)`). Authoritative for *whether money moved* remains the ledger. A 60-second TTL is a freshness *budget* for a photocopy of an address set, not a failover SLO.
+
+</BigPicture>
+
+<UnderTheHood title="Stacked caches, then a registry that actually forgets the dead">
+
+### The resolver chain is several independent TTLs
+
+A lookup is not one round trip. Typical path (illustrative):
+
+1. Application or language runtime cache.
+2. OS stub resolver (`nscd`, systemd-resolved, glibc).
+3. Recursive resolver (VPC DNS, 8.8.8.8, corporate).
+4. Authoritative nameserver for the zone.
+
+Each layer may honor, clamp, or ignore TTL. **Negative caching** (NXDOMAIN, empty NOERROR) often uses SOA `minimum` / RFC 2308 and can outlive the operator’s mental “we deleted the record.” Split-horizon answers differ by client network: a laptop VPN and a cluster node can receive different A/AAAA sets for the same name.
+
+SRV and CNAME add extra lookups. An A/AAAA set is what the client finally dials. SRV is useful for port discovery; it does not make the target healthy.
+
+<Calculation label="Stale window after a collector dies (illustrative)">
+
+Ad Click anycast name `ingest.ads.example` has TTL **60 s** at the authoritative server. Recursive resolvers clamp to 60 s. A collector process also caches the resolved set for **30 s**. Worst-case time a client keeps sending to a dead POP after the registry removed it: about **60 s + 30 s = 90 s**, plus the TCP timeout if the address still SYN-ACKs on a blackholed VIP.
+
+TokenX internal name `ledger-api.svc` with TTL **5 s** and no extra app cache: stale window ≈ **5 s**, which is still long enough to send several 200 ms debits at a draining pod. DNS TTL is not [load-balancing drain](/learn/load-balancing-deep-dive). Drain waits for in-flight commits; TTL waits for photocopies to expire.
+
+If 8,000 clients share a 60 s TTL and all expire together, the thundering herd is **8,000** simultaneous queries plus reconnects, not one polite refresh.
+
+</Calculation>
+
+### DNS versus a registry that can forget
+
+- **DNS-only discovery:** cheap, universal, cached. Failover is **TTL-bound**. Health is whoever still answers the name. Weighted records and anycast are routing tricks, not instance health.
+- **Client-side discovery:** the client watches a catalog (Consul, etcd, Eureka-class) and picks a healthy instance. Update latency is watch/index time, often seconds or less, but the catalog is another control plane to operate. The client now owns retry and outlier policy.
+- **Kubernetes Endpoints / EndpointSlice + CoreDNS:** kube-proxy or an endpoint controller is the membership owner. CoreDNS is a **derived** A/AAAA view of ready pods. A pod can be Ready in DNS while its ledger pool is exhausted. Readiness must include the dependency that matters, or TokenX will debit-route to a process that can only 503.
+- **Sidecar / mesh endpoint discovery:** xDS is another derived view. Policy lives in [Service mesh and proxies](/learn/service-mesh-and-proxies); this lesson only requires that empty endpoint sets **fail closed** for money.
+
+Registration, heartbeat, and **deregistration** are the actual failover path. A crash without deregistration leaves a zombie until TTL or the lease expires. A graceful stop that removes the endpoint *and* drains is the combination that [load balancing](/learn/load-balancing-deep-dive) already demanded.
+
+<ExecutionTimeline
+  title="TokenX debit against a name that still points at a dead pod"
+  steps={[
+    { title: "Resolve", detail: "The API client hits a 5 s TTL cache and receives 10.1.2.3, a pod that kubelet already SIGKILL’d.", state: "DNS cache owns a photocopy. Registry already dropped the endpoint.", failure: "Treating the A record as health truth." },
+    { title: "Dial", detail: "TCP SYN to 10.1.2.3 times out or hits a stale conntrack NAT.", state: "No ledger transaction yet.", failure: "Retrying immediately to the same cached address multiplies timeouts into the user deadline." },
+    { title: "Re-resolve or fail closed", detail: "On connect failure the client bypasses remaining TTL, asks the registry or CoreDNS again, and if the ready set is empty returns 503 without minting a new transfer_id.", state: "Ledger is untouched. Unique id unused.", failure: "Fail-open to a cached ‘last known good’ VIP that now belongs to another tenant’s debug host." },
+    { title: "Herd", detail: "When TTL finally expires, healthy pods see a reconnect spike. Admission 429s debug; TokenX uniqueness still fail-closes if the ledger is the bottleneck.", state: "Registry plus Ready endpoints are the routing source. Money is still the ledger.", failure: "Lowering TTL to 1 s without rate-limiting lookups DDoSes CoreDNS." }
+  ]}
+/>
+
+<InteractiveCalculation mode="little-law" title="Reconnect herd is extra in-flight work at the resolver and the VIP" />
+
+Little’s Law at the resolver: if 2,000 TokenX clients all refresh every 5 s, mean lookup rate is 400 queries/s. After a zone change that invalidates everyone, the spike is closer to 2,000 queries in one RTT. That is offered load on CoreDNS, not proof the ledger is up.
+
+</UnderTheHood>
+
+<MentalModel title="A phone book with yesterday’s numbers">
+
+DNS is a printed phone book. The registry is the live switchboard. Calling a number still in the book after the desk moved does not transfer money; it rings an empty room. Reprint delay is TTL. The switchboard forgetting a dead desk is deregistration. TokenX does not leave a voicemail that says “paid.”
+
+Retain: **caches are derived, health and registry are the routing authority, money still commits only in the ledger, and failover delay is the max of stacked TTLs plus connect timeout—not the time you edited the record.**
+
+</MentalModel>
+
+<ArchitectureDiagram title="Resolver caches, registry health, and fail-closed empty sets" chart={"flowchart LR\n  CLI[TokenX client] -->|lookup| STUB[Stub plus app cache]\n  STUB --> REC[Recursive resolver]\n  REC --> AUTH[Authoritative DNS]\n  REG[(Service registry)] -->|ready set| AUTH\n  REG -->|watch| CLI\n  AUTH -->|A set photocopy| STUB\n  CLI -->|debit plus transfer_id| VIP[VIP or pod IP]\n  VIP --> LED[(Authoritative ledger)]\n  CLI -. empty ready set 503 .-> REJ[Fail closed]\n  STUB -. stale TTL .-> DEAD[Dead pod]\n  DEAD -. connect fail .-> CLI\n  ADS[Ad Click client] -->|anycast name| POP[Collector POP]\n  POP --> LOG[(Billed-fact log)]"}>
+
+**Authoritative routing state:** the registry (or Kubernetes endpoint controller) and instance readiness that includes the ledger or collector dependency. **Authoritative money / billed facts:** TokenX ledger plus unique `(tenant, transfer_id)`; Ad Click log plus `click_id`. **Derived:** stub, recursive, and application DNS caches; CoreDNS A records; VIP membership; anycast announcements. Solid edges are a successful resolve-then-commit path. Dashed edges are stale TTL to a dead pod, empty-set fail-closed, and connect failure that must re-resolve rather than reuse the photocopy. Recovery is deregister, drain, expire or bypass TTL on hard failure, and never treat a cached address as a commit.
+
+<ArchitectureWalkthrough
+  title="What each layer is allowed to decide"
+  stages={[
+    { name: "Cache", owner: "Stub and recursive resolvers", state: "Photocopy of A/AAAA until TTL or negative cache", boundary: "Must not claim health or money.", failure: "Negative cache hides a restored name past the outage.", recovery: "Clamp negative TTL; flush on confirmed registry change." },
+    { name: "Registry", owner: "Control plane", state: "Registered instances plus leases", boundary: "Membership only.", failure: "Missing deregistration leaves zombies until lease expiry.", recovery: "Heartbeat plus explicit remove on SIGTERM before drain." },
+    { name: "Dial", owner: "Client", state: "Chosen address from ready set", boundary: "Connect is not commit.", failure: "Last-known-good fail-open for TokenX.", recovery: "503 if ready set empty; retry same transfer_id after a fresh lookup." }
+  ]}
+/>
+
+</ArchitectureDiagram>
+
+<RealExamples title="TokenX empty-set 503; Ad Click stale anycast">
+
+**TokenX.** `ledger-api` is a Kubernetes Service. Readiness requires a successful unique-id insert probe against the ledger, not merely “process listens on 8443.” If the Ready set is empty, kube-proxy has nowhere legal to send SYN. The API returns **503** and does **not** ACK a debit. Clients retry the **same** `transfer_id` after jitter. They do not pin a 10-minute application cache of pod IPs to “keep availability.”
+
+**Ad Click.** Public ingest uses an anycast name with TTL 30 s in front of regional collectors. If one POP dies, BGP withdraw is faster than DNS, but clients that resolved a unicast fallback name still hammer the dead POP until TTL. Ingest **fail-opens** to remaining healthy collectors. Billed identity is still `click_id` on the durable log. A stale DNS answer is lost availability at one POP, not permission to ACK from memory or drop uniqueness. Dashboards that lag because a POP vanished are **derived**.
+
+<FailureScenario
+  title="Pick the discovery failure without inventing health"
+  prompt="TokenX p99 debit errors spike. Some clients still resolve a pod IP that kubelet killed 20 s ago. CoreDNS TTL is 5 s. An engineer proposes pinning the last successful IP for 10 minutes."
+  choices={[
+    { label: "Pin last-known-good", impact: "Availability theatre: money routes to a corpse or to a recycled IP now running a scratch debug container.", recovery: "Never fail-open TokenX routing. Empty or unhealthy set must 503." },
+    { label: "Bypass remaining TTL on connect failure, require Ready including ledger probe, drain then delete the endpoint.", impact: "Stale window collapses to connect timeout plus one re-resolve. In-flight commits still need drain, not DNS.", recovery: "Keep unique transfer_id; fail closed if Ready is empty." },
+    { label: "Set TTL to 1 s globally including Ad Click anycast.", impact: "Resolver QPS explodes; ads ingest still needs uniqueness; TokenX still needs drain.", recovery: "Short TTL for money names, clamp negative cache, rate-limit herds; do not use TTL as a health loop." }
+  ]}
+/>
+
+</RealExamples>
+
+<InterviewTraps title="Discovery claims that fail IC6">
+
+- **“We updated DNS, so failover is instant.”** Stacked caches and negative TTL disagree. Bound the window.
+- **“Kubernetes DNS is health.”** CoreDNS is a derived view of Ready. Ready that ignores the ledger is a lie.
+- **“Client-side discovery is always better than DNS.”** You bought a catalog, watches, and client retry policy. Name the control plane.
+- **“Last-known-good keeps payments up.”** That is fail-open routing. TokenX money fail-closes on empty discovery.
+- **“SRV records give you service mesh.”** SRV gives port names. Mesh policy is a different lesson.
+- **“Anycast plus DNS means Ad Click cannot double-bill.”** Anycast is a routing hint. Uniqueness is `click_id` on the log.
+
+</InterviewTraps>
+
+<Tradeoffs title="Freshness, query load, and who owns membership">
+
+- **Short TTL versus resolver load:** 5 s money names cut stale windows and create herds. 60 s public names spare recursive resolvers and slow failover.
+- **DNS-only versus registry watch:** DNS is dumb and global; watches are fast and operationally heavy.
+- **Deep Ready versus shallow listen:** Deep probes eject pods during a shared ledger outage and can empty the VIP—the same trap as [load balancing](/learn/load-balancing-deep-dive). Shallow probes route to processes that cannot commit. For TokenX, empty-and-503 is better than 200-from-nowhere.
+- **App-level cache versus OS cache:** extra cache layers extend the stale bound you must quote in an interview.
+
+Correctness of spendable routing is not a TTL knob. Completeness of ads ingest during a dead POP is an availability knob with uniqueness still at the log.
+
+</Tradeoffs>
+
+<KnowledgeCheck
+  question="A TokenX client cached ledger-api for 30 s. Kubernetes removed a crashed pod immediately. What does the remaining TTL prove?"
+  options={[
+    "The ledger rolled back any in-flight debit to that pod",
+    "Only that the client may still dial a photocopy of an address; Ready membership already changed",
+    "CoreDNS is linearizable with kubelet",
+    "Retrying with a new transfer_id is required because DNS failed"
+  ]}
+  correct={1}
+  explanation="TTL is cache freshness, not a transaction. The registry already dropped the pod. A new transfer_id risks double-spend; reuse the same id after re-resolve or 503."
+/>
+
+<ScenarioCheck
+  scenario="Ad Click ingest.example has TTL 60 s. One of three POPs dies. BGP withdraws anycast for that POP in ~5 s, but a unicast fallback name still lists the dead VIP. Collectors ACK only after the billed-fact log append. A proposal: clients should pin the last IP that returned 200 and skip click_id if Redis discovery is down."
+  question="Which policy matches this curriculum?"
+  options={[
+    { label: "Pin last IP and ACK from the client when discovery is down, because ingest must be available.", feedback: "Pinning is stale routing. Client ACK is not a billed fact. Uniqueness cannot be skipped." },
+    { label: "Fail-open to remaining healthy collectors using fresh or bypassed lookups; keep click_id uniqueness at the log; treat the dead POP as lost availability; dashboards may lag.", feedback: "Availability of ingest uses other healthy sinks. Authority stays on the log. DNS is not health and not a ledger." },
+    { label: "Wait 60 s for TTL so all clients move together, then replay clicks without ids to backfill.", feedback: "Waiting the full TTL is an optional bound, not a requirement if you can re-resolve on failure. Replaying without ids double-bills." },
+    { label: "Lower TTL to 1 s and deep-health the billed log from DNS so NXDOMAIN means exactly-once failover.", feedback: "DNS cannot provide exactly-once. Deep-health of a shared log can NXDOMAIN the whole name during a real outage." }
+  ]}
+  correct={1}
+  explanation="Stale DNS is an availability hole at one POP. Billed identity does not move to the client. TokenX would fail closed on empty money routing; ads ingest may continue on other collectors."
+/>
+
+<InterviewAnswer>
+
+“I treat DNS as a stacked cache of routing photocopies. Failover delay is the max of application cache, stub, recursive, and TTL, plus connect timeout—not the time I edited the record. Negative cache can hide a restored name. The registry or Kubernetes endpoint controller plus honest Ready is membership; CoreDNS is derived. TokenX fail-closes if the ready set is empty: 503, same transfer_id on retry, no last-known-good VIP. Ad Click may fail-open ingest to remaining collectors while click_id uniqueness stays on the billed log. I do not call a name lookup health, linearizable failover, or a commit.”
+
+</InterviewAnswer>

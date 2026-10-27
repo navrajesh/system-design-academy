@@ -1,0 +1,157 @@
+---
+title: "TCP, QUIC, and Connection Lifecycle"
+description: "Budget handshake, congestion, head-of-line blocking, and connection reuse so a RST or 0-RTT replay cannot mint a second TokenX debit or a second billed click."
+module: 5
+moduleTitle: "Networking"
+order: 3
+duration: 38
+difficulty: "Intermediate"
+tags:
+  - TCP
+  - QUIC
+  - TLS
+  - connection pooling
+  - head-of-line blocking
+objectives:
+  - Separate TCP byte-stream order from application request order across connections
+  - Choose HTTP/1.1, HTTP/2-over-TCP, or QUIC from loss-induced head-of-line cost, not from slogans
+  - Size pools, keepalive, and TIME_WAIT so ephemeral ports and NAT timeouts do not look like application errors
+  - Forbid TLS 0-RTT for TokenX debits and treat RST-after-commit as UNKNOWN, not rollback
+---
+
+<BigPicture title="A connection is transport state, not a ledger row">
+
+[Networking for system design](/learn/networking-for-system-design) established that TCP preserves byte order **on one connection** and that a timeout is not a rollback. This lesson is the **lifecycle**: handshake cost, TLS 1.3 1-RTT versus 0-RTT replay, congestion and slow start, HTTP/1.1 versus HTTP/2 head-of-line blocking versus QUIC, keepalive, pooling, TIME_WAIT, NAT idle timeouts, and drain versus RST.
+
+The connection table on the client, the load balancer, and the NAT is **derived transport state**. It can be rebuilt by dialing again. TokenX money still commits in the ledger with `(tenant, transfer_id)`. Ad Click billed facts still commit on the log with `click_id`. Reusing a socket is amortization. It is not session affinity correctness, and it is not exactly-once.
+
+</BigPicture>
+
+<UnderTheHood title="Handshake, loss, reuse, then an honest UNKNOWN">
+
+### What you pay before the first byte of POST /debits
+
+TCP handshake is 1 RTT (SYN, SYN-ACK, ACK). TLS 1.3 on a new connection is typically **1-RTT** more after TCP, with session resumption sometimes overlapping. **0-RTT** (early data) sends application bytes in the first client flight using a previous PSK. Those bytes can be **replayed** by a network attacker or a buggy retry. TokenX **must not** put spendable debits in 0-RTT. Ad Click ingest must not put a new `click_id` in 0-RTT unless the log is already idempotent on that id—and even then you still replayed offered load.
+
+Slow start and congestion windows mean a new connection is a worse p99 than a warm one. That is why pools exist. It is also why a pool of idle sockets can hide a dead backend until the first write, which is why [load balancing](/learn/load-balancing-deep-dive) health and idle timeouts must match.
+
+### Head-of-line blocking is not one idea
+
+- **HTTP/1.1:** one request at a time per connection (pipelining is a museum piece). Loss delays that one request. You scale with more connections, which costs RAM, sockets, and slow start.
+- **HTTP/2 over TCP:** many streams, one congestion context. A lost TCP packet stalls **all** streams until retransmission. That is **TCP HOL**, not application FIFO.
+- **QUIC / HTTP/3:** streams mostly recover independently because loss is per-stream at the QUIC layer. You still share a connection-level congestion window. QUIC is not infinite parallelism and not a TokenX transaction.
+
+<Calculation label="Pool occupancy and TIME_WAIT (illustrative)">
+
+TokenX API: 2,000 req/s, mean service 20 ms, HTTP/1.1 one-request-per-connection: busy sockets ≈ 2,000 × 0.020 = **40**. With HTTP/2 multiplexing, fewer connections carry more streams—until a loss event stalls the multiplex.
+
+If each debit used a new connection and closed with TIME_WAIT 60 s on the client: 2,000/s × 60 s = **120,000** tuples in TIME_WAIT. Ephemeral ports (often ~28,000 on a default range) exhaust. Errors look like “cannot assign requested address,” not “ledger down.”
+
+NAT idle timeout 30 s with HTTP keepalive 90 s: the NAT drops the mapping; the next byte gets RST. If the ledger already committed, the client sees **UNKNOWN**, not rollback. Same identity on retry. See [tail-latency control](/learn/tail-latency-control) for cancellation that actually stops work.
+
+</Calculation>
+
+<ExecutionTimeline
+  title="Warm pool, loss, RST after commit"
+  steps={[
+    { title: "Acquire", detail: "The TokenX API takes a pooled TLS 1.3 connection. Handshake cost is already amortized. 0-RTT is disabled on POST /debits.", state: "No ledger write yet. Pool slot is derived.", failure: "0-RTT early data on a debit is a replay surface." },
+    { title: "Write", detail: "HTTP/2 carries the POST. A lost TCP segment stalls this stream and its siblings on the same connection.", state: "Server may still commit while the client waits for retransmit.", failure: "Calling that stall ‘QUIC would have committed exactly once’ confuses transport with the ledger." },
+    { title: "Commit then RST", detail: "The handler commits uniqueness plus debit. The balancer drain timer fires and RSTs. The client gets no HTTP status.", state: "Ledger row exists. Client outcome is UNKNOWN.", failure: "Treating RST as rollback and inserting a new transfer_id." },
+    { title: "Retry or query", detail: "Client retries the same transfer_id on a new connection after jitter, or reads the transfer status. Drain should have been above p99 so this RST is rare.", state: "Idempotency at the ledger. New socket is not a new command.", failure: "HTTP/2 ping keepalive that outlives NAT idle still looks healthy until the write." }
+  ]}
+/>
+
+Connection **drain** (from the LB lesson) means stop new streams, wait for in-flight, then RST. **Keepalive** is a lie detector with a clock: TCP keepalive, HTTP/2 PING, QUIC max idle. Set them **below** NAT and LB idle so you discover death before a debit.
+
+Kafka produce still rides TCP to brokers. `acks=all` is a **broker** durability contract from [Kafka delivery](/learn/kafka-delivery-and-failure), not HTTP semantics. A TCP RST on the produce socket is UNKNOWN for that record, same as HTTP.
+
+<InteractiveCalculation mode="little-law" title="New connections spend extra hold time in handshake" />
+
+If handshake+TLS adds 40 ms to a 20 ms debit at 2,000 req/s, extra occupancy is 2,000 × 0.040 = **80** connections of handshake work. Pools buy that back. Unbounded pool growth buys TIME_WAIT death.
+
+</UnderTheHood>
+
+<MentalModel title="A reserved lane, not a stamped contract">
+
+A TCP or QUIC connection is a reserved lane on a highway. The lane keeps cars in order. It does not stamp the bank slip. Closing the lane after the clerk stamped the slip does not unstamp it. Opening a second lane with a new slip number is a second payment. 0-RTT is mailing a photocopy of yesterday’s slip before the clerk looks up; someone else can mail it too.
+
+Retain: **order is per connection, reuse is amortization, 0-RTT is replay, RST after commit is UNKNOWN, and QUIC does not replace uniqueness.**
+
+</MentalModel>
+
+<ArchitectureDiagram title="Pooled TLS, loss, drain RST, and ledger UNKNOWN" chart={"flowchart LR\n  CLI[Client plus transfer_id] -->|acquire| POOL[Connection pool]\n  POOL -->|TLS 1.3 1-RTT| LB[L4 or L7 balancer]\n  LB --> SVC[TokenX handler]\n  SVC -->|same TX| LED[(Authoritative ledger)]\n  POOL -. 0-RTT forbidden .-> REJ[Reject early data]\n  LB -. drain RST .-> CLI\n  LED -. commit already done .-> SVC\n  CLI -. retry same id .-> POOL\n  ADS[Collector] -->|QUIC or TCP| LOG[(Billed-fact log)]\n  LOG -. RST after append .-> ADS"}>
+
+**Authoritative:** TokenX ledger plus unique `(tenant, transfer_id)`; Ad Click billed-fact log plus `click_id`. **Derived:** connection pools, congestion windows, LB 5-tuple maps, NAT mappings, QUIC connection IDs. **Consistency boundary:** commit is the ledger or log append, not TCP ACK, not TLS Finished, not HTTP/2 END_STREAM if the client never saw it. Solid edges are acquire, 1-RTT TLS, handler, commit. Dashed edges are forbidden 0-RTT, drain RST, and retry with the same identity. Recovery is drain above p99, keepalive below NAT idle, fail closed if the pool cannot obtain a connection for money, and never mint a new id because the socket died.
+
+</ArchitectureDiagram>
+
+<RealExamples title="TokenX no 0-RTT; Ad Click collector reuse">
+
+**TokenX.** Disable early data on the debit hostname. Pool HTTP/2 or HTTP/1.1 with a cap from Little’s Law, not “max 10,000.” On RST or timeout, query or retry the **same** `transfer_id`. Do not hedge POSTs onto two connections with two UUIDs ([tail latency](/learn/tail-latency-control)).
+
+**Ad Click.** High-QPS collectors prefer long-lived TCP or QUIC to the log broker or local disk. Connection reuse amortizes handshake at 80k clicks/s. ACK still waits for durable append. If QUIC 0-RTT replays a packet with the same `click_id`, the log’s unique insert makes it a duplicate, not a second bill—**if** uniqueness is up. If uniqueness is down, do not fail-open an ACK from the socket accept path.
+
+<FailureScenario
+  title="Name the transport failure"
+  prompt="A TokenX client enables TLS 1.3 0-RTT to cut 40 ms. p99 falls. Finance later finds doubled debits on a minority of retries through a flaky middlebox."
+  choices={[
+    { label: "Keep 0-RTT; the ledger unique key will always drop the replay.", impact: "If the first 0-RTT flight committed and a retry used a new id, you double-spend. Unique key only helps when the id is stable.", recovery: "Disable 0-RTT on spendable POST; keep transfer_id stable." },
+    { label: "Disable 0-RTT on POST /debits; treat socket death as UNKNOWN; drain above p99.", impact: "You give back handshake latency on cold connections and remove the replay path.", recovery: "Warm pools; never new UUID on RST." },
+    { label: "Switch everything to QUIC so HOL blocking proves exactly-once.", impact: "QUIC removes TCP HOL, not duplicate commands.", recovery: "Use QUIC for lossy last-mile reads; money still needs identity." }
+  ]}
+/>
+
+</RealExamples>
+
+<InterviewTraps title="Connection folklore">
+
+- **“TCP is reliable so the debit happened exactly once.”** Reliable delivery of bytes is not unique business effects.
+- **“HTTP/2 killed HOL blocking.”** It killed HTTP/1.1 request HOL. TCP loss still stalls the multiplex.
+- **“QUIC is always faster and safer for payments.”** Faster on lossy links maybe; 0-RTT is *less* safe for POST.
+- **“Connection reuse means sticky sessions.”** Reuse is a pool. Affinity is a correctness smell for HTTP APIs.
+- **“RST means the server rolled back.”** RST after commit is UNKNOWN.
+- **“TIME_WAIT is a kernel bug.”** It is a 2MSL guard. Exhaustion is an architecture bug (chatty new connections).
+
+</InterviewTraps>
+
+<Tradeoffs title="Warm sockets versus loss isolation versus replay">
+
+- **Many HTTP/1.1 connections versus few HTTP/2:** isolation versus memory and HOL on loss.
+- **QUIC versus TCP+TLS:** better loss recovery and migration; newer middlebox and CPU cost; 0-RTT temptation.
+- **Long keepalive versus NAT/LB idle:** discover death early versus extra PING traffic.
+- **Large pools versus cap:** handshake avoidance versus holding dead backends and file descriptors.
+
+Spendable writes choose 1-RTT and stable ids over a 40 ms handshake win.
+
+</Tradeoffs>
+
+<KnowledgeCheck
+  question="The balancer RSTs a TokenX HTTP/2 stream after the handler committed uniqueness plus debit. The client saw no status. What is true?"
+  options={[
+    "The ledger rolled back because TCP did not FIN",
+    "The outcome is UNKNOWN; retry must use the same transfer_id",
+    "HTTP/2 RST_STREAM is linearizable abort",
+    "Opening a new connection with a new UUID is the safe recovery"
+  ]}
+  correct={1}
+  explanation="Transport reset is not a transaction abort. A new UUID is a new command. Drain should have waited; recovery is identity plus query or idempotent retry."
+/>
+
+<ScenarioCheck
+  scenario="Ad Click collectors at 80,000 events/s open a new TLS connection per click to avoid HOL. Ephemeral ports exhaust in TIME_WAIT. A second proposal enables QUIC 0-RTT so lost packets do not stall billing, and ACKs when the QUIC handshake completes, before the log append."
+  question="Which change set is defensible?"
+  options={[
+    { label: "Keep one connection per click so each click is isolated; port exhaustion means we should NAT more.", feedback: "You will still die in TIME_WAIT. Isolation of money/clicks is uniqueness, not a socket per event." },
+    { label: "Pool long-lived TCP or QUIC; ACK only after durable unique click_id append; disable 0-RTT unless the same click_id is fenced; treat RST as UNKNOWN.", feedback: "Reuse amortizes handshake. Authority stays the log. 0-RTT replay is then a duplicate insert, not a second bill, and not an ACK-before-append." },
+    { label: "ACK on handshake and repair later from packet captures because QUIC is lossless.", feedback: "Handshake is not an append. Captures are not the billed log. QUIC is not lossless forever." },
+    { label: "Switch TokenX and ads to 0-RTT POST because TLS 1.3 forbids replay by spec.", feedback: "0-RTT is replayable by design. Spec says applications must be idempotent. TokenX debit is not, without a stable id." }
+  ]}
+  correct={1}
+  explanation="Pools fix TIME_WAIT. Uniqueness fixes duplicates. ACK-on-handshake and slogans about lossless QUIC do not."
+/>
+
+<InterviewAnswer>
+
+“I budget handshake and slow start separately from service time. Pools amortize TLS 1.3 1-RTT; I disable 0-RTT on TokenX POST /debits because early data is replayable. HTTP/2 multiplexes streams on one TCP congestion context, so a loss stalls siblings—QUIC mostly removes that HOL, not the need for transfer_id. Keepalive has to sit below NAT and balancer idle or the next write RSTs. TIME_WAIT times connections, not money: a new socket per debit will exhaust ephemeral ports. If drain RSTs after commit, the client sees UNKNOWN and retries the same identity. Kafka acks=all is still a broker contract riding TCP, not HTTP exactly-once. Connection reuse is not stickiness and not a ledger.”
+
+</InterviewAnswer>
