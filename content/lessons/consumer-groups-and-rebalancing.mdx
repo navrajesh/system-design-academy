@@ -1,0 +1,213 @@
+---
+title: "Consumer Groups and Rebalancing"
+description: "Design exclusive partition ownership, rebalance protocols, lag catch-up, and dual-owner safety without treating Kafka as exactly-once."
+module: 3
+moduleTitle: "Kafka & Fault Tolerance"
+order: 3
+duration: 38
+difficulty: "Intermediate"
+tags:
+  - Kafka
+  - consumer groups
+  - rebalancing
+  - offsets
+  - lag
+objectives:
+  - "Assign exclusive partition ownership without claiming a global lock or end-to-end exactly-once processing"
+  - "Choose eager versus cooperative rebalance and static versus dynamic membership from two failure detectors"
+  - "Calculate consumer lag and changelog restore cost, then fence dual owners at the sink"
+---
+
+<BigPicture title="A group is exclusive fetch ownership, not a lock and not exactly-once">
+
+A Kafka consumer group is a named set of members that subscribe to the same topics and receive **exclusive ownership of each subscribed partition**. Two members of `group.id=tokenx-settlement` must not both be assigned partition 3 of the settlement topic at the same generation. That is a fetch-assignment rule, not a cluster-wide mutex, and it is not a proof that a ledger row committed once.
+
+The group does not lock other groups. A second group can consume the same topic independently, with its own committed offsets. The group does not lock the sink: a revoked member can still finish in-flight work after the coordinator has already given the partition to a successor. Kafka also does not make the business workflow exactly once. Offset commits are **group progress**. Sink correctness still needs an idempotency key or a fencing token at the resource, as in [Kafka delivery semantics and failure](/learn/kafka-delivery-and-failure).
+
+TokenX settlement needs one owner per settlement-topic partition so ledger mutations for a keyed account stay serialized on the consume path. Ad Click collectors can add members to raise parallelism only up to the partition count; extra members sit idle and do not create a global click order. Broker layout, leaders, and in-sync replicas are in [Kafka Internals](/learn/kafka-internals). Key choice and per-partition order are in [Ordering and Event Keys](/learn/ordering-and-event-keys).
+
+</BigPicture>
+
+<UnderTheHood title="Coordinator, generation, two clocks, and a dual-owner window">
+
+### Membership is a generation, not a process name
+
+A **group coordinator** (a broker) owns membership, heartbeats, and offset commits for that `group.id`. Each join produces a **generation** (epoch). Offset commits carry that generation; a stale member whose generation has been superseded cannot advance group progress. Member identity is either a coordinator-assigned member id that dies with the process (**dynamic membership**) or an operator-set <code>group.instance.id</code> (**static membership**).
+
+Committed offsets live in Kafka (commonly the internal offsets topic). They record “this group last checkpointed here,” not “the sink applied this record.” Fetch position can sit ahead of the committed offset while work is in flight. Applied offset at the sink can sit ahead of the committed offset when you write the ledger first—the usual at-least-once order.
+
+### Eager stop-the-world versus cooperative revoke
+
+On a join, leave, or detected death, the coordinator starts a rebalance.
+
+- **Eager (stop-the-world):** every member revokes **all** assigned partitions, consumption pauses, then a new assignment is computed. Even a partition that will return to the same member goes idle for the round.
+- **Cooperative / incremental:** only partitions that must move are revoked. Members keep fetching partitions they still own. Every member must use a cooperative assignor (commonly cooperative-sticky). Mixing eager and cooperative assignors in one group is undefined behavior you do not ship.
+
+Partition **assignors** are properties, not slogans:
+
+- **Range:** per topic, sorted members receive contiguous partition ranges. Two topics with uneven partition counts can leave one member with more work.
+- **Round-robin:** topic-partitions are walked in a circle. Balance is even, but a membership change can move many partitions.
+- **Sticky:** balance plus minimize movement so local caches and in-flight work survive.
+- **Cooperative-sticky:** sticky placement plus incremental revoke.
+
+### Static membership versus a corpse that still owns work
+
+Static membership is useful when a rolling restart would otherwise revoke healthy partitions. If instance `settlement-2` restarts and rejoins with the same <code>group.instance.id</code> **before** <code>session.timeout.ms</code> expires, the coordinator can keep its assignment and skip an unnecessary generation. If that instance is dead—host down, bad deploy, hung JVM—those partitions stay assigned to the corpse until the session timeout fires. Short timeouts rebalance faster on death; long timeouts hide restarts and extend the zombie-hold window. Pick the timeout as an operational SLO, not as a default you never measure.
+
+### Two failure detectors: heartbeat versus poll interval
+
+<ExecutionTimeline
+  title="A live heartbeat does not prove a live processing loop"
+  steps={[
+    { title: "Join generation 12", detail: "Members heartbeat to the coordinator and receive exclusive partitions for this generation.", state: "Coordinator owns membership; Kafka log remains the fetch authority.", failure: "A join during an eager rebalance stops all fetching until the round completes." },
+    { title: "Heartbeat vs poll", detail: "A background thread can keep session.timeout.ms satisfied while the worker thread is stuck in a 12-minute ledger call and does not call poll.", state: "The member still looks alive on the heartbeat path.", failure: "Exceeding max.poll.interval.ms causes a leave; the group assigns the partition to someone else." },
+    { title: "Revoke", detail: "The leaving member must stop fetching revoked partitions, finish or cancel bounded in-flight work, and commit only fully applied offsets.", state: "Group offsets still mean checkpoint, not sink proof.", failure: "Committing an in-flight offset creates at-most-once loss if the sink write never lands." },
+    { title: "Dual owner", detail: "The new owner fetches from the last committed offset and starts applying while the old owner may still complete a late sink write.", state: "Two processes can touch the same keys until the sink fences or dedupes.", failure: "Treating exclusive assignment as a mutex double-posts a TokenX settlement." },
+  ]}
+/>
+
+<code>session.timeout.ms</code> and <code>heartbeat.interval.ms</code> detect **member liveness to the coordinator** (process gone, network cut). <code>max.poll.interval.ms</code> detects **processing-loop liveness**. A slow but heartbeating worker is kicked when it does not poll in time. Raising poll interval hides stuck processors; lowering it makes long but valid sink transactions look like deaths. Neither timeout is a lock expiry at the database.
+
+### Rebalance safety protocol
+
+1. On revoke, stop fetching those partitions immediately.
+2. Bound in-flight work: finish a small batch or cancel it; do not start new records for revoked partitions.
+3. Commit offsets only for records whose sink effect has already committed.
+4. Let the successor start from that checkpoint. Uncommitted records replay (at-least-once).
+5. Assume a **dual-owner window**: the revoked member may still apply while the new owner applies. The sink must be idempotent (stable event id in the same ledger transaction) or fenced (generation or epoch stored at the resource). Exclusive group assignment is not that fence.
+6. Treat changelog restore for stateful tasks as part of rebalance time: do not serve until local state is rebuilt from the changelog.
+
+### Lag, catch-up, and the parallelism ceiling
+
+**Lag** is not “the consumer feels slow.” Name the two offsets. Operational lag is usually **log-end offset (or high watermark) minus applied offset**. Log-end is the next offset the leader will append. High watermark is the highest offset replicated through the in-sync replica set and therefore fetchable for ordinary `read_uncommitted` consumers. For `read_committed`, the relevant end is the last stable offset, not aborted-transaction noise. Group-committed offset lag answers “where is the checkpoint,” which can disagree with applied lag if you committed too early.
+
+Assumptions (illustrative TokenX settlement partition): produce 8,000 records/s, 400 B payload, 3.2 MB/s into the leader before protocol overhead. Applied offset is 2,400,000 behind the high watermark.
+
+<Calculation label="Catch-up time needs leftover consume rate">
+
+Backlog time at the current produce rate: 2,400,000 records / 8,000 records/s = 300 s of age if produce stopped.
+Produce does not stop. If the consumer applies 12,000 records/s, catch-up headroom is 4,000 records/s.
+Catch-up time: 2,400,000 / 4,000 = 600 s (10 min), ignoring GC, sink contention, and rebalance pauses.
+If consume rate equals produce rate, lag never drains. If it is below produce rate, lag grows without bound.
+
+</Calculation>
+
+**Parallelism limit equals partition count** for one group and one topic. Twelve partitions and twenty members leave eight members idle. Adding consumers without adding partitions does not raise throughput. Adding partitions later changes key-to-partition mapping for new records and is an ordering-scope change, not a free scale knob.
+
+Stateful stream tasks restore from a **changelog** (derived, rebuildable) before they should serve. A 4 GB changelog restored at 80 MB/s is 50 s of assignment-to-ready time per task, plus any warmup. That 50 s is a rebalance cost: cooperative assignors reduce how often it happens; they do not make restore free.
+
+</UnderTheHood>
+
+<MentalModel title="One key on one desk, two clocks on the wall">
+
+Think of a coat-check room with numbered rails (partitions). A shift lead (coordinator) hands each attendant exclusive rails for this shift number (generation). The ticket stub on the wall (committed offset) is how far the shift claims it got. It is not proof the coat reached the owner. If an attendant is swapped mid-jacket, both the outgoing and incoming attendant may still be holding the same coat—the closet (sink) needs the claim check.
+
+Two wall clocks matter. The heartbeat clock asks “is the attendant still in the building?” The poll-interval clock asks “are they still taking tickets?” A worker chatting at the door can pass the first clock and fail the second.
+
+Remember: the group serializes **fetch** per partition per generation. The sink serializes **effects**. Lag is end-of-log minus applied work, in records or bytes, with leftover consume rate as the only catch-up fuel.
+
+</MentalModel>
+
+<ArchitectureDiagram title="Group ownership, group progress, and sink fencing" chart={"flowchart LR\n  LOG[(Authoritative partition log)] -->|fetch| A[Member A gen 12]\n  LOG -->|fetch| B[Member B gen 12]\n  GC[Group coordinator] -->|heartbeat session| A\n  GC -->|heartbeat session| B\n  A -->|commit after sink| OFF[(Group committed offsets)]\n  B -->|commit after sink| OFF\n  A --> SINK[(Ledger plus event IDs)]\n  B --> SINK\n  CHG[(Changelog derived state)] -. restore before serve .-> B\n  A -. revoke still applying .-> SINK\n  DEAD[Dead static member] -. holds partition until session timeout .-> LOG\n  SLOW[Poll interval exceeded] -. kick despite heartbeats .-> GC\n  OFF -. replay from checkpoint .-> B"}>
+
+The partition log is authoritative for records until retention. The coordinator is authoritative for membership and generation, not for ledger balances. Group committed offsets are derived progress for that `group.id`. The ledger plus event-id uniqueness (or a stored fencing generation) is authoritative for business effects. Changelog state is derived and must be restored before a stateful task serves. Dashed edges are revoke overlap, restore, replay, zombie hold, and poll-interval eviction—not successful ownership handoff.
+
+<ArchitectureWalkthrough
+  title="What each store is allowed to claim"
+  stages={[
+    { name: "Assign", owner: "Group coordinator", state: "Generation 12 membership and exclusive partition map", boundary: "Fetch ownership for this group and subscription only.", failure: "Eager revoke pauses healthy partitions; a dead static member keeps a partition assigned.", recovery: "Use cooperative assignors when members support them; size session.timeout.ms for restart versus zombie hold." },
+    { name: "Fetch", owner: "Current member", state: "Fetch position on the log; heartbeats and poll loop both running", boundary: "Session timeout versus max.poll.interval.ms are different detectors.", failure: "Heartbeats succeed while poll stalls; the group still replaces the member.", recovery: "Bound sink work per poll, or isolate slow keys without blocking the partition forever." },
+    { name: "Apply", owner: "Sink database", state: "Event id and mutation in one local transaction", boundary: "At-least-once delivery plus sink idempotency or fencing.", failure: "Dual-owner window writes the same settlement twice if the sink has no unique key.", recovery: "Reject the duplicate event id; never treat assignment as a mutex." },
+    { name: "Checkpoint", owner: "Kafka offsets", state: "Committed offset after durable sink success", boundary: "Group progress, not proof of effect.", failure: "Commit-before-apply loses records after a rebalance.", recovery: "Replay from the last committed offset and let the sink no-op duplicates. See delivery semantics." },
+  ]}
+/>
+
+</ArchitectureDiagram>
+
+<RealExamples title="TokenX settlement owners and Ad Click collector scale">
+
+**TokenX settlement.** A settlement topic is keyed by account (or a settlement batch that still maps to one partition). Group `tokenx-settlement` runs one member per partition at peak, matching the partition count. Each member applies ledger credits with a unique `event_id` in the same database transaction, then commits the Kafka offset. During a deploy, static membership can keep assignments if instances rejoin inside the session timeout. If a static instance never returns, partition 3 is silent until that timeout—operators page on lag, not on member count. A rebalance still allows a dual-owner window; the unique event id is the fence, not the group.
+
+**Ad Click Aggregator.** Collectors scale by adding partitions and members together. Twenty collectors on twelve partitions waste eight processes and do not create a total order of clicks. Per-campaign order, if required, is a keying problem for the later ordering lesson, not a consumer-count problem. Aggregates are derived: lag is high watermark minus applied offset on each partition. A stateful window store must restore from its changelog after an assignment before serving dashboard corrections; quoting “we rebalanced in 2 s” while restore takes 50 s is an SLO lie.
+
+<FailureScenario
+  title="Which control actually failed?"
+  prompt="Partition 3 of the TokenX settlement topic stops draining. Heartbeats from settlement-2 still arrive. Lag versus high watermark climbs at the produce rate."
+  choices={[
+    { label: "max.poll.interval exceeded", impact: "The worker is stuck in apply and never polls. The coordinator will kick the member even though heartbeats succeeded, then the successor replays uncommitted offsets.", recovery: "Bound apply batches, raise poll interval only with evidence, and keep sink idempotency for the overlap." },
+    { label: "Dead static member", impact: "If settlement-2 is actually a different process still heartbeating, this is not the static-corpse case. A truly dead static member would stop heartbeats and keep the assignment only until session.timeout.ms.", recovery: "If heartbeats have stopped, wait for session timeout or fence the instance id; page on partition lag." },
+    { label: "Eager rebalance of an unrelated member", impact: "Stop-the-world revoke pauses every partition, including 3, until the round ends. Lag grows for the pause duration, then catch-up needs leftover consume rate.", recovery: "Prefer cooperative-sticky when all members support it; still size catch-up headroom for the pause." },
+    { label: "More consumers than partitions", impact: "Idle members do not own partition 3. They cannot drain it. Throughput stays capped by the assigned owner.", recovery: "Add partitions only with an explicit key-mapping change, or speed the assigned owner." },
+  ]}
+/>
+
+</RealExamples>
+
+<InterviewTraps title="Ownership slogans that fail at IC6">
+
+- **“The consumer group is a distributed lock.”** It is exclusive fetch assignment for one group and subscription. Other groups and the sink are outside that lock. Stale apply after revoke is expected.
+- **“Kafka exactly-once because we use a consumer group.”** Groups coordinate ownership and offsets. End-to-end effects need the sink protocol in the delivery lesson. Do not claim exactly-once processing.
+- **“Heartbeats are healthy, so the consumer is healthy.”** Heartbeats are not <code>max.poll.interval.ms</code>. A stuck apply loop is a different failure detector.
+- **“Static membership removes rebalances, so it is always safer.”** It removes *restart* rebalances inside the session window. A dead static member blocks partitions until session timeout.
+- **“Cooperative rebalance means no dual owners.”** Incremental revoke shrinks idle time. It does not retract an in-flight HTTP call or database write.
+- **“Lag is two seconds.”** State records or bytes versus high watermark or log-end, applied versus committed, and whether produce is still adding to the backlog.
+- **“We will scale consumers to 50 because we have 12 partitions.”** Eight members idle. Parallelism is min(members, partitions).
+- **“State restore is free after sticky assignment.”** Changelog replay is a rebalance cost even when the partition did not move last time you looked—if the process is new, state is empty.
+
+</InterviewTraps>
+
+<Tradeoffs title="Pause time, zombie time, and restore time">
+
+- **Eager versus cooperative:** eager is simple and pauses everything; cooperative preserves throughput on unmoved partitions but requires homogeneous assignors and still needs sink fencing.
+- **Dynamic versus static membership:** dynamic rebalances quickly on process death; static hides rolling restarts and extends the hold time of a corpse. Session timeout is the knob between those pains.
+- **Short versus long <code>max.poll.interval.ms</code>:** short detects stuck processors; long allows slow but valid transactions and delays replacement.
+- **More partitions:** more parallelism and more rebalance and restore work; later partition adds change key mapping for new records.
+- **Local state plus changelog:** fast serving after restore, expensive restore after every cold assignment. Stateless consumers rebalance cheaper and push more load to the sink.
+- **Catch-up by adding members:** works only if idle partitions exist. Otherwise you need faster apply, more partitions, or load shedding—not a larger replica count of the same group.
+
+Correctness (sink idempotency or fencing) is not optional in any of these shapes. Availability during rebalance is what the protocol choice buys.
+
+</Tradeoffs>
+
+<KnowledgeCheck
+  question="A Java consumer keeps heartbeating, but a TokenX ledger call runs longer than max.poll.interval.ms. What happens, and what does that prove?"
+  options={[
+    "Nothing: a successful heartbeat extends exclusive sink ownership until the SQL commit returns",
+    "The coordinator can remove the member for poll-interval expiry while heartbeats still succeeded; the successor may start before the late sink write finishes",
+    "session.timeout.ms is the only detector, so the member cannot be replaced",
+    "Kafka transactions make the late sink write and the new owner's write exactly once together"
+  ]}
+  correct={1}
+  explanation="Heartbeat liveness and poll-interval liveness are different. Replacement creates a dual-owner window at the sink. Exclusive assignment never extended to the database, and Kafka does not make that external write exactly once."
+/>
+
+<KnowledgeCheck
+  question="A group has 12 partitions and 20 running members. Throughput is flat and eight members show no assigned partitions. Which change actually raises parallelism for this group?"
+  options={[
+    "Start ten more members in the same group so Kafka load-balances records inside a partition",
+    "Switch to the range assignor so idle members steal records from busy partitions without a rebalance",
+    "Increase partition count (accepting a new key-to-partition mapping for future records) or make the twelve owners faster; extra members beyond twelve stay idle",
+    "Enable static membership so idle members become hot standbys that process the same partitions"
+  ]}
+  correct={2}
+  explanation="One group assigns each partition to at most one member. Parallelism is min(members, partitions). Static membership does not create shared owners, and assignors do not split a partition's fetch stream."
+/>
+
+<ScenarioCheck
+  scenario="TokenX settlement-2 is revoked for partition 3. It has already written event S-991 to the ledger but has not committed the Kafka offset. settlement-5 is assigned partition 3 in generation 13 and fetches S-991 again. Meanwhile settlement-2's database commit lands late."
+  question="Which design preserves the balance invariant, and which assumption did the dual-owner window violate?"
+  options={[
+    { label: "Rely on exclusive group assignment: generation 13 proves settlement-2 can no longer write.", feedback: "Assignment is fetch ownership. It does not cancel or fence an in-flight ledger write. The violated assumption is 'revoke equals exclusive sink lock.'" },
+    { label: "Insert event_id S-991 with the ledger mutation in one database transaction; generation 13's replay is a no-op. Commit the Kafka offset only after that transaction.", feedback: "The group is at-least-once. The sink unique key (or an explicit fencing generation stored at the ledger) closes the overlap. Exclusive assignment was never the mutex." },
+    { label: "Commit the Kafka offset in onPartitionsRevoked before the ledger write so settlement-5 skips S-991.", feedback: "If the process dies after that commit, S-991 is lost. That is at-most-once, which TokenX settlement cannot accept." },
+    { label: "Raise max.poll.interval.ms so rebalances cannot happen during a ledger call, then skip sink idempotency.", feedback: "A crash, deploy, or session timeout can still rebalance. Hiding one detector does not remove the dual-owner window." },
+  ]}
+  correct={1}
+  explanation="The violated assumption is that coordinator assignment is a sink lock. It is not. Replay plus a transactional event-id marker (see the delivery lesson) keeps the ledger from double-applying S-991."
+/>
+
+<InterviewAnswer>
+
+“A consumer group gives exclusive fetch ownership of each subscribed partition for one group id and one generation. It is not a global lock and it is not exactly-once processing. The coordinator owns membership; committed offsets are group checkpoints, not sink proof. I pick eager versus cooperative from pause cost, and sticky or range from movement versus balance. Static membership skips restart rebalances inside session.timeout, but a dead static member blocks partitions until that timeout. Heartbeats and max.poll.interval.ms are different failure detectors: a slow apply loop can be kicked while heartbeats succeed. On revoke I stop fetching, commit only applied offsets, and assume a dual-owner window, so the sink is idempotent or fenced. Lag is high watermark or log-end minus applied offset; catch-up needs leftover consume rate. Parallelism stops at the partition count. Stateful tasks add changelog restore to rebalance time. TokenX settlement uses one owner per partition plus a unique event id; Ad Click scales collectors with partitions, not by inventing global order. Delivery semantics and internals are the previous lessons in this module; key ordering is next.”
+
+</InterviewAnswer>

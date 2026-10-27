@@ -41,26 +41,26 @@ Authoritative curriculum state lives in `content/lessons/`. Search data and rend
 | --- | ---: | --- |
 | 1. Storage & Data | 9 | 9 authored; coverage complete |
 | 2. Scalability | 8 | 1 foundation lesson authored |
-| 3. Kafka & Fault Tolerance | 9 | 1 foundation lesson authored |
+| 3. Kafka & Fault Tolerance | 9 | 9 authored; coverage complete |
 | 4. Performance | 9 | 1 foundation lesson authored |
 | 5. Networking | 9 | 1 foundation lesson authored |
 | 6. CAP & Consistency | 9 | 9 authored; coverage complete |
 | 7. Architecture & Mock Interviews | 11 | 1 foundation exercise authored |
-| **Total** | **64** | **23 authored, 41 planned** |
+| **Total** | **64** | **31 authored, 33 planned** |
 
-Modules 1 and 6 are complete in topic coverage and conform to the automated content contract. The Modules 1 and 6 technical audit (13 items) is remediating on `fix/distributed-systems-audit`; remaining notes below are non-blocking.
+Modules 1, 3, and 6 are complete in topic coverage on `feat/module-3-kafka-fault-tolerance`. The Modules 1 and 6 technical audit (13 items) is merged on `main` at `3e5a71e`.
 
 ## Current progress
 
 - Phase 0 foundation hardening is complete.
 - Phase 1A authored all nine lessons in Module 1 and all nine lessons in Module 6.
-- The repository contains **23 of 64 lessons**.
+- The repository contains **31 of 64 lessons** after completing Module 3.
 - All seven modules have at least one foundation lesson.
 - The future Architecture Reference Library remains Phase 2 and has not been implemented.
 
 ## Technical audit status
 
-The Modules 1 and 6 audit found **13 items**. All 13 are addressed on `fix/distributed-systems-audit`. The branch has not been pushed or merged.
+The Modules 1 and 6 audit found **13 items**. All 13 are addressed and merged to `main` in `3e5a71e`.
 
 | Priority | Finding | Remediation on this branch |
 | --- | --- | --- |
@@ -88,9 +88,8 @@ The Modules 1 and 6 audit found **13 items**. All 13 are addressed on `fix/distr
 
 ## Next milestone
 
-1. Merge `fix/distributed-systems-audit` only after explicit approval. Do not apply or drop `stash@{0}` until that review decides.
-2. Spot-check the densest diagrams (TokenX exclusive terminals, CAP 2-of-3, Raft ReadIndex) on desktop and mobile.
-3. Begin Module 3, **Kafka & Fault Tolerance**, with Kafka Internals, Consumer Groups and Rebalancing, and Ordering and Event Keys before progressing to stream processing and disaster scenarios.
+1. Pause for approval of Module 3 (9/9) on `feat/module-3-kafka-fault-tolerance`. Do not apply or drop `stash@{0}` until a later decision.
+2. Resume operating lessons in Modules 2, 4, and 5.
 
 Phase 2 is explicitly out of scope for this milestone.
 

@@ -1,0 +1,227 @@
+---
+title: "Stream Processing and Windows"
+description: "Assign event-time windows with an explicit watermark and lateness bound, treat state stores as derived, and keep Kafka transactions inside a produce-plus-offset envelope."
+module: 3
+moduleTitle: "Kafka & Fault Tolerance"
+order: 5
+duration: 38
+difficulty: "Intermediate"
+tags:
+  - Kafka Streams
+  - event time
+  - watermarks
+  - windowing
+  - state stores
+  - late data
+objectives:
+  - "Assign records to event-time windows without treating broker offsets as business time"
+  - "Choose tumbling, hopping, sliding, or session windows and name alignment plus a lateness policy"
+  - "Size changelog restore as assignment-to-ready cost and keep external sinks idempotent across rebalance"
+  - "Separate Kafka produce-plus-offset transactions from TokenX conservation and Ad Click audit"
+---
+
+<BigPicture title="Windows live on the job, not on the log">
+
+Kafka delivers records in **broker append order** inside one partition. Stream processing answers a different question: which **event-time interval** does this click belong to, and when is that interval allowed to close?
+
+Those answers are **consumer and job policy**. The broker does not sort by event time, does not compute a watermark, and does not drop a late phone. Offsets still increase when a 12:03 click arrives after a 12:08 click. That inversion is legal log order; it is out-of-order **event time**. See [Ordering and Event Keys](/learn/ordering-and-event-keys) and [Time and Ordering](/learn/time-and-ordering).
+
+A **watermark** is a threshold the job uses to say “event time has progressed at least this far under my idle and skew assumptions.” It is not a Kafka broker feature and it is not the replica **high-watermark** from [Kafka Internals](/learn/kafka-internals). After the watermark passes a window, late data needs a named bound: drop, side-output, or allowed-lateness recompute of a **versioned** aggregate.
+
+Local **state stores** and compacted **changelog** topics are derived. They speed restart; they are not a TokenX ledger. Ad Click Aggregator campaign windows are the primary design in this lesson. TokenX may use windows for risk features, never as conservation.
+
+</BigPicture>
+
+<UnderTheHood title="Three clocks, window math, watermarks, and rebuildable state">
+
+### Three clocks, one offset sequence
+
+- **Event time** is a field on the payload: when the device or source claims the click or transfer happened. Device clocks skew. Kafka does not wait for this field.
+- **Ingestion time** is when the platform durably accepted the record. With `LogAppendTime`, that is approximately broker append time. With `CreateTime`, it is the producer wall clock copied into the broker timestamp—still not a sorted event-time log.
+- **Processing time** is the job’s wall clock when it happens to run. Pause the workers and processing-time windows stall; event-time windows do not, because assignment uses the payload.
+
+A consumer that reads offsets `n`, `n+1`, `n+2` sees append order. Event-time values on those records can go backward. Window assignment uses event time. Replay, lag, and changelog restore use offsets. Dedup uses `click_id` (or `transfer_id`). Mixing those identities is the usual IC6 failure.
+
+### Window types and name alignment
+
+Assign windows on **event time** unless the product question is literally “what did we compute in this wall-clock minute of job runtime.” Alignment is whether window starts snap to a grid.
+
+- **Tumbling.** Size `S`, hop `S`, no overlap. Example: 5-minute campaign totals. **Aligned:** `window_start = event_time − (event_time mod S)` relative to a chosen origin (often Unix epoch, sometimes a timezone offset you must name). A click at 12:04:37 in a 5-minute tumbling window aligned to the hour lands in `[12:00, 12:05)`.
+- **Hopping.** Size `S`, hop `H` with `H < S`. Windows overlap. A 5-minute window hopping every 1 minute puts 12:04:37 into five concurrent windows. Still **grid-aligned** to the origin. Hopping is the usual name in Kafka Streams; Flink’s “sliding window” with a fixed slide is the same grid.
+- **Sliding (per-record).** A window of width `S` ending at this record’s event time, or `[event_time − S, event_time]`. **Not grid-aligned.** Kafka Streams `SlidingWindows` emit when records arrive, not on empty ticks. Use them when “activity in the last S of *this* event” matters more than wall-clock buckets.
+- **Session.** Gap `G`. A key’s events merge into one window while successive event times are within `G`; a quiet stretch of `G` closes the session. **Data-aligned**, not grid-aligned. A celebrity campaign with continuous clicks never sessions; a sparse campaign produces many short sessions.
+
+When a record is **late** relative to the job’s watermark (or Kafka Streams **stream-time** plus **grace**):
+
+1. Watermark still before `window_end`: treat as on-time; update state; emit if the operator emits on update.
+2. Watermark past `window_end` but inside **allowed lateness / grace**: admit, recompute, emit a **new aggregate version** (or changelog the state). Downstream must upsert by `(campaign_id, window_start, version)`, not increment blindly.
+3. Past grace: **drop**, **side-output** (Flink `sideOutputLateData`), or a separate correction stream. Keeping state forever is not a policy; it is an unbounded store.
+
+Grace is a product SLO: “dashboards stabilize 2 minutes after the bucket, except corrections we version.” It is not losslessness. Source retention in [time-series storage](/learn/time-series-and-append-only-storage) bounds how long you can still replay facts to rebuild a window.
+
+### Watermarks are job policy; Flink idle and Streams idle are different knobs
+
+A common Flink-style watermark is `min_i(max event time seen on partition i) − out_of_orderness_bound`. The job then closes windows whose end is before that threshold. **The Kafka broker does not compute this.** If partition 7 of the click topic goes silent, that partition’s contribution to the **min** does not advance. Other partitions can be minutes ahead in event time and still wait. The escape is Flink `WatermarkStrategy.withIdleness(duration)` (or an equivalent source idle timeout): mark that split idle and **exclude it from the min** until a new record arrives. Cost: when the silent partition speaks again, those records can be late.
+
+Kafka Streams window close is driven by **stream-time**: the **maximum** event timestamp observed on that **task**, plus the window’s **grace**. A quiet partition on a multi-input task does **not** freeze the others. `max.task.idle.ms` is a **wait-to-align** bound (default `0` = process whatever is already buffered). A large value *adds* wait so a caught-up partition does not pull stream-time forward while another input is only briefly empty. If **every** assigned partition is quiet, stream-time freezes because no records arrive—`max.task.idle.ms` does not mint event time. Do not treat `withIdleness` and `max.task.idle.ms` as interchangeable unstall switches.
+
+Neither `session.timeout.ms` nor `max.poll.interval.ms` is a watermark; those are membership clocks from [Consumer Groups and Rebalancing](/learn/consumer-groups-and-rebalancing).
+
+<ExecutionTimeline
+  title="One Ad Click through event time, watermark, and late policy"
+  steps={[
+    { title: "Append", detail: "Collectors produce clicks keyed by campaign_id. Partition offsets increase. A 12:03:10 click can receive a higher offset than a 12:08:02 click already in the log.", state: "The source topic log is authoritative for append order until retention.", failure: "Treating offset order as event-time order assigns the late phone to the wrong business minute." },
+    { title: "Assign", detail: "The task reads event_time=12:04:37 into the aligned tumbling window [12:00, 12:05) and updates keyed state for that campaign and window.", state: "Window state is derived. click_id still dedupes retries.", failure: "A hot campaign_id pins this task; other campaigns on the partition share its restore and stall risk." },
+    { title: "Watermark", detail: "Flink: event-time progress is min of per-partition maxima minus a 10 s out-of-orderness bound. Partition 4 is idle; without withIdleness that min stalls. Streams: stream-time is a max on the task; default max.task.idle.ms of 0 lets a caught-up partition advance and can make partition 4's later records late.", state: "Watermark is job policy, not a broker high-watermark.", failure: "Operators page offset lag while a Flink min is stuck on idle, or they raise max.task.idle.ms expecting it to exclude a split from a min watermark." },
+    { title: "Late", detail: "Window [12:00, 12:05) with grace 1 minute stays open for lateness only until event time 12:06. A 12:04:50 click that arrives after watermark 12:07 is past grace: drop or side-output, not a versioned in-place mutate.", state: "Closed windows are a product bound, not a Kafka delete.", failure: "Mutating the published total in place double-counts after a replay." }
+  ]}
+/>
+
+### Keyed state, tasks, changelogs, restore
+
+A Kafka Streams or Flink-style job partitions **keyed state** the same way the input is partitioned: **one task owns one input partition** (simple topology). Parallelism cannot exceed partition count for that topology stage. State for `campaign_id` lives on the task that owns that key. A viral campaign is a hot key: one task’s CPU, RocksDB (or heap store), and changelog.
+
+The **state store** is a local derived view (window aggregates, join buffers, session trackers). The **changelog topic** is a compacted log of store puts and deletes. Latest-per-store-key is enough to rebuild the store; intermediate aggregates disappear. That is the same compaction contract as [ordering](/learn/ordering-and-event-keys): useful cache in log form, **not** a fact ledger.
+
+On assignment, do not serve until the task has restored. Restore time is **changelog bytes / restore throughput**, plus warmup.
+
+<Calculation label="Assignment-to-ready from a compacted changelog">
+
+Assumptions (illustrative Ad Click hot-campaign task): changelog size 4.0 GiB after compaction; restore 80 MiB/s of changelog fetch into local disk (one task, no competing restores on the broker path).
+
+4.0 GiB = 4.0 × 1024 MiB = 4096 MiB
+
+4096 MiB / 80 MiB/s = 51.2 s from assignment until the store matches the changelog tip
+
+If ten tasks restore at once against the same broker disk, divide throughput; 10 × 51 s of serial-equivalent work is an availability hole, not a 2 s “rebalance finished” metric. Source-topic replay of 48 hours of clicks is the fallback when the changelog is gone; it is bounded by source retention, not by store magic.
+
+</Calculation>
+
+Changelog durability follows the delivery envelope on that topic (RF, `acks`, ISR, retention). Compaction plus `delete` still expires old keys. Lost changelog **and** expired source facts means that derived window is gone.
+
+### Kafka transactions are produce-plus-offset atomicity
+
+Kafka Streams `processing.guarantee=exactly_once_v2` wraps **input offset commit, changelog writes, and output topic produces** in a Kafka **transaction**. `read_committed` consumers skip aborted ranges. That is a real boundary **inside Kafka**: a task crash should not leave a committed offset without the corresponding changelog and output records, or vice versa. Flink’s Kafka exactly-once **sink** is different machinery: a checkpoint plus two-phase Kafka transactions; **input offsets live in Flink state**, not in that same Streams changelog transaction.
+
+It is **not** exactly-once processing of the business. It does not enclose a TokenX ledger SQL transaction, an HTTP credit, or a dashboard SQL upsert unless that sink is also in the same Kafka transaction (it is not). Cross-link: [Kafka delivery and failure](/learn/kafka-delivery-and-failure).
+
+Rebalance still creates a **dual-owner window** at any **external** sink: the revoked task may finish an in-flight write while the successor restores and emits. Cooperative assignors shrink idle time; they do not retract a JDBC call. Versioned aggregates keyed by `(campaign_id, window_start, version)` or idempotent upserts keyed by `click_id` remain required. Do not claim exactly-once processing.
+
+</UnderTheHood>
+
+<MentalModel title="A night-shift clerk and a wall clock the mail does not obey">
+
+Picture campaign windows as labeled mail slots on the clerk’s desk (the task). The post office (Kafka) delivers letters in the order they were stamped at the counter (offsets). The date written by the sender (event time) can be yesterday. The clerk’s watch (processing time) only says when they opened the envelope. The clerk draws a line on a notepad—“I will not reopen Monday’s slot after 10 minutes past the hour unless a supervisor files a correction”—that line is the watermark plus grace. If one mailbag never arrives, a Flink clerk who waits for **every** bag (min watermark) stands still until `withIdleness` says that bag is empty. A Streams clerk who tracks the **latest** stamp on the desk (max stream-time) keeps moving; a large `max.task.idle.ms` is extra wait for a late bag, not a min-unstall switch.
+
+The notepad of running totals is a scratch pad (state store). Overnight they photocopy the latest page into a filing cabinet (compacted changelog) so a new clerk can reconstruct the pad. The cabinet is not the vault. TokenX’s vault is the ledger plus `transfer_id`. Counting envelopes in a one-hour slot is a risk feature, not conservation.
+
+Retain: **offset → append order; event time → window assignment; watermark/grace → close and lateness bound; store/changelog → derived; Kafka transaction → produce + changelog + offset; ledger/`click_id` → business identity.**
+
+</MentalModel>
+
+<ArchitectureDiagram title="Source log authority, derived window state, and late or idle paths" chart={"flowchart LR\n  LOG[(Authoritative click log)] --> TASK[Keyed stream task]\n  TASK --> ET[Event-time field]\n  ET --> WIN[Event-time windows]\n  WM[Watermark plus idle policy] --> WIN\n  WIN --> ST[(Local state store derived)]\n  ST --> OUT[Versioned aggregates]\n  ST --> CHG[(Compacted changelog derived)]\n  CHG -. restore before serve .-> ST\n  LATE[Late click] -. async after watermark .-> WIN\n  WIN -. reject past grace .-> DROP[Drop or side output]\n  IDLE[Idle Flink split] -. exclude from min after withIdleness .-> WM\n  OLD[Revoked task] -. dual owner at sink .-> OUT"}>
+
+The **source topic log** is authoritative for records until time or size retention. **Window state** and the **compacted changelog** are derived and rebuildable from that log while the log still exists. **Watermark, Flink idleness, Streams task-idle wait, and grace** are job policy, not broker features. Solid edges are the on-time assign-and-emit path. Dashed edges are asynchronous late arrival, Flink min stall until `withIdleness`, restore, dual-owner overlap, and reject-past-grace—not successful window close.
+
+<ArchitectureWalkthrough
+  title="Name the store before you promise a window"
+  stages={[
+    { name: "Source log", owner: "Partition leader", state: "Offset-ordered click envelopes", boundary: "Append order in one partition until retention. Broker does not sort by event time.", failure: "Retention expiry or a compact-the-facts mistake deletes replay.", recovery: "Keep an uncompacted fact topic for the dispute window; rebuild derived stores from it." },
+    { name: "Event-time windows", owner: "Stream task for that key", state: "Tumbling, hopping, sliding, or session assignment plus grace", boundary: "Alignment and lateness are job config. Task parallelism equals partition assignment.", failure: "Hot campaign_id concentrates CPU and state; a silent Flink split freezes a min watermark.", recovery: "Salt only with a merge stage. Flink: withIdleness to exclude the silent split. Streams: size max.task.idle.ms only as wait-to-align (default 0), not as Flink recovery. Scale partitions with an explicit key remap." },
+    { name: "Derived state", owner: "Local store plus changelog topic", state: "Latest aggregate per window key", boundary: "Changelog is compacted latest-value, not a ledger. Serve only after restore.", failure: "Cold assignment with 4 GiB changelog is tens of seconds; lost changelog plus expired source loses the view.", recovery: "Restore from changelog; else replay source within retention; never treat the store as TokenX balances." },
+    { name: "Emit and fence", owner: "Output topic and external sink", state: "Versioned window result or click_id upsert", boundary: "Kafka transactions atomicize output, changelog, and offsets inside Kafka.", failure: "Revoke overlap double-applies an external upsert; EOS does not cover SQL.", recovery: "Idempotent sink keys; commit Kafka offsets with the transaction only for Kafka sinks. See delivery semantics." }
+  ]}
+/>
+
+</ArchitectureDiagram>
+
+<RealExamples title="Ad Click windows first; TokenX windows are not money">
+
+**Ad Click Aggregator (primary).** Key ingest by `campaign_id` when campaign-local windows matter; accept a viral campaign as a hot task. Store `click_id`, event time, ingestion time, and offset together. Use **event-time tumbling** minutes for billed or dashboard buckets so a paused job does not shift clicks into the next processing-time minute. Set out-of-orderness plus **grace** to the product SLO (illustrative: 10 s skew bound, 2 min grace). Past grace, **side-output** late clicks into a correction stream that emits `(campaign_id, window_start, version, total)` so the serving layer upserts. On **Flink**, enable **`withIdleness`** so a collector that owns an empty partition cannot stall every campaign’s **min** watermark. On **Kafka Streams**, do not expect `max.task.idle.ms` to do that job: stream-time is a max, and default idle `0` already lets other partitions advance. Dedup inside the window with `click_id`; replay is at-least-once. Changelog restore is part of the rebalance SLO. Do not compact the raw click topic.
+
+**TokenX.** Do not window-sum credits and call the result a balance. Conservation is the ledger transaction plus unique `transfer_id` (and usually `account_seq`). A 10-minute tumbling count of transfers per `wallet_id` is a **risk or velocity feature**: derived, late-able, rebuildable. If a late settlement arrives after grace, the risk score may be wrong until a versioned correction; the ledger row is still the money. Windowing two wallets’ activity does not prove Alice was debited before Bob was credited; those keys do not share a window state.
+
+<FailureScenario
+  title="Which window contract actually broke?"
+  prompt="Dashboards freeze, a viral campaign’s minute total looks short, or finance asks a stream job to prove TokenX supply. Pick the failure and name the bound."
+  choices={[
+    { label: "Idle partition stalls the watermark", impact: "On Flink, min of per-partition maxima stops at the silent split. On-time clicks in other partitions sit in state and do not close. On Streams, a quiet input does not freeze max stream-time; later records on that input can look late instead.", recovery: "Flink: withIdleness to exclude the split from the min. Streams: size max.task.idle.ms only as wait-to-align. Page on watermark or stream-time lag, not only offset lag." },
+    { label: "Late click after grace", impact: "The tumbling minute already emitted. Admitting the click into the same published cell silently mutates a number downstream already showed.", recovery: "Drop or side-output; emit version N+1 keyed by campaign and window_start; keep click_id dedupe on replay." },
+    { label: "Rebalance before changelog restore", impact: "The new task serves empty or partial window state, then restore overlays the real aggregates and the dashboard jumps.", recovery: "Hold serving until restore completes; count 4 GiB / 80 MiB/s in the SLO; keep sink upserts idempotent for dual owners." },
+    { label: "Window-sum as TokenX conservation", impact: "Event-time buckets, grace drops, and two wallet keys cannot prove conservation. A late transfer changes a window without changing ledger truth—or worse, the job double-counts on replay.", recovery: "Keep transfer_id in the ledger transaction. Use windows only for risk features with explicit lateness." }
+  ]}
+/>
+
+</RealExamples>
+
+<InterviewTraps title="Window slogans that fail at IC6">
+
+1. **“Kafka sorts by event time.”** It appends. Event time can run backward while offsets increase. See the [ordering lesson](/learn/ordering-and-event-keys).
+2. **“The watermark is the broker high-watermark.”** HW is ISR-covered offsets. A stream watermark is job event-time policy.
+3. **“Late data cannot happen inside one partition.”** Producer pipelines, retries, and skewed device clocks put an earlier event time at a later offset.
+4. **“We have exactly-once processing because Streams EOS is on.”** You have transactional produce, changelog, and offset commit **inside Kafka**. External sinks and TokenX ledgers are outside. See [delivery](/learn/kafka-delivery-and-failure).
+5. **“The changelog is a smaller ledger.”** It is compacted latest store key. Intermediate window updates vanish. TokenX facts must not live only there.
+6. **“Rebalance was 2 seconds.”** Assignment is not ready. Restore is GB / MB/s, then warmup.
+7. **“Idle partitions still advance event time.”** On Flink, a silent split holds the **min** until `withIdleness` (or an equivalent idle mark) excludes it. Processing-time punctuation is a different clock. On Kafka Streams, max stream-time still advances from other partitions; `max.task.idle.ms` waits, it does not mint event time when every input is quiet.
+8. **“Hopping and sliding are the same.”** Hopping is grid-aligned size plus hop. Per-record sliding is anchored on this event’s timestamp.
+9. **“Session windows bound dashboard minutes.”** Sessions follow gaps, not clock hours. Billing minutes want tumbling alignment.
+10. **“Cooperative rebalance removes dual owners.”** It reduces revoke scope. In-flight external writes still overlap. Idempotent sinks remain required.
+11. **“Summing 5-minute TokenX windows conserves tokens.”** Conservation is ledger plus `transfer_id`, including cross-wallet pairs that do not share a key.
+
+</InterviewTraps>
+
+<Tradeoffs title="Close time, memory, skew, and the EOS envelope">
+
+- **Event-time versus processing-time windows.** Event time matches the business clock and survives job pauses; it needs watermarks, idle policy, and grace. Processing time is operationally simple and wrong for billed Ad Click minutes.
+- **Tumbling versus hopping versus sliding versus session.** Tumbling is cheap and aligned for dashboards. Hopping multiplies state by `S/H`. Sliding emits per record and is unaligned. Sessions fit bursty per-key activity and fight hot keys that never gap.
+- **Tight grace versus long allowed lateness.** Tight grace bounds RocksDB and changelog bytes and stabilizes dashboards; it drops more late phones. Long grace keeps correcting; restore and memory grow; you still need a drop or side-output at the end.
+- **Flink idleness versus Streams task idle.** Short `withIdleness` unsticks a min watermark and can mark a slow collector’s burst late. Long or absent Flink idleness stalls the min and looks like “Kafka is slow.” Raising `max.task.idle.ms` on Streams adds wait-to-align; it is not a substitute for `withIdleness`.
+- **Local state plus changelog versus stateless map-then-sink.** Local state makes sub-second window updates and expensive restore. Stateless jobs rebalance cheaply and push aggregation to a store that must still version late data.
+- **Campaign keys versus user or click_id keys.** Campaign keys make window state local and create hot tasks. Other keys shuffle before campaign windows. Same skew lesson as ingest keying.
+- **Kafka EOS versus sink idempotency.** EOS shrinks split-brain inside Kafka topics. It does not replace `click_id` upserts or ledger uniqueness. Using both is normal; claiming one implies the other is the trap.
+- **Long source retention.** Enables full rebuild when changelogs die; storage cost. Changelog-only recovery is faster and incomplete if facts expired.
+
+</Tradeoffs>
+
+<KnowledgeCheck
+  question="A partition’s offsets increase 100, 101, 102. Event times on those records are 12:08, 12:03, 12:04. A tumbling 5-minute event-time window aligned to the hour is used. What does Kafka already guarantee, and how is 12:03 assigned?"
+  options={[
+    "Kafka reorders 101 in front of 100 so event time is sorted; both 12:03 and 12:04 land in [12:05, 12:10)",
+    "Kafka guarantees append order only; the job assigns 12:03 to [12:00, 12:05) even though it is consumed after the 12:08 record",
+    "The broker watermark holds offset 100 until 12:03 arrives so windows never see out-of-order event time",
+    "Processing time equals event time inside one partition, so 12:03 is dropped as a duplicate offset"
+  ]}
+  correct={1}
+  explanation="Offsets record broker append order. The 12:03 click is out-of-order in event time and still belongs in the aligned [12:00, 12:05) window. Brokers do not sort or delay for event time; a stream watermark is job policy, not a hold on offset 100."
+/>
+
+<KnowledgeCheck
+  question="A Kafka Streams job enables processing.guarantee=exactly_once_v2 and writes campaign-minute totals to Postgres on each emit. After a rebalance, two tasks overlap. Why is a double increment still possible?"
+  options={[
+    "EOS already serializes Postgres; exclusive partition assignment is a database lock",
+    "Kafka transactions atomically commit output topic records, changelog writes, and input offsets inside Kafka; the Postgres increment is outside that envelope and still needs an idempotent upsert or version key",
+    "Changelogs are TokenX ledgers, so restoring state undoes the extra increment",
+    "withIdleness prevents dual owners by advancing watermarks during revoke"
+  ]}
+  correct={1}
+  explanation="exactly_once_v2 is produce-plus-changelog-plus-offset atomicity for Kafka. An external counter is at-least-once across dual owners. Idle policy moves event time; it does not fence SQL. Changelog state is derived, not a conservation ledger."
+/>
+
+<ScenarioCheck
+  scenario="Ad Click uses 1-minute event-time tumbling windows, 30 s grace, Flink watermarks as min of per-partition maxima − 10 s, and no idle timeout. Partition 7 of the click topic goes silent. A viral campaign on partition 2 is 18% of peak. A 12:04:51 click for that campaign arrives at offset 9_000_040 after watermark-related close would have been 12:05:30 if partition 7 were idle-marked. Operators enable Streams-style EOS to the output topic and also increment a Redis counter. A second team proposes summing TokenX transfers in the same 1-minute windows to prove conservation."
+  question="Which statement is defensible?"
+  options={[
+    { label: "Partition 7 will not affect close time because offsets on partition 2 still increase, and EOS makes Redis and TokenX sums exactly once.", feedback: "A min watermark waits on the silent partition. EOS does not cover Redis. Window sums are not a ledger." },
+    { label: "Name Flink withIdleness so the min can exclude partition 7; do not use max.task.idle.ms as that unstall; keep grace plus side-output for the 12:04:51 click if it misses the bound; upsert Redis by campaign and minute version; never use windows as TokenX conservation.", feedback: "Flink idle, Streams task idle, lateness bound, external idempotency, and ledger identity are separate contracts." },
+    { label: "Raise grace to infinity so late clicks and idle partitions cannot change answers, and treat the compacted changelog as the audit log.", feedback: "Infinite grace is unbounded state. Compaction drops history. Idle still stalls a min watermark until you mark it idle." },
+    { label: "Switch to processing-time windows so broker append order equals the billed minute and hot keys disappear.", feedback: "Processing time follows the job clock, not the click. Hot keys follow campaign_id regardless of window clock." }
+  ]}
+  correct={1}
+  explanation="This job’s min watermark freezes on a silent Flink split until withIdleness excludes it. Kafka Streams max.task.idle.ms would not be that unstall. Late clicks need an explicit drop, side-output, or versioned recompute. Kafka transactions do not enclose Redis or TokenX. Conservation stays on transfer_id in the ledger. Related clock discussion: [time and ordering](/learn/time-and-ordering)."
+/>
+
+<InterviewAnswer>
+
+“I window on event time, not on Kafka offsets. The broker gives append order in a partition; a later offset can carry an earlier click time, so I assign tumbling, hopping, sliding, or session windows in the job and I name alignment: grid origin for tumbling and hopping, per-record for sliding, gap for sessions. A watermark is job policy—often min of per-partition maxima minus an out-of-orderness bound—not the replica high-watermark. Flink idle partitions freeze that min until withIdleness excludes them. Kafka Streams stream-time is a max; max.task.idle.ms waits to align, it does not mint event time. After close, late data hits grace: drop, side-output, or a versioned recompute, never a silent mutate. State stores and compacted changelogs are derived; restore is size over throughput, for example 4 GiB at 80 MiB/s is about 51 seconds before the task should serve. Kafka EOS is produce, changelog, and offset atomicity inside Kafka. I still idempotently upsert Ad Click totals and I never window-sum TokenX as conservation—that is ledger plus transfer_id. Dual owners after rebalance still need the sink key. Details of delivery and groups are the earlier module lessons.”
+
+</InterviewAnswer>

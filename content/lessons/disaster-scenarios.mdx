@@ -1,0 +1,226 @@
+---
+title: "Disaster Scenarios"
+description: "Classify Kafka disasters by failure domain, restore only durably copied logs, and cut over without treating offsets or compacted changelogs as money."
+module: 3
+moduleTitle: "Kafka & Fault Tolerance"
+order: 9
+duration: 38
+difficulty: "Advanced"
+tags:
+  - Kafka
+  - disaster-recovery
+  - RPO
+  - RTO
+  - failover
+objectives:
+  - Separate one-broker loss from disk-correlated ISR loss and region loss under a named acks envelope
+  - Distinguish KRaft metadata restore from resurrection of expired or compacted log bytes
+  - Design regional cutover with a new log, offset translation, and fenced producers
+  - Restore only durably copied journals and treat in-flight produces as UNKNOWN
+---
+
+<BigPicture title="A disaster is a failure domain, not a broker reboot">
+
+High availability in Kafka is surviving the failures the durability envelope named. Disaster recovery is reconstructing a **trustworthy log and a fenced serving epoch** after a failure that envelope did not cover: whole-ISR power loss, an availability-zone or region gone, an operator deleting a topic, retention or compaction eating a fact log, or a restore that would mint TokenX balances from the wrong evidence.
+
+The [delivery envelope](/learn/kafka-delivery-and-failure) is specific: RF=3, `acks=all`, `min.insync.replicas=2` survives **one in-sync broker** (writes pause if ISR falls below two). It does **not** survive correlated disk or power loss of the whole ISR, unclean election, `acks=1`, or history older than retention. [Internals](/learn/kafka-internals) add the physics: ISR is a lag roster, page cache is not fsync, and controller metadata is a different log from partition bytes.
+
+[Backup, restore, and disaster recovery](/learn/backup-restore-and-disaster-recovery) already defined RPO, RTO, committed journals versus UNKNOWN request logs, and fence-before-write. This lesson applies those rules to **Kafka-specific** disasters. It does not re-teach snapshot-plus-WAL for a database, and it does not re-teach dead-letter headers or retry-topic ownership—that protocol lives in [retries, dead letters, and replay](/learn/retries-dead-letters-and-replay). Here the question is: **which bytes still exist, in which cluster, under which identity, and what must not auto-replay.**
+
+Do not claim lossless DR, unbounded exactly-once, or safe failover without naming the copy that survived and the fence that stops split brain.
+
+</BigPicture>
+
+<UnderTheHood title="Name the lost domain, then the remaining copy">
+
+### Broker, ISR, AZ, region
+
+Treat these as different incidents.
+
+**One broker dies.** If it was a follower, ISR shrinks and HW can still advance with remaining members. If it was the leader, the controller elects another **current ISR** member. Acknowledged records that waited for the **current ISR** (at least `min.insync.replicas=2` under `acks=all`) should still be on a remaining ISR member. This is HA, not DR.
+
+**Disk-correlated ISR loss.** Two (or three) replicas share a rack, a SAN, or a power distribution unit. Dirty page-cache batches that producers saw as `acks=all` can vanish together. Internals already said ISR membership is not an fsync certificate. Recovery is restore from whatever copy crossed that domain—tiered storage, a backup, a mirror—or treat the gap as **UNKNOWN**, not as “Kafka will heal offsets.”
+
+**AZ or region loss.** Every replica of a partition that lived in that failure domain is gone. A second cluster, if it existed, is a **different log**. Offsets, producer ids, and group committed offsets are **not portable**. Produce into the surviving cluster is a new append, not a continuation of the old high-watermark.
+
+### Metadata loss versus data-plane loss
+
+KRaft (or ZooKeeper plus a controller) stores **cluster metadata**: topics, partition assignments, ISR snapshots, configs. Partition **segment files** store record bytes.
+
+Restoring the metadata log can bring back names, partition counts, and leader maps. It does **not** resurrect records retention already deleted or compaction already dropped. Offsets in consumer-group metadata without log bytes are not transfers. A recovered controller that points at empty directories is an empty product, not a successful DR.
+
+If metadata is lost and data directories remain, the cluster may not know which replica is leader until metadata is rebuilt from a metadata backup or a documented salvage procedure. Do not invent a leader map from local LEO.
+
+### Operator disasters: delete, short retention, compacting facts
+
+Accidental `delete topic`, a retention.ms cut from seven days to one hour, or `cleanup.policy=compact` on a TokenX fact log are **data-plane disasters that replication will helpfully copy**. Replicas are not backups. The remaining evidence is: a mirror that lagged behind the delete, tiered storage still holding segments, an object-store backup, or nothing.
+
+Offsets without bytes are not money. Consumer lag dashboards that still show a committed offset past deleted segments do not prove the payload exists.
+
+### Poison storms are not regional DR
+
+A flood of corrupt events is a data-quality disaster. The control is the retries lesson: **classify, bound retry, park the key** for TokenX state machines, do not silent-skip. This lesson only adds the blast-radius rule: a poison storm plus “skip so the partition drains” can destroy conservation **without** losing a broker. Page the owner; do not declare a cluster failover.
+
+### Regional failover is a new log
+
+Required properties, then names:
+
+- **Independent durable copy** in the other region (async mirror, dual-produce, or backup).
+- **Offset translation** (MirrorMaker-style checkpoint: source topic-partition-offset maps to target offset). Consumers cannot reuse source committed offsets on the target.
+- **Cutover plan:** stop or fence source producers, wait for a measured mirror lag (that lag **is** RPO if you fail over now), start producers on the target with **new producer ids**, start consumers from translated offsets or from a sink-known position.
+- **Dual-write** (client produces to both) raises the chance both logs have the record and creates two delivery identities; the sink still dedupes on `transfer_id`.
+
+None of this is lossless. Async mirror lag, in-flight acks, and producers that never learned the new bootstrap list are all loss or duplication windows. State them as RPO/RTO, then drill them.
+
+<ExecutionTimeline
+  title="Region loss to a fenced new cluster"
+  steps={[
+    { title: "Declare and fence", detail: "Stop new produces to the failed region. Record last known source offsets, mirror lag, and in-flight producer timeouts.", state: "The surviving mirror or backup is a candidate recovery source, not yet the serving authority.", failure: "Leaving old producers alive after DNS flips creates split brain: two clusters accept the same transfer_id or two different ones." },
+    { title: "Select remaining bytes", detail: "Fail over only offsets the mirror or backup durably copied. In-flight produces with ambiguous acks are UNKNOWN, not missing-and-must-mint.", state: "Committed mirrored batches are the automatic replay journal.", failure: "Auto-replaying client request logs or producer send buffers mints transfers the source never committed." },
+    { title: "Restore or promote", detail: "If promoting a mirror, keep its log. If restoring a new cluster from backup or tiered storage, load segments then rebuild RF from those bytes. Metadata restore is a separate step.", state: "Target offsets are a new numbering. Compaction and expiry already dropped what they dropped.", failure: "Treating restored KRaft metadata as proof the fact log is complete." },
+    { title: "Cut over", detail: "Fence old epoch (reject source writers). Start target producers (new PIDs). Consumers use offset translation or sink checkpoints. Replay UNKNOWN only by transfer_id lookup.", state: "The sink remains effect authority. Kafka is a new at-least-once log.", failure: "Reusing old group offsets or old producer sequence numbers after a cluster rebuild." }
+  ]}
+/>
+
+### Restore: copy physics, UNKNOWN produces, new PIDs
+
+Replay from backup or tiered storage **only what was durably copied**. A tier that lags the leader by minutes has an RPO of that lag plus anything never flushed off the ISR. After restore:
+
+- **Auto-replay committed journals:** surviving segment bytes, a mirror that acknowledged the copy, outbox rows that committed with the ledger.
+- **UNKNOWN:** in-flight produces (timeout before ack), signed client requests without a matching log record, producer buffers. Reconcile by `transfer_id`. Same rule as the backup lesson; the Kafka instance of UNKNOWN is an ambiguous produce, not a WAL hole in Postgres.
+- **Fence** producers and consumers against the old cluster **before** opening writes on the new one.
+- **Producer idempotence after rebuild:** a new cluster issues **new producer ids**. Sequence numbers from the dead cluster do not fence duplicates. Business identity (`transfer_id`, `click_id`) still has to live at the sink.
+
+<Calculation label="Illustrative TokenX fact-log RPO and restore floor">
+
+Assumptions (planning, not a measured cluster): 2,000 transfers/s, 800 B/record, 1.6 MB/s encoded produce; seven-day time retention ≈ 1.6 MB/s × 86,400 s/day × 7 days ≈ 968,000 MB ≈ 968 GB unique log bytes. RF=3 copies on brokers are not extra unique history.
+
+Async mirror lag at failover (illustrative): 45 s. Unprotected produce: 1.6 MB/s × 45 s = 72 MB ≈ 90,000 records. That 45 s is the **RPO if you promote the mirror now**. It is not zero.
+
+Tiered-storage copy lag 15 min: 1.6 MB/s × 900 s = 1,440 MB ≈ 1.44 GB not yet off-cluster.
+
+Restore unique bytes into a new cluster at a sustained 250 MB/s: 968,000 MB / 250 MB/s = 3,872 s ≈ 1.08 h transfer floor, **before** RF=3 re-replication, index rebuild, consumer catch-up, ledger invariant checks, and fencing. A 30-minute RTO is incompatible with cold restore of this topic. Warm mirror promotion is an architecture change, not a tighter spreadsheet cell.
+
+Re-replication after restore: two extra copies × 968 GB at 400 MB/s cluster replication ≈ 4,840 s ≈ 1.3 h additional if done serially; parallel replica fetch can overlap but still adds disk and network.
+
+</Calculation>
+
+Game-day: write the RPO and RTO **per topic class** (TokenX facts versus Ad Click dashboards), restore in isolation, validate conservation or billing manifests, then open writes. Prove that rebuilt producers get new PIDs and still cannot double-apply because the ledger unique-indexes `transfer_id`.
+
+</UnderTheHood>
+
+<MentalModel title="Two libraries, two catalog numbers">
+
+A Kafka cluster is a library. The stacks (partition segments) are the books. The card catalog (KRaft metadata) says which shelf a title lives on. Burning one shelf is a broker loss; the copies on other floors (ISR) may still have the book. Burning the whole building is a region loss. Printing a new catalog does not reprint burned books. Compaction is the clerk keeping only the latest edition and pulping the rest.
+
+A disaster-recovery site is a **second library with its own catalog numbers** (offsets). You can truck boxes that already arrived (durably copied segments). You cannot claim the books that were on the delivery truck during the fire (UNKNOWN in-flight produces). You do not let the old librarians keep stamping returns after the new building opens (fence). Sampling a few magazines so the reading room looks busy is **degradation**, not a rebuilt archive.
+
+Retain: **failure domain first; remaining copy second; metadata is not bytes; offsets are per cluster; auto-replay only durable copies; UNKNOWN by transfer_id; fence before write; compacted changelogs are not ledgers.**
+
+</MentalModel>
+
+<ArchitectureDiagram title="Failure domains, remaining copies, and fenced cutover" chart={"flowchart LR\n  P[Producers] --> LOG[(Authoritative source log until retention)]\n  LOG --> ISR[ISR copies RF=3]\n  CTRL[Controller] --> META[(KRaft metadata log)]\n  META --> LOG\n  LOG --> TIER[(Tiered or backup copy)]\n  LOG -.->|async mirror| MM[Mirror offset translation]\n  MM -.-> DR[(DR cluster new log)]\n  TIER -.-> DR\n  AZ[AZ or region loss] -.-> ISR\n  DEL[Delete short retention compact] -.-> LOG\n  UNK[UNKNOWN in-flight produces] -.-> SINK[(Ledger effect authority)]\n  DR --> SINK\n  FENCE[Fence old writers new PIDs] -.-> DR\n  COMP[(Compacted changelog derived)] -.-> SINK"}>
+
+The source partition log is authoritative for record bytes until retention or compaction. ISR copies are the HA domain, not a cross-region vault. KRaft metadata is a separate authority: restoring it does not recreate expired facts. Tiered storage and backups are recovery sources only for bytes they actually hold. The DR cluster is a **new log** with new offsets. Dashed edges are the **async mirror** (`LOG` → translation → DR), tiered restore, region loss, operator deletion, UNKNOWN produces, compacted-history misuse, and fencing new PIDs—lossy or reject paths, not lossless failover. Compacted changelogs are derived. The ledger is effect authority.
+
+<ArchitectureWalkthrough
+  title="What each store is allowed to claim after a disaster"
+  stages={[
+    { name: "HA copy", owner: "ISR on RF=3", state: "Acknowledged batches under acks=all minISR=2", boundary: "Survives one in-sync broker, not whole-ISR power or disk correlation.", failure: "AZ-correlated ISR loss or unclean election.", recovery: "Restore from a copy outside that domain; treat missing acked offsets as UNKNOWN until evidence exists." },
+    { name: "Metadata", owner: "Controller / KRaft log", state: "Topic maps, ISR snapshots, configs", boundary: "One metadata authority. Restore does not recreate segment bytes.", failure: "Metadata backup without data directories, or data directories without a leader map.", recovery: "Restore both planes from tested backups; never invent money from leftover offsets." },
+    { name: "Off-cluster copy", owner: "Mirror, tiered storage, or vault", state: "Durably copied segments plus a lag clock", boundary: "RPO equals copy lag plus in-flight produces. Offsets need translation.", failure: "Promote a mirror that is 45 s behind and call it lossless.", recovery: "Name the lag; fence source; translate offsets; do not auto-apply UNKNOWN." },
+    { name: "Serving epoch", owner: "Incident commander plus sink", state: "Fenced DR cluster, new PIDs, ledger unique keys", boundary: "Old writers rejected before new appends.", failure: "Split brain or reconstructing TokenX from a compacted changelog.", recovery: "Replay time-retained facts or backup; reconcile UNKNOWN by transfer_id; rebuild derived views last." }
+  ]}
+/>
+
+</ArchitectureDiagram>
+
+<RealExamples title="TokenX facts versus Ad Click degradation">
+
+**TokenX.** Disputed transfers need the **time-retained fact log** or a backup of those segments. A compacted per-wallet changelog is a derived snapshot: it cannot reconstruct twelve intermediate transfers. After region loss, promote a mirror only up to the last translated offset that copy holds. In-flight settlement produces are UNKNOWN—query clearing or idempotency by `transfer_id`; do not auto-replay producer send logs into the ledger. After a cluster rebuild, producer idempotence starts over (new PIDs); conservation still depends on the ledger unique index. If a poison storm hits during recovery, park the account key rather than skip; that is the retries lesson, not a reason to fail the whole cluster over.
+
+**Ad Click Aggregator.** Losing one **collector partition** (one broker’s leader plus its ISR in the same AZ) loses un-mirrored clicks still only in that ISR. That is an ingest hole with size ≈ produce rate × time-to-restore for that partition. Losing **billed-click facts after retention** is worse: the audit window is gone and sampling live traffic at 1% is **degradation** for dashboards, not DR for invoices. Billing remains closed until a retained fact log or backup can replay to a declared watermark. Campaign config on a compacted topic can be rebuilt from a control plane; billed clicks cannot.
+
+<FailureScenario
+  title="Which disaster actually happened?"
+  prompt="Pick the failure. Name the remaining copy and the illegal reconstruction."
+  choices={[
+    { label: "One broker in a healthy ISR", impact: "Controller elects another ISR member. Acknowledged data under minISR=2 should still be on a survivor. This is not region DR.", recovery: "Replace the broker, let it fetch, keep unclean.leader.election.enable=false." },
+    { label: "Whole ISR loses power", impact: "Page-cache acknowledgements can disappear together. Delivery envelope did not cover this.", recovery: "Restore segments that were durably copied off that power domain; UNKNOWN the rest; do not trust leftover consumer offsets." },
+    { label: "Accidental topic delete or compact-the-facts", impact: "Replication deletes or pulps everywhere. Metadata still names the topic. Offsets without bytes are not money.", recovery: "Restore from backup or a lagging mirror taken before the delete; stop compacting fact logs; never rebuild TokenX from the changelog alone." },
+    { label: "DNS to a new empty cluster", impact: "Producers append a new log. Old offsets do not apply. Dual writers if the old cluster is not fenced. New PIDs do not equal exactly-once.", recovery: "Fence first. Load durably copied bytes or promote a mirror with offset translation. Reconcile UNKNOWN by transfer_id." }
+  ]}
+/>
+
+</RealExamples>
+
+<InterviewTraps title="DR slogans that fail at IC6">
+
+1. **“acks=all minISR=2 RF=3 means we cannot lose acknowledged data.”** It means you survive one in-sync broker, not whole-ISR correlation, not retention, not delete-topic.
+2. **“We restored KRaft, so the messages are back.”** Metadata is not the fact log.
+3. **“Consumer offsets survived, so we can resume.”** Group checkpoints live in `__consumer_offsets`, not the KRaft metadata log. Offsets without segment bytes typically yield `OffsetOutOfRange` (then `auto.offset.reset`). They are not a backup of transfers.
+4. **“Fail over to the DR cluster and keep the same offsets.”** Different log. Translate or start from a sink checkpoint.
+5. **“MirrorMaker gives lossless DR.”** It gives an async copy with lag. That lag is RPO. In-flight produces are UNKNOWN.
+6. **“Producer idempotence will save us after rebuild.”** New cluster, new PIDs. Sink `transfer_id` is the remaining fence.
+7. **“Rebuild TokenX balances from the compacted changelog.”** Intermediates are gone. Use the time-retained fact log or backup.
+8. **“Sample 1% of clicks until Kafka is back; billing can wait on sampling.”** Sampling is product degradation. Billed facts need retained bytes or an explicit write-off.
+9. **“Skip poison so DR catch-up can finish.”** Catch-up that skips TokenX state machines is silent corruption. Park keys; see the retries lesson.
+10. **“RTO starts when the new brokers are up.”** Business RTO includes fence, restore, offset translation, invariant checks, and UNKNOWN reconciliation.
+
+</InterviewTraps>
+
+<Tradeoffs title="Copy lag, restore physics, and split brain">
+
+- **Single-region RF=3 versus cross-AZ ISR.** Cross-AZ raises HA against one AZ and adds replicate latency. It is still not region DR if all AZs share a provider failure mode you care about.
+- **Warm mirror versus cold backup.** Mirror shortens RTO and costs continuous network plus offset-translation ops; backup is cheaper and slower and has a larger RPO. Neither is lossless.
+- **Dual-produce versus async mirror.** Dual-produce can shrink RPO if both acks succeed and doubles the UNKNOWN surface when only one does. Mirror is simpler for consumers but lag is explicit RPO.
+- **Long fact retention versus storage.** TokenX disputes need history; compaction saves money and destroys the DR story for that topic.
+- **Aggressive auto-failover versus human gate.** Fast DNS cutover without a fence is split brain. Slow human gate misses RTO. Game-days decide which failures are auto.
+- **Rebuild derived aggregations versus serving stale dashboards.** Ad Click can degrade; TokenX ledger cannot serve a compacted guess.
+
+Correctness is the remaining copy plus the sink identity. Availability is how hot that copy was. Cost is how many failure domains you actually paid for.
+
+</Tradeoffs>
+
+<KnowledgeCheck
+  question="A TokenX cluster uses RF=3, acks=all, and min.insync.replicas=2. The three ISR replicas share one disk array that fails. Why are acknowledged transfers not guaranteed to still exist?"
+  options={[
+    "acks=all already fsynced every replica, so the controller can recreate the bytes from metadata",
+    "The named envelope survives one in-sync broker, not disk-correlated loss of the whole ISR; page cache and shared disks are outside that envelope",
+    "min.insync.replicas=2 means two extra off-site backups are required by the protocol",
+    "Producer idempotence stores transfer bodies in KRaft, so only metadata restore is required"
+  ]}
+  correct={1}
+  explanation="Delivery plus internals: minISR=2 on RF=3 is a one-broker HA bound. Shared disks and dirty page cache are a different failure domain. Metadata does not hold transfer bodies."
+/>
+
+<KnowledgeCheck
+  question="After rebuilding a DR Kafka cluster from metadata plus a compacted wallet changelog, operators still have consumer group offsets from the old cluster. What can they defensibly restore?"
+  options={[
+    "The full TokenX fact history, because offsets plus metadata plus latest-per-key values reconstruct every transfer",
+    "A new empty or changelog-only log with new offsets; disputed transfers still need the time-retained fact log or backup, and old offsets are not portable",
+    "Exactly-once settlement, because new brokers reissue the same producer ids",
+    "Lossless billed history for Ad Click by sampling live traffic at the same offsets"
+  ]}
+  correct={1}
+  explanation="Metadata restore is not byte resurrection. Compaction dropped intermediates. Offsets are per log. New PIDs. Sampling is not a fact log."
+/>
+
+<ScenarioCheck
+  scenario="Region A is gone. Mirror cluster B is 45 seconds behind on settlements. Three producers timed out on acks during the outage. An engineer restores KRaft from last night, points DNS at a third empty cluster C, and a script auto-applies timed-out send buffers into C so 'customers are not blocked.' Ad Click billing proposes 1% sampling until click facts catch up. A poison settlement appears on B; the team wants to skip it to drain lag."
+  question="Which cutover preserves conservation and named RPO?"
+  options={[
+    { label: "Use C plus auto-applied send buffers and old offsets; skip poison; sample clicks for billing.", feedback: "C is a new empty log. Auto-applying buffers can mint UNKNOWN transfers. Old offsets do not apply. Skip breaks the account state machine. Sampling is not billed-fact DR." },
+    { label: "Fence A, promote B as the new log, accept 45 s RPO, translate consumer offsets, classify the three timeouts as UNKNOWN and reconcile by transfer_id, park the poison key, and keep billing closed until retained click facts replay.", feedback: "The remaining durable copy is B. Lag is the RPO. UNKNOWN is not auto-replay. New serving epoch is fenced. Poison handling stays on the retries protocol. Ad Click facts are not optional samples." },
+    { label: "Restore metadata onto C so offsets match A, then claim lossless failover because RF=3 in A had already acked.", feedback: "A's ISR is gone. Metadata on C does not recreate A's bytes. Offsets without bytes are not money." },
+    { label: "Dual-write A and B without fencing because producer idempotence will drop duplicates after rebuild.", feedback: "A is dead or split. New PIDs on B do not equal business identity. Unfenced dual-write is two logs." }
+  ]}
+  correct={1}
+  explanation="DR uses the remaining durable copy, names its lag as RPO, fences old writers, translates offsets, auto-replays only copied journals, parks poison keys, and does not substitute sampling for billed facts."
+/>
+
+<InterviewAnswer>
+
+“I name the failure domain first. RF=3, acks=all, minISR=2 survives one in-sync broker, not whole-ISR disk or power, not a region, not retention, not delete-topic. KRaft restore is metadata, not fact bytes—offsets without segments are not money, and a compacted changelog is not a TokenX ledger. For region loss I promote or restore only what a mirror, tier, or backup durably copied; that copy lag is RPO. The DR cluster is a new log: translate offsets, issue new producer ids, fence old writers before opening produces. In-flight acks are UNKNOWN; I reconcile by transfer_id and auto-replay only committed journals, same rule as the backup lesson. Poison during catch-up parks the key; I do not skip state machines. Ad Click can degrade dashboards; billed facts need retained bytes. Game-days measure those RPO and RTO numbers. I never call that lossless or exactly-once.”
+
+</InterviewAnswer>

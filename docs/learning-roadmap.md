@@ -30,14 +30,14 @@ Status key: **Hardened** means the lesson meets the full learning standard, incl
 ## Module 3 — Kafka & Fault Tolerance
 
 1. **Kafka Delivery Semantics & Failure** — offsets, at-least-once, idempotency, outbox, poison records, and replay. **Hardened**
-2. **Kafka Internals** — partitions, replicas, leaders, in-sync replicas, controller behavior, retention, and log segments. **Planned**
-3. **Consumer Groups and Rebalancing** — ownership, cooperative rebalance, lag, state restore, and parallelism limits. **Planned**
-4. **Ordering and Event Keys** — per-partition order, key choice, sequence numbers, causal order, and resequencing. **Planned**
-5. **Stream Processing and Windows** — event time, processing time, watermarks, late data, state stores, and changelogs. **Planned**
-6. **Retries, Dead Letters, and Replay** — error taxonomy, retry topics, quarantine, replay controls, and operational ownership. **Planned**
-7. **Failure Detection and Recovery** — heartbeats, leases, fencing tokens, split brain, failover, and repair. **Planned**
-8. **Graceful Degradation** — bulkheads, circuit breakers, fallbacks, admission control, and dependency isolation. **Planned**
-9. **Disaster Scenarios** — broker loss, regional loss, corrupt events, accidental deletion, and recovery exercises. **Planned**
+2. **Kafka Internals** — partitions, replicas, leaders, in-sync replicas, controller behavior, retention, and log segments. **Hardened**
+3. **Consumer Groups and Rebalancing** — ownership, cooperative rebalance, lag, state restore, and parallelism limits. **Hardened**
+4. **Ordering and Event Keys** — per-partition order, key choice, sequence numbers, causal order, and resequencing. **Hardened**
+5. **Stream Processing and Windows** — event time, processing time, watermarks, late data, state stores, and changelogs. **Hardened**
+6. **Retries, Dead Letters, and Replay** — error taxonomy, retry topics, quarantine, replay controls, and operational ownership. **Hardened**
+7. **Failure Detection and Recovery** — heartbeats, leases, fencing tokens, split brain, failover, and repair. **Hardened**
+8. **Graceful Degradation** — bulkheads, circuit breakers, fallbacks, admission control, and dependency isolation. **Hardened**
+9. **Disaster Scenarios** — broker loss, regional loss, corrupt events, accidental deletion, and recovery exercises. **Hardened**
 
 ## Module 4 — Performance
 
@@ -96,6 +96,6 @@ Complete the hardened foundation lesson in each module once to establish breadth
 ## Delivery phases
 
 - **Phase 0 — Complete:** the seven foundation lessons have corrected technical boundaries, explicit failure and recovery paths, challenging scenario checks, and reusable interactive learning components. Content validation covers frontmatter, section order, quiz counts, and Mermaid syntax.
-- **Phase 1A — Complete:** all nine Storage & Data lessons and all nine CAP & Consistency lessons are hardened, cross-linked, interactive, and validated. The academy now contains 23 of 64 planned lessons.
-- **Phase 1B — Planned:** author the remaining 41 lessons, continuing with the event-driven reliability spine in Module 3, followed by the operating spine in Modules 2, 4, and 5, then the applied designs in Module 7.
+- **Phase 1A — Complete:** all nine Storage & Data lessons and all nine CAP & Consistency lessons are hardened, cross-linked, interactive, and validated.
+- **Phase 1B — In progress:** Module 3 is complete (9/9). The academy contains 31 of 64 planned lessons. Resume operating lessons in Modules 2, 4, 5, and 7.
 - **Phase 2 — Future, not implemented:** add an Architecture Reference Library of reusable patterns, decision guides, failure modes, and canonical diagrams cross-linked to lessons and mock interviews.

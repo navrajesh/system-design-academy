@@ -1,0 +1,233 @@
+---
+title: "Retries, Dead Letters, and Replay"
+description: "Classify retryable versus poison failures, bound backoff without stalling a partition, and operate dead-letter replay as an owned at-least-once procedure."
+module: 3
+moduleTitle: "Kafka & Fault Tolerance"
+order: 6
+duration: 38
+difficulty: "Intermediate"
+tags:
+  - Kafka
+  - retries
+  - dead-letter
+  - replay
+  - poison
+objectives:
+  - Classify proven-retryable, UNKNOWN timeout, and terminal poison before choosing a retry path
+  - Bound exponential backoff with jitter so retry topics do not storm or block a partition
+  - Operate a dead-letter log with headers, an owner, an SLO, and idempotent replay controls
+  - Park per-key state machines instead of skipping records that later events depend on
+---
+
+<BigPicture title="A retry is a protocol, not a loop">
+
+Kafka will redeliver. That is the [delivery semantics](/learn/kafka-delivery-and-failure) envelope: at-least-once consumption unless you deliberately commit early. This lesson is the **operational protocol** on top of that envelope: which errors may retry, how long, where the delayed work lives, who owns the failures that never succeed, and how you put records back without pretending the broker made the sink exactly once.
+
+HTTP 429/503 and `LEADER_NOT_AVAILABLE` are **proven retryable** only inside a bound: the remote **rejected or did not accept** the request. A **timeout is UNKNOWN**—the remote may already have applied the effect. Retry the lookup or the same `transfer_id`; do not mint a second command. A schema-incompatible payload, a poison body that cannot deserialize, and an invariant violation (debit a TokenX wallet below zero with no overdraft policy) are **non-retryable**. Repeating them does not create a better answer. It creates head-of-line blocking, retry storms, and poison amplification.
+
+The source partition log is authoritative for records **until retention deletes them**. A retry topic and a dead-letter topic are **other logs**, not trash cans. The sink—ledger, campaign store, notification API—is the **effect authority**. Producer idempotence stops duplicate *appends* in a producer session. It is not a `transfer_id`, and Kafka retries do not make end-to-end exactly-once processing.
+
+TokenX must never auto-replay an `UNKNOWN` settlement into the ledger. Ad Click may dead-letter a malformed click keyed by `click_id` without stalling other campaigns, but a campaign-keyed config stream cannot skip a required configuration event.
+
+</BigPicture>
+
+<UnderTheHood title="Classify, bound, park, then replay with identity">
+
+### Error taxonomy before the first retry
+
+Name the failure class on the first exception. The class decides the path.
+
+**Proven retryable (transient non-accept):** HTTP 429 or 503; broker `LEADER_NOT_AVAILABLE` / `NOT_LEADER_OR_FOLLOWER` during failover; a sink lock wait the database classifies as deadlock-retry. The remote **did not accept** the work. Retry the **same** identity after a bound delay.
+
+**UNKNOWN (timeout / lost response):** request timeout; connection reset mid-call; an ambiguous producer ack. The remote **may already have applied**. Retry a **lookup** or the original command id. Do not treat timeout as 429, and do not mint a second TokenX settlement.
+
+**Non-retryable (terminal for this payload):** Avro/JSON schema mismatch that will not parse until a new consumer version exists; poison bytes that crash the deserializer; a business invariant the current record can never satisfy (negative amount, unknown enum, checksum fail); a 400 that names a semantic error, not capacity.
+
+A 401 can be either: rotated credentials are proven-retryable after a refresh; a record that signed with a revoked key is terminal. If you cannot tell, it is UNKNOWN, not failure. UNKNOWN is the TokenX settlement trap: the clearing house may already have posted.
+
+<Callout type="warning" title="Unknown is not retryable-as-new">
+A timed-out settlement is not proof it failed. Retry the *lookup* or the same `transfer_id`. Do not mint a second settlement command. See [idempotency and deduplication](/learn/idempotency-and-deduplication).
+</Callout>
+
+### Bounded retries: backoff, jitter, and two places to wait
+
+In-process retry: the consumer thread sleeps and re-invokes the sink for the same record before polling again. Retry topic: the consumer produces the record (plus headers) to a delay topic and **commits past it** on the source only when that produce is durable *and* the key is allowed to move forward.
+
+Both shapes need a **budget**: maximum attempts, maximum delay, and a deadline. Exponential backoff without a cap is an unbounded stall. Jitter (randomize the delay inside a band, for example full jitter between 0 and `min(cap, base × 2^attempt)`) stops synchronized herds.
+
+<ExecutionTimeline
+  title="One record through classify, retry, park, and offset"
+  steps={[
+    { title: "Classify", detail: "The consumer records exception class, attempt count, and whether the sink effect is known, unknown, or proven absent.", state: "The source log still holds the authoritative offset. Group progress has not moved.", failure: "Treating timeout as proven failure skips a TokenX settlement that already posted." },
+    { title: "Bound the retry", detail: "Retryable classes use capped exponential backoff with jitter. In-process sleep keeps the partition; a retry-topic produce moves delay off the hot poll loop.", state: "Attempt N is the same business identity, not a new event.", failure: "No jitter plus correlated 429s creates a retry storm that DDoSes the sink you are trying to recover." },
+    { title: "Park or dead-letter", detail: "Non-retryable or exhausted attempts go to a DLQ with original topic, partition, offset, exception, and attempt headers. Per-key state machines park the key so later records do not apply.", state: "DLQ is another Kafka log with an owner. The sink has not taken the effect.", failure: "Skipping a poison record and consuming offset+1 applies a later credit without the missing debit." },
+    { title: "Checkpoint", detail: "Commit the source offset only after a successful sink effect, a durable retry-topic handoff that still fences the key, or a durable DLQ produce plus park.", state: "Offsets remain group progress, not ledger proof.", failure: "Committing first, then DLQ-producing, loses the record if the process dies in between." }
+  ]}
+/>
+
+**In-process retry** is simple and preserves the record in place. It **head-of-line blocks** every later offset on that partition for the sleep budget. Other keys that share the partition wait even if they are healthy. During that sleep you can also trip `max.poll.interval.ms` and get revoked, which is a dual-owner window at the sink—not a retry strategy.
+
+**Retry topic** (sometimes a series of delay topics: 5s, 30s, 5min) isolates waiting. Consumers of the source partition can proceed. The cost: you now have **another append**. Per-key order is no longer “next offset on the source.” If the key is a TokenX account, you must **pause that key** on the source (a parked-key fence) until the delayed record succeeds or is dead-lettered. Otherwise a later credit on the source partition applies while the debit is still sitting in the 5-minute retry topic.
+
+### Retry storms and poison amplification
+
+A retry storm is correlated retry traffic: many members share the same backoff grid, the sink is already at 429, and each retry adds load. Jitter, a per-key and per-sink token bucket, and a circuit that stops retrying into a proven-down dependency are the controls. Raising `retries` on the producer is not that control.
+
+Poison amplification is a protocol bug: each failed attempt **produces a new record** (retry topic or DLQ) without an attempt ceiling or a stable identity. One bad payload becomes thousands of log bytes, thousands of pages, and a replay that multiplies the damage. Headers must carry `attempt` and the **original** topic/partition/offset so tooling can collapse copies.
+
+### Dead letters are an operational queue
+
+A dead-letter topic is not `/dev/null`. It is a log that needs:
+
+- **Headers:** original topic, partition, offset, timestamp, exception class and truncated message, attempt count, producing consumer group and member, optional key and schema fingerprint.
+- **An owner:** a team named in the runbook, not “the platform.”
+- **An SLO:** age of the oldest record, depth, and page threshold. A DLQ that grows for a week is an unowned incident.
+- **Replay tooling:** operators choose from-offset, from-timestamp, or a filtered key set; the tool produces back to a repair topic or the source with a replay generation header.
+- **Idempotent sinks:** replay is **at-least-once**. The sink still keys effects by `transfer_id` or `click_id`.
+
+Stopping the partition (do not commit, do not skip) is valid when **every later record is uninterpretable** without this one and the blast radius is acceptable. That is a severity-1 product decision, not the default. Parking the key is the usual TokenX move: other accounts on the partition continue; this account’s later events wait or go to a repair stream with a sequence check.
+
+### Replay controls and the retention bound
+
+You can replay:
+
+- **From an offset** on a partition (precise, operator must name partition).
+- **From a timestamp** (broker time index is approximate; clocks and batch timestamps skew).
+- **Filtered keys** (repair one wallet or one campaign without replaying the world).
+
+[Kafka internals](/learn/kafka-internals) already placed the bound: **retention is the replay horizon**. Time or size retention deletes segments. After expiry there is nothing to seek. Compacted topics (`cleanup.policy=compact`) keep the **latest value per key**. Replaying a compacted campaign-config topic does not reconstruct intermediate configs; you get whatever the cleaner left. Do not use that replay as a ledger or as a click audit.
+
+Kafka transactions and producer idempotence still do not enclose an external ledger. A replayed record is a second delivery. [Idempotency](/learn/idempotency-and-deduplication) at the sink is mandatory. [Ordering and event keys](/learn/ordering-and-event-keys) still apply: a filtered-key replay that lands while live traffic continues can invert business sequence unless the sink checks `account_seq`.
+
+<Calculation label="Head-of-line cost versus retry-topic isolation">
+
+Assumptions (illustrative TokenX settlement partition): 2,400 records/s applied capacity; 12% of records share celebrity account A; a **429** (proven non-accept) for A is retried in-process with 7 sleeps at 200 ms, 400 ms, 800 ms, 1.6 s, 3.2 s, 8 s cap, 8 s cap. Poison is terminal—it does not get this sleep ladder.
+
+Sum of sleeps: 0.2 + 0.4 + 0.8 + 1.6 + 3.2 + 8 + 8 = 22.2 s of partition stall before the attempt cap.
+
+Records delayed on that partition: 2,400 records/s × 22.2 s ≈ 53,000 records, including accounts that were healthy.
+
+If A is 12% of the stream, about 0.12 × 53,000 ≈ 6,400 of those delayed records were for A (and needed the park anyway). About 46,600 were other accounts blocked only because retry was in-process.
+
+A retry topic plus a parked-key fence for A lets those 46,600 proceed. A still waits on the delay path. Same 429, different blast radius.
+
+Retry storm: 40 members seeing 2% 429s, synchronized 2 s backoff without jitter, herd at the same instant. Extra offered load is the herd, not a Kafka outage. Full jitter spreads the same retries across the backoff window instead of a spike at 2.00 s. A **timeout** is not this 429 path: it is UNKNOWN and must lookup `transfer_id` rather than re-invoke a new settlement.
+
+</Calculation>
+
+</UnderTheHood>
+
+<MentalModel title="Quarantine the patient, not the hospital ward">
+
+A partition is a hospital ward with many patients (keys) in one hallway. A retryable fever gets a timed dose in a side room (retry topic) so the hallway keeps moving. A poison diagnosis goes to isolation (DLQ) with the chart: which bed, which time, which test failed, how many doses already. You do not send the patient home and pretend the next person in line can skip their surgery. If the missing surgery is a TokenX debit, later credits are not “progress.”
+
+The original hallway log is the legal record until the hospital shreds old charts (retention). Isolation is another hallway with a named doctor on call, a time-to-treat SLO, and a procedure for walking someone back. Walking them back is another admission—the pharmacy (sink) must still recognize the prescription id.
+
+Retain: **classify first; bound retry with jitter; park the key if order matters; DLQ is owned; replay is at-least-once; retention is the last chance; producer idempotence is not a business id.**
+
+</MentalModel>
+
+<ArchitectureDiagram title="Source log, retry log, DLQ log, and sink authority" chart={"flowchart LR\n  P[Producer] --> LOG[(Authoritative source log until retention)]\n  LOG --> C[Consumer classifier]\n  C -->|apply then| SINK[(Sink effect authority)]\n  C -->|after sink commit| OFF[(Group offsets)]\n  C -->|proven 429 503 leader-not-available| RT[(Retry topic log)]\n  JIT[Bounded backoff plus jitter] -.-> RT\n  RT --> C\n  C -->|schema poison invariant| DLQ[(DLQ operational log)]\n  DLQ --> OWN[Named owner plus SLO]\n  OWN --> ALERT[Age and depth pages]\n  OWN --> TOOL[Replay from offset time or key]\n  TOOL -.->|at-least-once replay| LOG\n  C -->|per-key poison| PARK[Parked key fence]\n  PARK -.-> DLQ\n  HOLD[Head-of-line stall] -.-> C\n  COMP[(Compacted latest-per-key)] -.->|intermediates gone| TOOL\n  C -->|timeout UNKNOWN| UNK[UNKNOWN reconcile gate]\n  UNK -.->|lookup same transfer_id| SINK"}>
+
+The source partition log is authoritative for record bytes until time or size retention. Retry topics and the DLQ are additional logs: durable, ordered, and equally mortal. Group offsets are **consumer** checkpoints after the sink commit—the ledger does not write `__consumer_offsets`. Compacted latest-per-key state is derived and lossy. The sink is authoritative for effects. Dashed edges are backoff, park, head-of-line stalls, compacted-history loss, UNKNOWN lookup (not a second command), and at-least-once replay. Proven 429/503 retries are a separate solid path from timeout UNKNOWN.
+
+<ArchitectureWalkthrough
+  title="Who may change which state"
+  stages={[
+    { name: "Classify", owner: "Consumer", state: "Exception class, attempt, known versus unknown outcome", boundary: "Retryable versus terminal is a product rule, not a Kafka flag.", failure: "Timeout classified as failure; UNKNOWN TokenX settlement is auto-retried as a new command.", recovery: "Lookup or retry the same transfer_id; never mint a second settlement." },
+    { name: "Retry", owner: "Retry topic plus backoff policy", state: "Same identity, attempt header, delay budget", boundary: "In-process retry stalls the partition; retry topics must park keys that have a state machine.", failure: "Synchronized retries storm a 429 sink; skip-and-commit breaks per-key sequences.", recovery: "Full jitter, attempt cap, parked-key fence, then DLQ with original offset headers." },
+    { name: "Quarantine", owner: "Named on-call team", state: "DLQ records plus age and depth SLO", boundary: "DLQ is an operational log, not deletion.", failure: "No owner, no pages, poison amplification from uncapped re-produces.", recovery: "Collapse by original offset; alert on oldest record; repair with tooling, not ad-hoc console consume." },
+    { name: "Replay", owner: "Replay tool and sink", state: "Selected offsets, timestamps, or keys plus replay generation", boundary: "At-least-once. Retention is the hard bound. Compaction drops intermediates.", failure: "Replaying compacted configs as a ledger, or replaying UNKNOWN into TokenX balances.", recovery: "Idempotent sink on transfer_id or click_id; sequence check before applying a parked key's later events." }
+  ]}
+/>
+
+</ArchitectureDiagram>
+
+<RealExamples title="TokenX parks keys; Ad Click isolates clicks">
+
+**TokenX settlement.** Key by account. A timeout talking to clearing is `UNKNOWN`: operators (or an automated reconciler) query clearing by `transfer_id` and apply at most one ledger mutation. Auto-replaying the Kafka record into the ledger can double-post if clearing already succeeded. A poison settlement (schema break, impossible amount) is produced to the DLQ with original topic/partition/offset and parked by account key. Later credits for that account do not apply until a repair records the missing sequence or an operator marks a hole with an explicit compensating event. Other accounts on the partition keep moving. Unique `transfer_id` in the same database transaction as the balance update is still required on every apply, including replay. Delivery already required that uniqueness; here the extra rule is **do not skip, and do not auto-replay UNKNOWN**.
+
+**Ad Click Aggregator.** Malformed or late clicks keyed by `click_id` can dead-letter without blocking other campaigns: there is no per-click state machine that later clicks must follow. Dedupe still uses `click_id` so a replayed click cannot increment twice inside the declared window. A **campaign-keyed configuration stream** is the opposite. If campaign C's `budget-updated` event is poison and you skip it, later `click-accepted` events for C apply the old budget. Park campaign C, DLQ the config record, page the ads-serving owner, and replay the repaired config before unparking. Do not treat “the partition stayed healthy” as proof campaign C is consistent.
+
+<FailureScenario
+  title="Pick the control that matches the failure"
+  prompt="A consumer hits a bad record. Choose the operational response, not the slogan."
+  choices={[
+    { label: "Retryable 429 with no jitter", impact: "Members retry on the same cadence, amplifying load on a saturated sink. Lag looks like a Kafka outage.", recovery: "Cap attempts, add full jitter, shed or circuit-break the sink, keep the same event identity." },
+    { label: "Skip poison TokenX debit", impact: "The account's later credits apply. The per-key state machine is now lying. Conservation is gone even if unique transfer_id prevents double-apply of that one debit.", recovery: "Park the account key, DLQ with original offset headers, repair or compensate, then unpark with an account_seq check." },
+    { label: "DLQ as trash can", impact: "Records expire in an unowned topic. Replay horizon is whatever retention happened to be. Incidents are discovered by finance, not pages.", recovery: "Name an owner, SLO on oldest age, replay runbook, and alerts. Treat DLQ like a queue with a service." },
+    { label: "Replay compacted campaign config from timestamp", impact: "Intermediate budget changes are gone. The consumer installs a latest value that never existed at that event time.", recovery: "Replay from an uncompacted fact log still inside retention, or accept that history is unrecoverable and rebuild from a backup." }
+  ]}
+/>
+
+</RealExamples>
+
+<InterviewTraps title="Retry slogans that fail at IC6">
+
+1. **“Kafka retries give us exactly-once.”** Retries increase delivery count. Exactly-once would require a named atomic boundary with the sink. Producer idempotence is not a business event id.
+2. **“We skip poison messages so the partition does not stall.”** Valid only when later records do not depend on this key’s prior state. TokenX accounts and campaign-config streams usually do.
+3. **“Dead-letter and forget.”** A DLQ without owner, SLO, headers, and replay tooling is silent data loss with extra steps.
+4. **“In-process retry preserves order, so it is always safer.”** It preserves offset order by stalling everyone else on the partition and risks poll-interval eviction.
+5. **“A retry topic preserves order because the key is the same.”** Only if you fence the key on the source while the delayed copy is in flight. Otherwise source offset N+1 can apply before retry-topic N.
+6. **“Replay from timestamp equals the business clock.”** Broker timestamps and event time diverge. See ordering. Filtered keys plus `account_seq` are the precise tool.
+7. **“We can always replay.”** Retention and compaction bound replay. Compacted intermediates are gone.
+8. **“UNKNOWN settlement should be retried hard until the ledger accepts it.”** That is how you double-post. Reconcile by `transfer_id`.
+9. **“Headers are optional metadata.”** Without original offset and attempt, you cannot collapse amplification or prove what you quarantined.
+
+</InterviewTraps>
+
+<Tradeoffs title="Stall, storm, skip, and operational load">
+
+- **In-process retry versus retry topic.** In-process keeps one log and simple order; it head-of-line blocks and can trip poll interval. Retry topics restore source throughput but add produces, lag monitoring, and a parked-key protocol for state machines.
+- **Park key versus stop partition versus skip.** Parking isolates blast radius and protects the state machine. Stopping the partition is honest when the whole log is unreadable (corrupt segment, poison broadcast). Skipping maximizes throughput and is only defensible for independent records such as `click_id` ingest.
+- **Long backoff cap versus fast DLQ.** Long caps ride over short sink outages; they also hide incidents and enlarge HOL windows. Fast DLQ needs a sharp on-call response.
+- **Deep DLQ retention versus storage cost.** Deep retention preserves repair; it is not a strategy if nobody replays. Align DLQ retention with the source replay horizon and the sink idempotency window.
+- **Automatic replay versus human gate.** Automation recovers 429 outages quickly. A human (or reconciler with a lookup) must gate TokenX `UNKNOWN` and any effect that is not idempotent.
+- **Jitter versus deterministic delay.** Jitter breaks storms; operators lose a single “everyone retries at T+2s” timeline, which is a good trade.
+
+Correctness still sits at the sink. These knobs choose whose latency and whose pager pay for failure.
+
+</Tradeoffs>
+
+<KnowledgeCheck
+  question="A TokenX settlement consumer gets a 30s timeout from clearing. Why is producing a new settlement command on a retry topic the wrong default?"
+  options={[
+    "Retry topics cannot carry headers, so the ledger would not see transfer_id",
+    "The outcome is UNKNOWN: clearing may already have posted; a new command can double-apply unless the same transfer_id is reconciled first",
+    "Kafka producer idempotence already made the ledger exactly once, so any retry is wasted work",
+    "Timeouts are non-retryable schema errors and must go straight to compaction"
+  ]}
+  correct={1}
+  explanation="A timeout does not prove absence. Auto-replay into the ledger is a new delivery of a possibly successful remote effect. Reconcile with unique transfer_id. Producer idempotence never enclosed the ledger."
+/>
+
+<KnowledgeCheck
+  question="Why can Ad Click dead-letter a malformed click keyed by click_id, while a campaign-keyed budget-updated event must be parked instead of skipped?"
+  options={[
+    "click_id records are larger, so skipping them saves more disk",
+    "Malformed clicks are independent events; skipping a required campaign-config event lets later clicks apply the wrong budget for that campaign",
+    "Campaign keys are compacted automatically, so skipping is how Kafka implements config",
+    "Dead-letter topics only work for click_id because offsets are globally unique"
+  ]}
+  correct={1}
+  explanation="Independence of later records is the test. click_id ingest has no per-click successor that requires this payload. Campaign config is a state machine: later events assume the config happened."
+/>
+
+<ScenarioCheck
+  scenario="Partition 4 of settlements contains account A then account B. Offset 100 for A fails schema validation. The consumer writes A to a DLQ without original-offset headers, commits offset 101, and applies B. A retry publisher also copies every failed attempt to the retry topic with a new key. Operators later replay the compacted changelog of account snapshots from a timestamp to 'fix A'."
+  question="Which repair is defensible, and which mistakes must it undo?"
+  options={[
+    { label: "Do nothing: DLQ plus skip is the standard Kafka poison pattern and compaction will restore A's history.", feedback: "Skip broke A's state machine. Compaction does not restore intermediates. Delivery sketched quarantine; it did not authorize skip-for-accounts." },
+    { label: "Treat B as committed forever, replay A from the DLQ as a new transfer_id, and disable sink uniqueness so the repair can land.", feedback: "A new transfer_id can mint money. Disabling uniqueness invites double-apply on the next replay." },
+    { label: "Park A, stop applying A's later offsets until repair; collapse retry copies by original identity; replay the original payload against unique transfer_id and account_seq; leave B if B's key was independent. Rebuild A from an uncompacted fact log still in retention, not from compacted snapshots.", feedback: "This restores the park-versus-skip rule, stops amplification, keeps sink idempotency, and respects compaction and retention bounds." },
+    { label: "Rewind the whole partition to 100 and auto-replay every record into the ledger, including UNKNOWN timeouts, because Kafka exactly-once will dedupe.", feedback: "Kafka retries are at-least-once. UNKNOWN auto-replay can double-post. A full rewind also re-applies B unless the sink is idempotent—and it still would not justify treating EOS as given." }
+  ]}
+  correct={2}
+  explanation="The broken assumptions were skip-equals-quarantine, headers-are-optional, retry-copies-are-harmless, compaction-is-a-ledger, and Kafka-retries-are-EOS. Park the key, keep transfer_id, replay from a retained fact log."
+/>
+
+<InterviewAnswer>
+
+“I classify first. Proven 429/503 and leader-not-available are retryable inside a cap with exponential backoff and full jitter. A timeout is UNKNOWN: I look up or retry the same transfer_id, I do not mint a second command. Schema failures, poison payloads, and invariant violations are terminal. In-process retry stalls every key on the partition; a retry topic needs a parked-key fence if that key is a state machine. Skipping a TokenX debit to keep the partition healthy is not quarantine. I DLQ with original topic, partition, offset, exception, and attempt, name an owner and an age SLO, and I collapse amplified copies. Replay is at-least-once from offset, timestamp, or filtered keys, and only while retention still has the bytes—compaction has already dropped intermediates. The sink stays idempotent on transfer_id or click_id. I never auto-replay UNKNOWN settlement into the ledger; I reconcile. Ad clicks keyed by click_id can DLQ independently; campaign-config cannot be skipped. Kafka retries and producer idempotence are not exactly-once and are not a business event id.”
+
+</InterviewAnswer>

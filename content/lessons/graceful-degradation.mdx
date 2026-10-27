@@ -1,0 +1,226 @@
+---
+title: "Graceful Degradation"
+description: "Isolate Kafka and mesh dependencies with bulkheads, circuit breakers, fallbacks, and priority shedding without faking correctness."
+module: 3
+moduleTitle: "Kafka & Fault Tolerance"
+order: 8
+duration: 36
+difficulty: "Intermediate"
+tags:
+  - graceful degradation
+  - circuit breakers
+  - bulkheads
+  - load shedding
+  - Kafka
+objectives:
+  - Isolate TokenX ledger pools from analytics produce, and billed-click consumers from debug apply, so one hot partition cannot exhaust the wrong process
+  - "Choose fail-closed versus fail-open circuit and fallback policy from the invariant at risk"
+  - "Shed, queue, or pause by priority at mesh, producer buffer, and consumer lag gates"
+  - "Name user-visible degradation without claiming exactly-once from a circuit breaker"
+---
+
+<BigPicture title="Degrade the optional path before the invariant">
+
+Graceful degradation is an explicit policy for **which work you refuse, delay, or serve stale** when a dependency is slow, saturated, or wrong—not a hope that timeouts will sort themselves out. In a Kafka-plus-service-mesh production setting the policy has to name three planes at once: the **mesh sidecar** (admission, timeouts, outlier ejection), the **application bulkheads** (separate pools for HTTP, ledger, notifications, analytics produce), and the **log** (producer buffer, `max.block.ms`, consumer pause, lag).
+
+The ledger, unique-id table, and billed-click fact log are **authoritative**. Dashboards, notification outboxes, debug payloads, and cache copies are **derived**. When Kafka analytics lags or a notification cluster 5xxs, the system should still enforce TokenX uniqueness and still accept billed ad clicks. When the ledger itself is unhealthy, TokenX must **fail closed**: refuse the debit. It must not return success from a stale cache.
+
+Circuit breakers **shed load**. They do not make the sink correct, do not provide exactly-once processing, and do not prevent dual writes. Delivery, offsets, and idempotency stay in [Kafka delivery semantics and failure](/learn/kafka-delivery-and-failure). Retry taxonomy, dead letters, and replay controls belong in [Retries, dead letters, and replay](/learn/retries-dead-letters-and-replay). Queueing math and why unbounded buffers destroy tail latency stay in [Latency, throughput, and queues](/learn/latency-throughput-and-queues). This lesson decides **what you stop doing first**.
+
+</BigPicture>
+
+<UnderTheHood title="Bulkheads, breakers, fallbacks, then Kafka admission">
+
+### Bulkheads: separate wait from wait
+
+A **bulkhead** is a hard cap on concurrency for one class of work so that class cannot consume the whole process. Typical TokenX API isolation:
+
+- HTTP/mesh worker pool: accept and parse requests.
+- Ledger pool: unique-id insert plus balance mutation.
+- Notification pool: email/push fan-out.
+- Analytics produce pool: Kafka producer I/O.
+
+Kafka **consumer lag** is a different queue from the API pool. Isolate **each process** by class: TokenX HTTP must not share the **ledger connection pool** with analytics `send()`. Ad Click consumers must not share **sink** connections or worker permits across billed-click apply and debug-click apply. If one viral campaign hashes to one partition, that partition’s apply loop can pin every shared **consumer** worker—cap **partition-aware permits against the billed sink**, not against TokenX’s ledger pool, unless you have named a monolith that truly shares both. Consumer-group ownership still assigns each partition to one member; isolation here is **thread and connection isolation**, not a second group. See [Consumer groups and rebalancing](/learn/consumer-groups-and-rebalancing) for lag versus high watermark.
+
+### Circuit breakers: open, half-open, then probe
+
+A breaker watches a **named dependency** (RPC, produce, HTTP) for error rate, timeout rate, or consecutive failures in a sliding window. **Closed** sends traffic. **Open** fails fast for a sleep interval. **Half-open** admits a small probe; success closes, failure reopens.
+
+What the open state actually does: it **stops sending more load** into a dependency that is already failing. In-flight calls are not recalled. Records already in a Kafka producer buffer may still flush or time out. Dual writes that already raced still race. The breaker is not a transaction manager.
+
+Name **fail-closed versus fail-open** as a product policy, not as a library default:
+
+- **Fail-closed (TokenX payments, unique-id enforcement):** if the ledger, uniqueness store, or the breaker itself is unavailable, **reject** the debit. Do not apply, do not tell the client the money moved.
+- **Fail-open to a degraded path (ads ingest, analytics):** if the analytics cluster or optional Kafka topic is unhealthy, **keep accepting** billed clicks and **sample or skip** derived produce. Availability of ingest wins; completeness of the dashboard loses.
+
+Those two phrases are also used for “what if the sidecar crash-loops.” TokenX payment sidecars should fail closed (no silent pass-through that skips uniqueness). Ad click collectors can fail open to a local sampled disk buffer with a bound, then drain—never unbounded memory.
+
+### Fallbacks: stale, default, skip—never fake a debit
+
+Allowed fallbacks: serve a **stale cache** for TokenX token metadata; return a **default** feature flag; **skip** a non-critical notification; mark a dashboard “delayed.” Forbidden: fallback a TokenX debit to HTTP 200 “success,” mint a new unique id in memory and pretend it committed, or acknowledge a billed click that never hit a durable log.
+
+A fallback is a **derived answer**. State the freshness bound (“balances as of last successful read, up to 30 s stale” is still wrong for spendable money; it is acceptable for a public price ticker).
+
+### Admission control: drop, queue, or degrade by priority
+
+At overload you have three honest moves: **drop** (429, produce exception, sampled skip), **queue in a bound** (mesh queue, producer `buffer.memory`, consumer records in flight), or **degrade** (read-only API, delayed settlement, 10% analytics sample). Unbounded queues convert a 2-second Kafka stall into minutes of stale work; the latency lesson covers Little’s Law and why that happens.
+
+Kafka-specific knobs:
+
+- **Producer buffer** plus **`max.block.ms`:** `send()` blocks until there is buffer space or the wait expires, then the client throws. That is admission, not durability. A full buffer does not mean the broker has the record.
+- **Consumer pause:** pause partitions when sink SLO or lag SLO is exceeded. Pause stops **fetch**. You must still **`poll()`** so `max.poll.interval.ms` does not expire; heartbeats alone do not prove a live processing loop (same trap as the consumer-groups lesson). Pause is backpressure, not a drop of already-acked produce, and it does **not** bound broker lag on the paused partitions—producer sample, 429, or `max.block.ms` is what sheds produce.
+- **Lag-based admission at the producer edge:** when applied lag exceeds a bound, refuse or sample **low-priority produce** (debug fields, unsampled analytics) before the consumer dies under a growing log.
+
+Retry **budgets** (how many extra calls a dependency may see) belong with the mesh and the retries lesson. This lesson only requires that retries not steal the ledger pool: a 3× retry on notifications must not take the last ledger thread. Cancel work when the caller deadline expires.
+
+### User-visible degradation, named in the contract
+
+Silent 200s with missing side effects are defects. Name the mode:
+
+- **Read-only:** transfers rejected; balances readable from replica or cache with a stated bound.
+- **Delayed settlement:** the API persists an **intent** (or enqueues a durable command) and tells the user settlement is deferred. The ledger row is **not** implied.
+- **Sampled analytics:** dashboards show a sample and a confidence note; finance still uses the billed-click path.
+
+<ExecutionTimeline
+  title="One TokenX transfer through mesh, bulkheads, and Kafka analytics"
+  steps={[
+    { title: "Admit", detail: "The sidecar enforces deadline, concurrency, and priority. Low-priority debug traffic can 429 while transfer traffic is still accepted.", state: "Mesh owns admission; no ledger write yet.", failure: "An unbounded mesh queue holds expired transfers that still call the ledger after the client is gone." },
+    { title: "Isolate", detail: "The API checks out a ledger-pool permit, inserts the unique event id, and mutates the balance in one database transaction.", state: "The ledger plus event-id table is authoritative. Analytics and notification pools are still unused.", failure: "A shared executor lets a stuck analytics produce hold the thread that should have run the unique-id insert." },
+    { title: "Break or skip", detail: "Notification and analytics calls run in their own pools with their own breakers. An open analytics breaker skips produce and serves the previous dashboard.", state: "Derived views go stale by policy. The debit already committed.", failure: "A fail-open fallback that returns debit success from cache would lie about money." },
+    { title: "Bound the log", detail: "If the breaker is closed, the producer waits up to max.block.ms for buffer space. Consumers pause fetch when applied lag exceeds the SLO but still poll so membership survives; pause does not cap log growth.", state: "Kafka owns the analytics log until retention. Group lag is derived progress.", failure: "Treating a produce timeout as 'the event is durable' duplicates or loses the derived record; the ledger must not be retried as if it had failed." }
+  ]}
+/>
+
+Assumptions (illustrative, not a measured TokenX cluster): API peak 2,000 requests/s; 40% require a ledger hold of 15 ms; 80% attempt an analytics produce; analytics Kafka is down and each blocked produce would otherwise wait a 5 s timeout.
+
+<Calculation label="Shared pool versus bulkhead under a dead analytics topic">
+
+Ledger concurrency: 2,000 req/s × 0.40 × 0.015 s = 12 busy ledger calls on average.
+
+If analytics produce shares that executor and 1,600 calls/s each block 5 s: 1,600 × 5 = 8,000 threads of wait—far beyond any sane pool. The ledger starves even though its own service time is 15 ms.
+
+Isolated analytics pool of 16 plus a breaker that opens after a 50% timeout rate: in-flight analytics waits cap at 16. Ledger occupancy stays ~12. Transfers continue; dashboards go stale.
+
+Ad Click lag gate (separate example): produce 20,000 debug+click records/s, apply 12,000 records/s, surplus 8,000 records/s. Lag after 15 s ≈ 120,000 records. Pause debug partitions at 100,000 lag (~12.5 s of imbalance) so billed-click apply keeps leftover rate. Sampling debug to 10% cuts surplus by 0.9 × debug share; billed facts stay unsampled.
+
+</Calculation>
+
+</UnderTheHood>
+
+<MentalModel title="Ship watertight compartments, then cut non-essential circuits">
+
+Think of a ship with bulkheads: a hole in the analytics hold must not flood the ledger hold. The circuit breaker is the electrician cutting power to a smoking panel so the rest of the ship keeps steering. Cutting power does not put the cargo back in the right crate, and it does not prove a crate was loaded only once.
+
+Admission is the harbormaster: queue a bounded number of barges, turn the rest away, or tell passengers “read-only, no new cargo.” Kafka’s producer buffer is a dock warehouse with a clock (`max.block.ms`). When the warehouse is full, you refuse more boxes; you do not tattoo “delivered” on the box.
+
+Retain: **isolate concurrency, fail closed on money and unique ids, fail open only onto a named degraded derived path, bound every queue, and say out loud what the user lost.**
+
+</MentalModel>
+
+<ArchitectureDiagram title="Mesh admission, bulkheads, Kafka buffer, and degraded derived views" chart={"flowchart LR\n  CLI[Clients] -->|deadline plus priority| MESH[Mesh admission]\n  MESH -->|accepted| API[API HTTP pool]\n  MESH -. reject 429 .-> CLI\n  API --> LP[Ledger bulkhead]\n  API --> NP[Notification bulkhead]\n  API --> AP[Analytics bulkhead]\n  LP --> LED[(Authoritative ledger plus event IDs)]\n  NP -. skip on open circuit .-> SKIP[Skip notifications]\n  AP --> CB[Analytics circuit]\n  CB -->|closed| BUF[Producer buffer]\n  CB -. open sample or skip .-> DASH[(Degraded derived dashboard)]\n  BUF -->|acks=all| KLOG[(Kafka log until retention)]\n  BUF -. max.block.ms timeout .-> SHED[Shed produce]\n  KLOG --> CG[Consumer bulkhead]\n  CG --> DASH\n  CG -. pause on lag .-> KLOG\n  CACHE[(Stale cache fallback)] -.-> API"}>
+
+**Authoritative state:** the TokenX ledger plus unique event ids, and—on the ad path—the billed-click Kafka log (until retention) plus the billed sink. **Derived:** dashboards, notification delivery, debug payloads, and the read cache. **Consistency boundary:** a transfer is committed only at the ledger transaction; analytics offsets are group progress, not proof of money. Solid edges are admitted, in-policy work. Dashed edges are reject, skip, sample, produce timeout, consumer pause, and stale-cache fallback. Recovery is close the breaker after probes succeed, drain paused partitions when apply rate exceeds produce, and never “recover” by writing a success that the ledger did not commit.
+
+<ArchitectureWalkthrough
+  title="What each gate is allowed to shed"
+  stages={[
+    { name: "Admit", owner: "Service-mesh sidecar", state: "Deadline, concurrency, and request class", boundary: "Admission only; the sidecar does not own ledger bytes.", failure: "Fail-open mesh on payments skips unique-id enforcement.", recovery: "Fail-closed on the money path; 429 with retry-after on overload." },
+    { name: "Isolate", owner: "Process bulkheads", state: "Separate permits for TokenX ledger vs analytics produce, and for billed vs debug consumer sinks", boundary: "One hot partition cannot take every consumer worker; API analytics send cannot take the ledger pool.", failure: "A shared consumer pool lets debug apply starve billed-click sink connections; a shared API pool lets analytics send starve ledger inserts.", recovery: "Cap each class in its own process; pause fetch on the hot debug partition and keep polling." },
+    { name: "Break", owner: "Per-dependency circuit", state: "Closed, open, or half-open probe", boundary: "Sheds calls; does not atomically pair Kafka and the database.", failure: "Operators treat open as exactly-once or as dual-write prevention.", recovery: "Keep sink idempotency from the delivery lesson; use the breaker only to stop amplifying failure." },
+    { name: "Bound the log", owner: "Producer buffer and consumer pause", state: "In-flight batches versus applied lag", boundary: "max.block.ms is a wait cap, not an ack. Pause is backpressure, not a drop of prior acks.", failure: "Unbounded buffer.memory or continued fetch on paused partitions while produce is unshed.", recovery: "Timeout produce, sample low-priority keys, pause fetch on debug partitions, keep polling, keep billed/ledger paths." }
+  ]}
+/>
+
+</ArchitectureDiagram>
+
+<RealExamples title="TokenX sheds notifications first; Ad Click samples before it drops billed facts">
+
+**TokenX degradation order (highest sacrifice first).** (1) Drop debug and extra telemetry fields on the produce path. (2) Skip notifications (email, push) via an open breaker and a skip fallback—the user may not get a receipt until replay. (3) Skip or heavily sample analytics produce; the dashboard is a degraded derived view. (4) Enter **delayed settlement**: persist an intent, show “processing,” do not move spendable balance until the ledger transaction commits. (5) Enter **read-only**: refuse new debits and credits; serve balances from a replica or cache only if the product labels them non-spendable. **Never shed unique-id enforcement. Never fallback a debit to success.** If the uniqueness store is down, fail closed.
+
+A TokenX debit that already committed must not be retried as a new debit because analytics produce timed out. The analytics event is a separate, at-least-once derived write; duplicates are fenced with the same `event_id` if you do produce after recovery. That pairing is the delivery lesson, not the breaker.
+
+**Ad Click Aggregator.** Keep the **billed-click path** (the records finance will invoice) on the highest admission class: they continue to the durable topic with the usual acks policy while debug partitions pause. (1) Drop debug fields (user-agent dumps, verbose context) so payload bytes fall. (2) **Sample** non-billed or exploratory clicks (illustrative 10%): dashboards lose precision and cannot reconstruct every impression; fraud research loses tail events; you still have billed facts. (3) Only then drop ingest for the lowest class. A viral campaign is a hot key: isolate its consumer permits so it cannot exhaust workers that apply billed partitions. What is lost when you sample: per-click debug reconstruction, exact uniques on the sampled stream, and any model that assumed 100% exploratory events. What is not lost until you shed billed produce: the invoiceable click log.
+
+Mesh outlier ejection can remove a sick analytics pod without opening the ledger circuit. Do not copy the same retry budget onto both clusters.
+
+<FailureScenario
+  title="Pick the control that matches the invariant"
+  prompt="Analytics Kafka is timing out. A TokenX transfer API still has a healthy ledger. Notification pods are 5xx. A viral ad campaign is pinning one consumer."
+  choices={[
+    { label: "Open analytics and notification breakers", impact: "Transfers keep committing. Dashboards freeze on the last derived view. Receipts are delayed until a later replay. Load into the sick clusters falls.", recovery: "Half-open probes; republish analytics from the ledger outbox or a retained topic. Do not reverse the debit." },
+    { label: "Fail-open debit fallback to stale cache", impact: "Clients observe success while unique-id and balance may not have committed. Double-spend and phantom money become possible.", recovery: "Remove that fallback. Fail closed on the ledger path; keep cache only for non-spendable reads." },
+    { label: "Share one pool so the hot campaign can finish", impact: "The viral Ad Click partition occupies every consumer worker for that process. Billed-click apply queues behind debug apply. A separate TokenX API process is unaffected unless you wrongly shared its ledger pool with analytics produce.", recovery: "Bulkhead billed vs debug consumer sinks; pause fetch on the hot debug partition and keep polling; do not enlarge a shared executor." },
+    { label: "Raise max.block.ms to 5 minutes", impact: "API threads wait in the producer buffer. Little's Law turns a broker stall into a process-wide thread deadlock. Tail latency explodes; retries amplify.", recovery: "Keep a short block timeout, shed low-priority produce, and bound buffer.memory. See the queues lesson." }
+  ]}
+/>
+
+</RealExamples>
+
+<InterviewTraps title="Degradation slogans that fail at IC6">
+
+- **“The circuit breaker gives us exactly-once.”** It stops calls. In-flight produces, consumer replays, and dual owners still happen. Idempotency lives at the sink.
+- **“If payments are down we return 200 from cache so the app feels available.”** That is a forged debit. TokenX fail-closed.
+- **“Fail-open is always more available.”** For ads ingest, yes, onto a sampled path. For unique ids, fail-open skips the invariant.
+- **“One thread pool is simpler.”** Inside one process it couples unrelated classes. A hot Ad Click partition becomes a billed-click outage in that consumer; analytics `send()` on the API becomes a TokenX ledger outage. They are not the same pool unless you named a monolith.
+- **“The producer buffer is our shock absorber.”** Unbounded `buffer.memory` plus long `max.block.ms` is an unbounded queue with extra steps.
+- **“We paused consumers, so those records were dropped.”** Pause stops fetch. Previously acked produces remain in the log until retention. You still poll; heartbeats without poll still trip `max.poll.interval.ms`. Pause does not stop produce, so lag on those partitions can keep growing.
+- **“Load shedding unique-id checks under overload.”** Then overload becomes an integrity incident.
+- **“Silent sampling.”** If finance or a user cannot tell the dashboard is a sample, you have changed the contract without saying so.
+
+</InterviewTraps>
+
+<Tradeoffs title="What you give up when you keep the invariant">
+
+- **Fail-closed versus fail-open:** closed protects money and uniqueness and costs availability; open protects ingest and costs completeness. Pick per dependency, not per cluster default.
+- **Bulkhead count versus operability:** more pools mean more saturation metrics and more ways to mis-size; one pool means a single stuck produce can halt transfers.
+- **Drop versus pause versus delay:** drop loses derived events (unless an outbox retries later); pause grows lag and recovery time but keeps the log; delayed settlement needs an intent store and a user-visible state.
+- **Stale cache versus error:** cache keeps the page up and can serve a spendable number that is wrong; an error is honest and may storm retries—cap those in the retries lesson.
+- **Sampling rate:** 10% analytics is cheap and biased under skew (a hot campaign still dominates the sample unless you stratify); 100% billed facts cost more broker I/O.
+- **Mesh retries versus app retries:** two layers can multiply load into a recovering sink. Give one owner a budget; point remaining retry design at [Retries, dead letters, and replay](/learn/retries-dead-letters-and-replay).
+
+Correctness of TokenX balances is not a knob you trade for a prettier availability graph. Completeness of a dashboard is.
+
+</Tradeoffs>
+
+<KnowledgeCheck
+  question="An analytics circuit breaker opens after a 60% produce-timeout rate. TokenX already committed debit D-44. What is the breaker allowed to claim?"
+  options={[
+    "Exactly-once: D-44 cannot appear twice in Kafka or in the ledger",
+    "The ledger write and the analytics produce were atomic, so opening the breaker rolls both back",
+    "Further analytics calls are shed; D-44 remains committed; a later produce is a derived, at-least-once write that still needs the event id",
+    "Fail-open should now return success for any retry of D-44 from cache without hitting unique-id"
+  ]}
+  correct={2}
+  explanation="Open means stop sending more analytics load. It does not couple Kafka to the database, does not prevent dual writes, and does not authorize a success fallback. The debit stays at the ledger; analytics is a separate derived path."
+/>
+
+<KnowledgeCheck
+  question="A viral campaign partition is saturating a shared consumer executor that also applies billed-click partitions. Which control matches the bulkhead-and-shed model?"
+  options={[
+    "Pause or cap permits on the hot debug partition and keep billed-click workers isolated, even if campaign dashboards lag",
+    "Drop unique-id checks on billed clicks so workers finish faster",
+    "Set max.block.ms to 10 minutes so producers wait until the hot partition drains",
+    "Add members far beyond the partition count so Kafka splits the hot partition across owners"
+  ]}
+  correct={0}
+  explanation="Isolation plus pause sheds or delays the low-priority hot key without discarding billed facts. Unique-id is a TokenX API concern, not this consumer executor. Extra members beyond partition count stay idle; a longer block timeout only enlarges the queue."
+/>
+
+<ScenarioCheck
+  scenario="TokenX mesh latency to the ledger p99 is 8 s. The analytics topic is also on fire. An engineer proposes: open a circuit on the ledger, fail-open, and fallback to 'debit succeeded' from the 30-second balance cache so the iOS app stays green. Notifications already skip. Unique-id enforcement would be bypassed while the circuit is open."
+  question="What should you ship, and what did the proposal violate?"
+  options={[
+    { label: "Ship it: availability of the payment API is the SLO, and the cache is eventually consistent enough for money.", feedback: "Spendable balances are not a derived dashboard. A success fallback forges the ledger and skips uniqueness." },
+    { label: "Fail closed on ledger and unique-id: reject new debits (read-only or delayed-intent). Keep notification skip and analytics skip. Never 200 a debit the ledger did not commit.", feedback: "The violated assumption is that a circuit plus cache can stand in for an authoritative unique write. Breakers shed load; they do not mint money." },
+    { label: "Fail-open the ledger circuit but keep unique-id in the app process memory so ids stay unique until Kafka recovers.", feedback: "Process memory is not the uniqueness store. A restart or a second instance dual-writes." },
+    { label: "Close the analytics breaker only; leave the ledger fail-open because mesh outlier ejection already proved the database is fine.", feedback: "Outlier ejection of an analytics pod says nothing about ledger health. The proposal still returns success without a commit." }
+  ]}
+  correct={1}
+  explanation="Degradation order sheds notifications and analytics first, then delays or refuses settlement. Unique-id and ledger commit are not shed. A circuit breaker that fail-opens onto a cached 'success' is an integrity bug, not graceful degradation."
+/>
+
+<InterviewAnswer>
+
+“I treat graceful degradation as a priority list, not a timeout. Bulkheads are per process: TokenX isolates the ledger pool from analytics produce and notifications; Ad Click isolates billed-click apply from debug apply so a hot partition cannot take every consumer worker. Circuit breakers open on error or timeout and half-open with probes: they shed load, they do not make the sink exactly-once or prevent dual writes. TokenX payments and unique-id checks fail closed; I will not fallback a debit to success. Ads ingest can fail open onto sampled analytics while the billed-click log stays on the high-priority path—you lose debug reconstruction and unsampled dashboard accuracy, not invoices. Admission is drop, bounded queue, or named degrade: mesh 429s, producer buffer plus max.block.ms, consumer pause of fetch with continued poll. Queues stay bounded. User-visible modes are explicit: read-only, delayed settlement with an intent, sampled dashboards. Retries get a budget so they cannot steal the ledger pool; the retries lesson owns the rest.”
+
+</InterviewAnswer>
