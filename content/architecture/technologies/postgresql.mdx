@@ -27,7 +27,7 @@ Place it when the invariant lives in relational constraints (TokenX ledger rows,
 
 A client session sends SQL. The backend process plans, locks, and versions rows with **MVCC**. Readers do not block writers on the same snapshot rules you named (default `READ COMMITTED`). Indexes are derived access paths over heap tuples; an index-only scan still consults visibility. Details: <LessonCrossLink slug="indexes-and-query-execution" />.
 
-A commit records records in the **write-ahead log (WAL)** and flushes according to `synchronous_commit`. The client acknowledgement is “this LSN is durable on the servers you waited for,” not “every replica and every cache agrees.”
+A commit records changes in the **write-ahead log (WAL)** and flushes according to `synchronous_commit`. The client acknowledgement is “this LSN is durable on the servers you waited for,” not “every replica and every cache agrees.”
 
 ### Replication units
 
@@ -40,7 +40,7 @@ A PostgreSQL transaction does not include Redis, Kafka, or HTTP. Cross-store wor
 <ExecutionTimeline
   title="TokenX debit commit on PostgreSQL"
   steps={[
-    { title: "Begin + fence", detail: "Checkout a pool connection. INSERT uniqueness (tenant_id, transfer_id) so retries collide on the key.", state: "Authoritative occupancy of the transfer id.", failure: "Hold the transaction while calling HTTP or Kafka." },
+    { title: "Begin + occupancy key", detail: "Checkout a pool connection. INSERT uniqueness (tenant_id, transfer_id) so retries collide on the key.", state: "Authoritative occupancy of the transfer id.", failure: "Hold the transaction while calling HTTP or Kafka." },
     { title: "Mutate rows", detail: "UPDATE the balance row in the same transaction. Celebrity accounts queue on the row lock.", state: "MVCC versions; other sessions see committed data only.", failure: "Read in one transaction, write in another without the unique key." },
     { title: "WAL flush", detail: "COMMIT waits for local WAL fsync, and for a synchronous standby if configured.", state: "Durability is the flush policy, not the SQL parse.", failure: "synchronous_commit=off while telling the user the transfer is final." },
     { title: "Outbox then response", detail: "Outbox row committed with the debit. Client ACK after COMMIT. Workers are async.", state: "Kafka is derived.", failure: "Produce to Kafka inside the SQL transaction and call that exactly-once." }

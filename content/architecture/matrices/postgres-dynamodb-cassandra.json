@@ -18,7 +18,7 @@
       "product": "PostgreSQL",
       "cells": {
         "workload": "Relational rows, joins, unique constraints, multi-row transactions in one database. Ad-hoc query and reporting on the same model.",
-        "consistency": "Single-primary snapshot isolation (default READ COMMITTED). Replicas are lagged. Linearizable cluster-wide reads are not implied by 'the leader'.",
+        "consistency": "Single-primary SQL isolation you name: default is READ COMMITTED (per-statement snapshots, not snapshot isolation). REPEATABLE READ is SI; SERIALIZABLE is SSI. Replicas lag. Linearizable cluster-wide reads are not implied by 'the leader'.",
         "latency": "Low ms for indexed primary-key lookups in-region. Joins and sequential scans dominate p99. Commit waits on WAL fsync and any synchronous replica.",
         "scaling": "Vertical first. Read replicas for stale-tolerant reads. Write scale needs sharding or partitioning you operate.",
         "failure": "Primary crash: promote a replica after fencing. Async replica promotion can lose acknowledged writes. Split-brain if two writers exist.",
