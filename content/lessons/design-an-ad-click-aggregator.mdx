@@ -1,0 +1,174 @@
+---
+title: "Design an Ad Click Aggregator"
+description: "Design billed-click ingest with keyed uniqueness, event-time windows, hot campaigns, and replay that never becomes a TokenX ledger."
+module: 7
+moduleTitle: "Architecture & Mock Interviews"
+order: 8
+duration: 46
+difficulty: "Advanced"
+tags:
+  - ad-click
+  - ingestion
+  - windows
+  - deduplication
+  - replay
+objectives:
+  - "Separate billed click facts from derived campaign windows and serving caches"
+  - "Size ingest, uniqueness horizon, and hot-key fan-in with units"
+  - "Choose watermarks and lateness without treating Kafka offsets as event time"
+  - "State fail-open ingest versus TokenX fail-closed money, and who owns DLQ replay"
+---
+
+<BigPicture title="One log of facts; many rebuildable totals">
+
+Prompt: **Design an Ad Click Aggregator** that accepts clicks, deduplicates them, windows them for billing and reporting, survives hot campaigns, and can replay.
+
+The **authoritative billed fact** is an append-only click record with a stable `click_id` (or equivalent) inside a declared uniqueness horizon. Minute and campaign totals, fraud scores, and operator dashboards are **derived**. Serving caches are even further derived.
+
+This is not TokenX. A duplicate click is a billing dispute. A duplicate debit is minted money. Fail **open** enough to keep keyed ingest when a limiter store dies; fail **closed** on uniqueness only where you have a durable unique index. See [graceful degradation](/learn/graceful-degradation), [time-series storage](/learn/time-series-and-append-only-storage), and [stream windows](/learn/stream-processing-and-windows).
+
+Kafka durability for the log, if you use one: RF=3, `acks=all`, `min.insync.replicas=2`, idempotent producer, ISR-only election. Partition key `campaign_id` preserves **append order per partition**, not event-time or causal order ([ordering](/learn/ordering-and-event-keys)).
+
+</BigPicture>
+
+<UnderTheHood title="Ingest, unique, window, then the celebrity campaign">
+
+### Capacity (illustrative)
+
+500 million billed clicks/day, 12× peak around a sports final, 400 B encoded click, RF=3, 50,000 campaigns, one campaign at 8% of traffic.
+
+<Calculation label="Ad Click planning envelope">
+Average ingest = 500e6 / 86,400 ≈ 5,790 clicks/s
+
+Peak ingest ≈ 69,500 clicks/s
+
+Raw bytes/day ≈ 500e6 × 400 B ≈ 200 GB; with RF=3 ≈ 600 GB/day before indexes and compression
+
+Hot campaign at 8% of peak ≈ 5,560 clicks/s on one key — size the partition and aggregator, not the mean
+</Calculation>
+
+<InteractiveCalculation mode="event-ingress" title="Stress billed ingest volume" initialRate={500000000} initialPeakFactor={12} initialEventBytes={400} initialReplication={3} />
+
+### Path
+
+1. Edge authenticates the pixel or SDK, applies [rate limiting](/learn/rate-limiting) per IP and per campaign (admission, not uniqueness).
+2. Ingest API assigns `click_id` if the client did not, records ingestion time, and appends to the log.
+3. A uniqueness store (`UNIQUE(click_id)` inside a 7-day horizon, illustrative) rejects duplicates. Horizon must cover the replay window you promise.
+4. Stream job assigns **event-time** windows with a watermark and lateness bound. Broker offsets are not business time.
+5. Sinks write versioned aggregates keyed by `(campaign_id, window)`. Idempotent upsert on replay.
+6. Serving reads **derived** counters with an explicit staleness SLO.
+
+Hot campaigns: do not require every click to hit one lock in the serving DB. Pre-aggregate in the stream job; shard the uniqueness store by `click_id`, not by celebrity campaign, if the campaign key is the hotspot.
+
+<ExecutionTimeline
+  title="Click from pixel to billed window"
+  steps={[
+    { title: "Admit", detail: "Edge rate-limits and forwards a click with click_id, campaign_id, event_time, ingestion_time.", state: "Limiter is admission.", failure: "Limiter Redis down: ads fail-open with a local cap, not a 200 TokenX debit.", recovery: "Keep keyed append if uniqueness store is up." },
+    { title: "Append", detail: "Producer acks=all to minISR=2; click lands on campaign or click_id partition per your skew plan.", state: "Log is the billed fact stream.", failure: "Timeout UNKNOWN: retry with same click_id.", recovery: "Unique index or idempotent produce+inbox." },
+    { title: "Dedupe", detail: "Sink inserts click_id; duplicate is no-op.", state: "Uniqueness horizon owns 'already billed'.", failure: "Horizon shorter than replay mints a second bill.", recovery: "Horizon ≥ replay and restore window." },
+    { title: "Window", detail: "Job places the click in an event-time tumbling minute; late data follows a named bound.", state: "Aggregate is derived.", failure: "Closing on processing time undercounts late phones.", recovery: "Watermark plus allowed lateness or side-output." }
+  ]}
+/>
+
+Retries: 429 is proven reject; timeout is UNKNOWN; do not park UNKNOWN into a TokenX ledger. DLQ has an **owner** ([retries and replay](/learn/retries-dead-letters-and-replay)).
+
+</UnderTheHood>
+
+<MentalModel title="The receipt is the click; the dashboard is a rumor until rebuilt">
+
+Think warehouse receiving: each parcel has a tracking number (`click_id`). Hourly totals are clipboard math you can redo from the dock log. Do not let the clipboard authorize TokenX spending.
+
+</MentalModel>
+
+<ArchitectureDiagram title="Billed click log versus derived campaign windows" chart={"flowchart LR\n  Px[Pixel or SDK] --> Edge[Admit and rate limit]\n  Edge --> Ing[Ingest API]\n  Ing --> Log[(Authoritative click log)]\n  Log --> Uniq[(click_id uniqueness)]\n  Log --> Job[Window job]\n  Job --> Agg[(Derived window totals)]\n  Agg --> Svc[Serving API]\n  Log -. replay rebuilds .-> Job\n  Edge -. limiter down fail-open local .-> Ing\n  Uniq -. duplicate no-op .-> Ing"}>
+
+The log plus uniqueness horizon own billed identity. Windows, serving, and fraud scores rebuild. Dashed edges are degrade, reject-duplicate, or replay—not a second source of truth.
+
+<ArchitectureWalkthrough
+  title="Who owns the click"
+  stages={[
+    { name: "Edge", owner: "CDN/API", state: "Rate budget, TLS", boundary: "Admission.", failure: "Burst or limiter outage.", recovery: "Fail-open local cap for keyed ads ingest; never forge TokenX 200s." },
+    { name: "Log", owner: "Kafka-class log", state: "Append order per partition", boundary: "Durable facts under named acks/ISR.", failure: "ISR shrinks below minISR.", recovery: "Producer retries; do not silently ack." },
+    { name: "Uniqueness", owner: "Store with horizon", state: "click_id set", boundary: "Duplicate billing defense.", failure: "Store down.", recovery: "Name the degrade: pause billing vs accept at-least-once risk with later reconcile." },
+    { name: "Windows", owner: "Stream job", state: "Versioned aggregates", boundary: "Derived.", failure: "Late data after watermark.", recovery: "Allowed lateness or compensating version bump." }
+  ]}
+/>
+
+</ArchitectureDiagram>
+
+<RealExamples title="Sports final, replay, and stolen TokenX pool">
+
+**Hot campaign.** 8% of peak on one `campaign_id` partition overloads a single aggregator task. Split uniqueness by `click_id`; keep a campaign recent-list for serving; do not make the serving row the billed authority.
+
+**Replay after a bad deploy.** Replay the log from a stored offset. Aggregates must upsert by deterministic key. Auto-replay **committed** segments only.
+
+**Shared thread pool with TokenX.** Ads steal ledger workers. That is a bulkhead bug, not “efficiency.”
+
+<FailureScenario
+  title="Ad Click degraded modes"
+  prompt="What remains billed-true?"
+  choices={[
+    { label: "Serving cache empty", impact: "Dashboards miss; billed log still complete.", recovery: "Rebuild from windows or log." },
+    { label: "Uniqueness store lost", impact: "Replay may double-count bills.", recovery: "Restore uniqueness snapshot or recompute from log if click_id is on the record; pause invoices until reconciled." },
+    { label: "Watermark too aggressive", impact: "Late mobile clicks drop from the minute.", recovery: "Raise lateness; version the aggregate; do not rewrite the raw log." },
+    { label: "Limiter Redis down", impact: "Admission is degraded.", recovery: "Local fail-open cap for ingest; TokenX stays fail-closed on its own limiter." }
+  ]}
+/>
+
+</RealExamples>
+
+<InterviewTraps title="IC6 follow-ups">
+
+- What is authoritative: the counter or the click record?
+- Why is campaign_id a dangerous Kafka key at 8% heat?
+- Event time vs processing time vs broker timestamp?
+- Who owns DLQ, and what is never auto-replayed?
+- How is this fail-open policy different from TokenX?
+- How do you prove an invoice from the log?
+
+</InterviewTraps>
+
+<Tradeoffs title="Log-first versus counter-first">
+
+**Log + uniqueness + derived windows:** replayable audit; operational lag and watermark policy.
+
+**Direct counter increment:** cheap dashboards; uniqueness and replay become folklore.
+
+**Fail-open ingest:** revenue continuity; overload and duplicate risk if uniqueness is also down.
+
+**Tight watermarks:** faster close; undercount late devices.
+
+</Tradeoffs>
+
+<KnowledgeCheck
+  question="A stream job emits campaign totals. Kafka is replayed after a bug. What must be true?"
+  options={[
+    "Totals are authoritative, so skip the log",
+    "Sinks upsert versioned aggregates by deterministic window keys; the click log remains the billed fact",
+    "Use processing-time windows so replay is identical",
+    "Share TokenX serializable transactions so clicks are exactly-once globally"
+  ]}
+  correct={1}
+  explanation="Windows are derived. Replay safety is idempotent sinks plus uniqueness on click_id, not a money protocol."
+/>
+
+<ScenarioCheck
+  scenario="Limiter Redis dies during a sports final. TokenX and Ad Click share a cluster. A teammate wants both products to fail-open so ads keep selling and transfers keep flowing."
+  question="What is the defensible split?"
+  options={[
+    { label: "Ads ingest may use a local degraded cap; TokenX transfers fail-closed on a claimed abuse cap; separate bulkheads.", feedback: "Money and billed clicks have opposite default degrade policies." },
+    { label: "Fail-open both; uniqueness is optional at peak.", feedback: "TokenX uniqueness is conservation, not optional." },
+    { label: "Fail-closed both, including dropping all billed clicks.", feedback: "Ads often choose availability of keyed ingest; that is a named product choice, not a TokenX rule." },
+    { label: "Pause Kafka ISR election until Redis returns.", feedback: "ISR is a broker durability path, not a limiter." }
+  ]}
+  correct={0}
+  explanation="Keep bulkheads and opposite fail defaults."
+/>
+
+<InterviewAnswer>
+
+“I treat billed clicks as an append-only fact log with a stable click_id and a uniqueness horizon at least as long as replay. At 500 million clicks per day and a 12× peak I plan about 70 thousand events per second and size the hot campaign explicitly.
+
+Ingest admits with rate limits, appends with Kafka acks=all and minISR=2, dedupes by click_id, and computes event-time windows with a watermark and lateness bound. Dashboards are derived and rebuildable. Timeouts retry the same click_id. I fail-open ads admission when the limiter store dies, I never share that pool with TokenX, and I do not call broker order event time.”
+
+</InterviewAnswer>

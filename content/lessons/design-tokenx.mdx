@@ -1,0 +1,197 @@
+---
+title: "Design TokenX"
+description: "Defend a custodial transfer ledger in interview time: exclusive terminals, tenant-scoped idempotency, outbox after commit, and no auto-replay of UNKNOWN."
+module: 7
+moduleTitle: "Architecture & Mock Interviews"
+order: 9
+duration: 48
+difficulty: "Advanced"
+tags:
+  - TokenX
+  - ledger
+  - idempotency
+  - fencing
+  - settlement
+objectives:
+  - "Scope TokenX to balances, transfers, and history with named non-goals"
+  - "Place conservation inside one serializable ledger or exclusive shard terminals"
+  - "Resolve client timeouts with tenant-scoped keys, not a second debit"
+  - "Keep analytics, notifications, and Web3 overlays derived from committed journals"
+---
+
+<BigPicture title="The interview is conservation under ambiguity">
+
+This mock is the full TokenX prompt. [Driving a System Design Interview](/learn/driving-a-system-design-interview) already walked the 45-minute loop on the same product. Here you must survive follow-ups: cross-shard terminals, fencing, restore, and a Web3 comparison that does not smuggle linearizability.
+
+Prompt: **Design TokenX**, a custodial service that creates transfers, reads spendable balances, and lists history. One successful transfer debits and credits **exactly once inside the ledger transaction** (or an equivalent exclusive-terminal protocol). Total supply is conserved. A wallet cannot spend more than `available`.
+
+**In scope:** authenticated `POST /v1/transfers` with `Idempotency-Key`, status reads, authoritative balances, cursor history, regional DR.
+
+**Out of scope unless asked:** public-chain consensus, AMM trading, smart-contract custody, multi-region active-active last-write-wins balances.
+
+Uniqueness is `UNIQUE (tenant_id, operation, idempotency_key)` plus a request hash. It is not a global UUID slogan. See [idempotency](/learn/idempotency-and-deduplication) and [transactions across boundaries](/learn/transactions-across-boundaries).
+
+</BigPicture>
+
+<UnderTheHood title="Numbers, one-region ledger, then the shard fork">
+
+### 1. Capacity (illustrative, labeled)
+
+Assume 50 million wallets, 20 million transfers/day, 20× market peak, 1 KB durable transfer+ledger bytes before indexes, 10 balance reads per transfer.
+
+<Calculation label="TokenX planning envelope">
+Average writes = 20,000,000 / 86,400 ≈ 231 transfers/s
+
+Peak writes ≈ 4,630 transfers/s
+
+Peak authoritative reads ≈ 46,300/s
+
+Raw growth ≈ 20 GB/day; one year ≈ 7.3 TB before indexes, RF, and backups
+</Calculation>
+
+At this peak, a quorum-backed relational or distributed-SQL ledger with partitioned tables is simpler than a homemade cross-shard money protocol. Shard only when **measured** lock wait or commit p99 says so. Virtual `wallet_bucket` keys now; protocol later.
+
+<InteractiveCalculation mode="event-ingress" title="Stress TokenX durable volume" initialRate={20000000} initialPeakFactor={20} initialEventBytes={1000} initialReplication={3} />
+
+### 2. Authoritative schema
+
+- `wallet_balances(wallet_id, asset, available, version)` — spend authorization.
+- `transfers(tenant_id, idempotency_key, request_hash, transfer_id, status)` — command identity.
+- `ledger_entries(transfer_id, account_id, asset, delta, sequence)` — balanced immutable lines.
+- `outbox(...)` — committed integration intent in the **same** database transaction.
+
+Same-region transfer: one serializable transaction, deterministic wallet lock order, then outbox. Kafka is **after** commit. RF and Kafka producer assumptions for the integration log: RF=3, `acks=all`, `min.insync.replicas=2`, idempotent producer, ISR-only election ([Kafka delivery](/learn/kafka-delivery-and-failure)).
+
+### 3. Timeout is not failure
+
+A lost 200 after commit is **UNKNOWN to the client**. Replay the same tenant-scoped key. Auto-replay of a signed **request log** after restore is forbidden: replay only **committed journals**, then fence writes ([backup and DR](/learn/backup-restore-and-disaster-recovery)).
+
+### 4. Cross-shard exclusive terminals
+
+When two wallets leave one lock domain, conservation is a saga, not two independent UPDATEs.
+
+- Shard A: unique insert `RESERVED` on `transfer_id`, then exclusive `FINALIZED | RELEASED`.
+- Shard B: unique row `ABSENT → CREDITED | CANCELLED`. Credit and cancel race; the winner is terminal. Delayed credit after `CANCELLED` is **rejected**. Delayed cancel after `CREDITED` cannot reverse the credit.
+- Coordinator timeouts persist `UNRESOLVED` and **query B**. Never treat a lost RPC as cancel.
+
+Fencing: a resource retains a durable high-water epoch; lease expiry is not immediate exclusion ([locks and leases](/learn/distributed-locks-and-leases)). Raft reads need current-term ReadIndex or a bounded lease, not “I once committed a no-op” ([consensus](/learn/consensus-and-leader-election)).
+
+<ExecutionTimeline
+  title="Cross-shard TokenX under reordered messages"
+  steps={[
+    { title: "Reserve A", detail: "Atomic unique insert RESERVED for transfer_id T on source shard.", state: "A holds the amount; B has no spendable credit.", failure: "Two RESERVED rows would mint dual spends.", recovery: "Insert-if-absent; duplicates see the first row." },
+    { title: "Credit B", detail: "B commits CREDITED or loses to CANCELLED in one compare-and-set.", state: "Destination terminal is exclusive.", failure: "Timeout is not a ledger fact.", recovery: "Coordinator stays UNRESOLVED until B's row is known." },
+    { title: "Finalize or release A", detail: "CREDITED drives FINALIZED; CANCELLED drives RELEASED.", state: "Supply conserved.", failure: "Releasing on timeout while B credited mints money.", recovery: "Query, never guess." },
+    { title: "Publish", detail: "Outbox relay publishes at-least-once after each shard's local commit.", state: "Kafka is derived integration.", failure: "Consumer replay must not debit again.", recovery: "Inbox uniqueness on event_id." }
+  ]}
+/>
+
+</UnderTheHood>
+
+<MentalModel title="Money is a sealed envelope; chatty RPCs are not">
+
+Local TokenX is one envelope: balances, unique command, balanced entries, outbox. Cross-shard TokenX is two envelopes plus a checklist that is allowed to say `UNRESOLVED`. Notifications are photocopies.
+
+Retain: **invariant first, mechanism second, vendor third.** “Use Kafka” is not conservation. “Use blockchain” is not linearizability.
+
+</MentalModel>
+
+<ArchitectureDiagram title="TokenX ledger versus derived TokenX overlay" chart={"flowchart LR\n  C[Client] -->|idempotency key| API[Transfer API]\n  API -->|serializable txn| L[(Authoritative ledger)]\n  L --> Bal[(Balances)]\n  L --> Ent[(Ledger entries)]\n  L --> Ob[(Outbox)]\n  Ob --> Rel[Relay]\n  Rel --> K[(Kafka log)]\n  K --> N[Notifications]\n  K --> An[(Analytics)]\n  API -->|status read| L\n  L -. quorum loss reject writes .-> API\n  K -. replay rebuilds derived .-> An"}>
+
+The ledger owns spendable state. Kafka, charts, and any Web3 **indexer** are derived. A public-chain overlay, if asked, must name finality, reorg, and custody; it does not replace exclusive terminals.
+
+<ArchitectureWalkthrough
+  title="Defend every TokenX boundary"
+  stages={[
+    { name: "Edge", owner: "Gateway", state: "Auth, rate budget, deadline", boundary: "Admission only. Rate limit is not uniqueness.", failure: "Client disconnects after forward.", recovery: "Retry same key; GET transfer status." },
+    { name: "Ledger", owner: "Quorum DB or shard pair", state: "Balances, terminals, outbox", boundary: "Serializable local txn or exclusive CREDITED/CANCELLED.", failure: "Quorum loss or UNRESOLVED query.", recovery: "Reject new spends; query B; fence restored replicas." },
+    { name: "Integration", owner: "Outbox plus Kafka", state: "At-least-once events", boundary: "After ledger commit.", failure: "Broker down; consumer replay.", recovery: "Outbox age alerts; inbox dedupe; never authorize spending from the log." },
+    { name: "Overlay", owner: "Indexers and wallets UI", state: "Labeled-stale views", boundary: "Derived.", failure: "Corrupt analytics.", recovery: "Drop and replay committed journals only." }
+  ]}
+/>
+
+</ArchitectureDiagram>
+
+<RealExamples title="Hot wallet, delayed credit, and a fake chain shortcut">
+
+**Hot exchange wallet.** Hash sharding does not split one wallet's serial invariant. Batch deposits, sub-balances with explicit semantics, or a single-writer queue. Each changes freshness.
+
+**Delayed credit after cancel.** B already wrote `CANCELLED`. A late credit must lose the compare-and-set. Releasing A is then safe. The reverse (credit then cancel) keeps `CREDITED` and finalizes A.
+
+**Interviewer offers LWW multi-region balances.** Last-write-wins can erase a debit. That is not TokenX. Use regional ownership, escrow, or a globally consistent protocol.
+
+<FailureScenario
+  title="Pick a TokenX failure"
+  prompt="What does the architecture still promise?"
+  choices={[
+    { label: "Client timeout after commit", impact: "Client sees UNKNOWN; ledger may already hold SUCCEEDED.", recovery: "Replay tenant-scoped key and hash; do not open a second transfer_id." },
+    { label: "Coordinator timeout before B is known", impact: "A stays RESERVED; workflow UNRESOLVED.", recovery: "Query B. Never auto-release." },
+    { label: "Kafka unavailable", impact: "Transfers remain correct; notifications lag.", recovery: "Relay retries; consumers stay idempotent." },
+    { label: "Restore from request logs only", impact: "UNKNOWN outcomes look like missing transfers.", recovery: "Replay committed journals only; fence writes before serving." }
+  ]}
+/>
+
+</RealExamples>
+
+<InterviewTraps title="IC6 follow-ups">
+
+- Where is conservation enforced during quorum loss?
+- Why is uniqueness tenant-scoped?
+- What does a fencing token survive that a TTL does not?
+- Why is ReadIndex or a lease required for follower/leader reads?
+- When do you shard, and which protocol preserves supply?
+- Why is a signed HTTP log insufficient after restore?
+- How is a public chain different from this ledger (finality, reorg, custody)?
+
+Weak answers: “Kafka exactly-once,” independent balance writes, or “blockchain so we do not need transactions.”
+
+</InterviewTraps>
+
+<Tradeoffs title="Why this design, and when it stops">
+
+**Serializable one-region ledger:** simplest proof; write availability tracks quorum.
+
+**Exclusive-terminal saga:** scales lock domains; adds `UNRESOLVED` operations and query-on-timeout.
+
+**Outbox + Kafka:** decouples notify/analytics; at-least-once and lag are mandatory.
+
+**Fail-closed writes:** protects money; Ad Click billed ingest may fail-open locally ([graceful degradation](/learn/graceful-degradation)). Do not share one bulkhead.
+
+Wrong when regulators forbid one region, or measured commit capacity is exhausted without an invariant-safe migration ([migration at scale](/learn/migration-at-scale)).
+
+</Tradeoffs>
+
+<KnowledgeCheck
+  question="The coordinator times out after A is RESERVED and before it knows B's row. What is the legal next step?"
+  options={[
+    "Release A immediately so the user can retry",
+    "Persist UNRESOLVED and query B; CREDITED finalizes A and CANCELLED releases A",
+    "Insert a second transfer_id so the retry is clean",
+    "Treat Kafka consumer lag as proof the credit never happened"
+  ]}
+  correct={1}
+  explanation="Timeout is not a destination terminal. Only B's committed CREDITED or CANCELLED row authorizes A's exclusive fork."
+/>
+
+<ScenarioCheck
+  scenario="Ops restores a TokenX replica from application request logs because the ledger snapshot is a day old. They want to auto-replay every signed POST."
+  question="Which response is IC6-correct?"
+  options={[
+    { label: "Refuse auto-replay of request-only outcomes; replay committed journals; fence writes; treat the rest as UNKNOWN until reconciled.", feedback: "Request logs are not proof of commit." },
+    { label: "Replay every POST because idempotency keys make it exactly-once globally.", feedback: "Keys do not recreate missing commits, and uniqueness is tenant-scoped, not cosmic." },
+    { label: "Serve analytics balances until the ledger catches up.", feedback: "Derived views cannot authorize spending." },
+    { label: "Switch to last-write-wins multi-region so restore is unnecessary.", feedback: "LWW can drop a debit." }
+  ]}
+  correct={0}
+  explanation="Only committed journals are auto-replayable. Fence before new writes."
+/>
+
+<InterviewAnswer>
+
+“I scope TokenX to custodial transfers, spendable balances, and history in one authoritative region. Invariants are conservation, no overspend, and one effect per tenant-scoped idempotency key plus request hash. At 20 million transfers per day and a 20× peak I plan about 4.6 thousand writes per second.
+
+Same-wallet-domain transfers use one serializable ledger transaction: claim the key, lock wallets in a stable order, write balanced entries, commit the outbox. Timeouts replay the key. Kafka is at-least-once after commit and never authorizes spending.
+
+If I must split shards, A reserves uniquely, B is exclusively CREDITED or CANCELLED, and a coordinator timeout stays UNRESOLVED until B is queried. I fail closed on ledger quorum loss, fence restored replicas, and I would not shard until measurements require an invariant-safe protocol.”
+
+</InterviewAnswer>

@@ -1,0 +1,177 @@
+---
+title: "Design a File Storage Service"
+description: "Design upload, metadata authority, immutable bytes, sharing, and recovery without treating object storage as a transaction coordinator."
+module: 7
+moduleTitle: "Architecture & Mock Interviews"
+order: 7
+duration: 44
+difficulty: "Advanced"
+tags:
+  - object-storage
+  - multipart
+  - metadata
+  - sharing
+  - recovery
+objectives:
+  - "Split immutable object bytes from an authoritative metadata database"
+  - "Quantify multipart parts, egress, and incomplete-upload garbage"
+  - "Make finalize atomic so clients never see partial bytes as AVAILABLE"
+  - "Explain sharing, virus-scan, and restore without rewriting TokenX money into S3"
+---
+
+<BigPicture title="Bytes in the warehouse; the ledger is the paper">
+
+Prompt: **Design a file storage service** (Dropbox/Drive-class): upload, download, list, share, sync, recover.
+
+**Authoritative control plane:** metadata DB — owner, ACL, current version pointer, size, checksum, scan status, `UPLOADING | AVAILABLE | TOMBSTONED`.
+
+**Authoritative data plane:** object store — immutable keys such as `tenant/object_id/version`. Replacing content writes a **new** version; one metadata transaction swings the pointer.
+
+Clients upload through short-lived signed URLs. The API never proxies terabytes. TokenX statements and Ad Click creatives may live here; spendable balances and billed click uniqueness do **not**. See [object storage](/learn/object-storage-and-large-files) and [CDNs](/learn/cdns-and-edge-architecture).
+
+</BigPicture>
+
+<UnderTheHood title="Multipart, finalize, then the races">
+
+### Capacity (illustrative)
+
+50 million users, 1 billion objects, mean object 2 MB, 5% daily read, 0.5% daily write, 16 MB multipart parts, 10 Gbps NIC for a cache miss path (planning, not a promise).
+
+<Calculation label="Storage and part counts">
+Logical bytes = 1e9 × 2 MB = 2 PB
+
+With 3-way erasure or RF-equivalent storage ≈ 2–3× depending on class — name the class, do not invent 3× without a code
+
+A 2 GB video at 16 MB parts = 128 parts; incomplete uploads need a lifecycle abort
+
+Daily write bytes = 0.5% × 2 PB = 10 TB/day ingest before replication
+</Calculation>
+
+The event-ingress widget is calibrated for log records in the 100–5,000 B range, not 2 MB objects. Keep object-byte math in the static calculation above; do not pretend a Kafka-style envelope is a multipart part.
+
+### Upload protocol
+
+1. Authenticate; create metadata row `UPLOADING` with unguessable key, max bytes, content policy, expiry.
+2. Return signed part URLs constrained to that key and part range.
+3. Client PUTs parts; each part has a checksum.
+4. `CompleteMultipart` verifies parts, size, checksum; malware scan may be async with `SCANNING`.
+5. One metadata transaction: `UPLOADING → AVAILABLE` (or `REJECTED`). Readers never follow a pointer to a partial object.
+
+Download: authz in metadata, then signed GET or CDN with a cache key that includes version. Purge on new version. Private TokenX documents: `private, no-store` at the edge.
+
+Sync: device checkpoints a **cursor per folder**, not “download everything.” Conflicts: last-writer-wins on office docs is a product choice you must name; it is illegal for TokenX ledger files.
+
+<ExecutionTimeline
+  title="Safe multipart finalize"
+  steps={[
+    { title: "Initiate", detail: "Metadata UPLOADING plus signed parts with expiry and byte cap.", state: "No AVAILABLE pointer yet.", failure: "Client abandons.", recovery: "Lifecycle abort incomplete uploads; metadata TTL." },
+    { title: "Put parts", detail: "Direct to object store; checksum per part.", state: "Bytes exist but are not published.", failure: "Part checksum mismatch.", recovery: "Retry that part only." },
+    { title: "Finalize", detail: "Verify composition; optional scan; one DB commit to AVAILABLE.", state: "Pointer swing is the publish.", failure: "Crash after object complete, before DB.", recovery: "Client retries complete; idempotent finalize on object_id+version." },
+    { title: "Read", detail: "Authz then signed GET or CDN versioned key.", state: "CDN is derived.", failure: "Stale CDN after new version.", recovery: "Version in cache key; purge is best-effort." }
+  ]}
+/>
+
+Sharing: ACL rows in metadata, not in the object header. Revoke is a metadata write plus short-lived URL expiry; CDN may serve until TTL unless you purge.
+
+DR: object versioning + metadata PITR. Restore testing required ([backup](/learn/backup-restore-and-disaster-recovery)). Orphan bytes without metadata are garbage, not user files.
+
+</UnderTheHood>
+
+<MentalModel title="Library card catalog versus the stacks">
+
+The catalog (metadata) says which book is current and who may read it. The stacks (object store) hold immutable copies. Publishing is changing the catalog card, not scribbling on a book in place.
+
+</MentalModel>
+
+<ArchitectureDiagram title="Metadata authority and immutable object bytes" chart={"flowchart LR\n  Cl[Client] --> API[Control API]\n  API --> Meta[(Authoritative metadata DB)]\n  API -->|signed URLs| Obj[(Object store bytes)]\n  Cl -->|PUT parts| Obj\n  Meta -->|AVAILABLE pointer| Obj\n  Obj --> CDN[CDN derived]\n  CDN --> Cl\n  Obj -. abort incomplete .-> GC[Lifecycle GC]\n  Meta -. revoke ACL .-> API"}>
+
+Dashed edges are GC and revoke. CDN is never the ACL source. Object store is not a TokenX transaction manager.
+
+<ArchitectureWalkthrough
+  title="Control versus data plane"
+  stages={[
+    { name: "Control API", owner: "Stateless app", state: "Auth session", boundary: "Issues leases as signed URLs.", failure: "App crash mid-initiate.", recovery: "No AVAILABLE row; retry initiate." },
+    { name: "Metadata", owner: "Transactional DB", state: "ACL, version pointer, status", boundary: "Publish and sharing.", failure: "DB quorum loss.", recovery: "Fail closed on new publishes; reads may be stale if you allow it—say so." },
+    { name: "Object store", owner: "Blob service", state: "Immutable versions", boundary: "Durability of bytes.", failure: "Partial MPU.", recovery: "Abort rules; checksum on complete." },
+    { name: "CDN", owner: "Edge cache", state: "Versioned cache keys", boundary: "Derived.", failure: "Hit after revoke within TTL.", recovery: "Short URL TTL; purge; never cache TokenX private docs." }
+  ]}
+/>
+
+</ArchitectureDiagram>
+
+<RealExamples title="Resume, share revoke, ransomware">
+
+**Resume:** client retries remaining parts; finalize is idempotent on the version id.
+
+**Revoke a shared link:** metadata deletes the token; signed URLs expire in minutes; CDN may still hit until TTL.
+
+**Ransomware on a client:** object versioning plus time-hold; restore is metadata pointer rollback plus byte versions, not “undelete Kafka.”
+
+<FailureScenario
+  title="File service failures"
+  prompt="What remains true?"
+  choices={[
+    { label: "Incomplete multipart", impact: "Bytes billed until abort; users must not see AVAILABLE.", recovery: "Lifecycle abort; metadata stays UPLOADING or expires." },
+    { label: "CDN stale after replace", impact: "Readers may see old version until TTL or purge.", recovery: "Version in cache key; document TTL." },
+    { label: "Metadata restored without objects", impact: "Pointers dangle.", recovery: "Restore both planes; never invent bytes." },
+    { label: "Treat S3 as TokenX ledger", impact: "No serializable conservation.", recovery: "Keep money in the ledger DB." }
+  ]}
+/>
+
+</RealExamples>
+
+<InterviewTraps title="IC6 follow-ups">
+
+- Why signed URLs instead of streaming through the API?
+- What is atomic at finalize?
+- How do you bound orphaned storage cost?
+- Dedup identical bytes: content-hash sharing vs tenant isolation and legal holds?
+- Sync conflict vs TokenX conservation?
+- RPO/RTO for metadata versus blobs?
+
+</InterviewTraps>
+
+<Tradeoffs title="Convenience versus isolation">
+
+**Immutable versions + pointer:** cheap rollback; storage growth.
+
+**In-place overwrite:** smaller bill; no restore granularity.
+
+**CDN:** redirect p99; revoke delay.
+
+**Client-side encryption:** privacy; loss of server-side search and scan.
+
+</Tradeoffs>
+
+<KnowledgeCheck
+  question="The object store finishes all parts, then the API crashes before metadata becomes AVAILABLE. The user retries Complete. What should happen?"
+  options={[
+    "Leave the file visible because bytes exist",
+    "Idempotent finalize: verify parts and commit AVAILABLE once; readers never used a partial pointer",
+    "Delete the object and require a new upload with a new id always",
+    "Publish through the CDN first so the DB can catch up"
+  ]}
+  correct={1}
+  explanation="Publish is the metadata transaction. Finalize must be retry-safe without exposing partial objects."
+/>
+
+<ScenarioCheck
+  scenario="A PM wants file sync last-write-wins for TokenX monthly statements stored in this service."
+  question="What do you defend?"
+  options={[
+    { label: "Statements may use versioned objects, but spendable balances stay in the ledger; LWW must not apply to money.", feedback: "Separate the blob product from conservation." },
+    { label: "S3 versioning is linearizable money.", feedback: "Object stores do not run TokenX terminals." },
+    { label: "Overwrite in place to save storage on statements and balances alike.", feedback: "Balances are not files." },
+    { label: "CDN HIT of a statement is an authoritative debit receipt.", feedback: "CDN is derived; TokenX receipts are ledger rows." }
+  ]}
+  correct={0}
+  explanation="File LWW is a product choice for documents, not for the ledger."
+/>
+
+<InterviewAnswer>
+
+“I split a file product into a transactional metadata database and an immutable object store. Upload creates an UPLOADING row and signed multipart URLs. Finalize verifies checksums and swings a version pointer in one metadata transaction so readers never see partial bytes. CDN and search indexes are derived from that pointer.
+
+I size storage from object count times mean size, I abort incomplete multipart, and I expire signed URLs so revoke is metadata plus TTL. TokenX may store statements here; it does not store balances here.”
+
+</InterviewAnswer>

@@ -1,0 +1,222 @@
+---
+title: "Design a Rate Limiter"
+description: "Compose a distributed admission-control system: placement, Redis counters, hot-reload policy, fairness, and named Redis-down behavior for TokenX versus Ad Click."
+module: 7
+moduleTitle: "Architecture & Mock Interviews"
+order: 5
+duration: 40
+difficulty: "Advanced"
+tags:
+  - rate limiter
+  - mock interview
+  - distributed counters
+  - fairness
+  - admission control
+objectives:
+  - Place one user-visible limiter at the edge, gateway, service, or mesh
+  - Shard hot Redis counters without treating INCR as a ledger
+  - Hot-reload policy as a versioned snapshot shared by enforcement hops
+  - "Name Redis-down policy: TokenX fail-closed versus Ad Click fail-open ingest"
+---
+
+<BigPicture title="The mock is placement and failure, not a token-bucket quiz">
+
+The interviewer says: **design a rate limiter**. Algorithms already live in [Rate limiting](/learn/rate-limiting): token bucket, leaky bucket, fixed window, sliding window, atomic `INCR` with expiry, and the 2× fixed-window edge burst. This mock is the **system**: where the turnstile sits, how many turnstiles the caller sees, how counters stay coordinated, how policy reloads, who is isolated from whom, and what happens when Redis dies.
+
+Scope this interview the same way [Driving a system design interview](/learn/driving-a-system-design-interview) scopes TokenX. Default product:
+
+- TokenX public transfer and read APIs: per-tenant and per-API-key budgets, plus a fraud/abuse cap you advertise in the contract.
+- Ad Click collectors: per-campaign and bot-IP budgets on **keyed ingest**, with uniqueness still on `click_id` at the billed-fact log.
+
+Out of scope unless the interviewer adds them: global exactly-once, a lock service, CDN cache keys as uniqueness, and “Redis is the ledger.” A rate limit is **admission**. It is not a unique constraint, not [idempotency](/learn/idempotency-and-deduplication), and not exactly-once processing. A Redis `SETNX` [lease](/learn/distributed-locks-and-leases) is exclusive ownership with fencing; a bucket is a **budget**. Do not implement one with the other.
+
+[Backpressure and overload](/learn/backpressure-and-overload) still owns bounded queues, 429 versus wait, and class priority. [Graceful degradation](/learn/graceful-degradation) still owns what you stop first. This design names **which hop enforces**, **which store counts**, and **fail-closed money versus fail-open billed ingest**.
+
+</BigPicture>
+
+<UnderTheHood title="Clarify, place one policy, then count">
+
+### 1. Lock the contract before drawing boxes
+
+Ask: whose budget (tenant, API key, user, IP, campaign, RPC class)? Strict global cap or approximate? Burst allowed? Multi-region shared budget or per-region? What is user-visible on reject (`429` plus `Retry-After`, versus `503` when the cap cannot be enforced)? What must remain correct if the limiter is wrong—TokenX ledger uniqueness, Ad Click `click_id`.
+
+Illustrative planning load (label it; do not pretend it is measured):
+
+- TokenX peak **8,000** transfer POSTs/s across **200** tenants; celebrity tenant **400** rps against a **100** rps cap, burst **20**.
+- Ad Click keyed ingest peak **50,000** facts/s, **2,000** campaigns, one viral campaign **20,000** rps.
+- Target extra limiter latency **≤ 2 ms** p99 on the allow path in-region.
+
+### 2. Place the limiter: edge, gateway, service, mesh
+
+All four hops can 429. **One user-visible policy** for a class. Stacking edge + gateway + sidecar + app with three windows produces three `Retry-After` values and no coherent fairness.
+
+| Hop | What it sees | What it protects | Typical miss |
+| --- | --- | --- | --- |
+| **Edge / PoP** | IP, TLS, coarse JWT | Origin and CDN | NAT shares one IP; tenant identity is thin |
+| **API gateway** | API key, tenant, route | Fleet of services | Weak on east-west and per-RPC class inside a binary |
+| **Service** | Full authz and method | Business class (transfer vs debug) | Does not shed load that already filled the process |
+| **Mesh sidecar** | Workload identity, east-west | Neighbor amplification | Policy is derived xDS; sidecar tax; see [service mesh and proxies](/learn/service-mesh-and-proxies) |
+
+Defensible default for this mock: **gateway** as the user-visible TokenX limiter (tenant + route + class), **mesh** as a matching safety net using the **same policy snapshot**, **edge** as a cheap IP/bot shield that is not the tenant fairness story. Ad Click collectors often enforce **at the collector** (service hop) because the ingest identity is campaign + `click_id`, not an API key at a shared gateway.
+
+Local in-process buckets survive Redis loss but multiply: **N** replicas × 100 rps = **100N** rps. Central Redis coordinates and adds a failure mode you must name.
+
+### 3. Distributed counters
+
+Treat Redis (or an equivalent linearizable-enough counter store) as **derived admission state**. Authoritative money still commits in the ledger. Authoritative ads still append the billed-fact log.
+
+- Atomic take: Lua or `INCR` plus `EXPIRE NX` on first increment. GET/SET races stick keys or lose burst. Module 5 already showed this; in the interview, say **atomic** and **TTL owner**.
+- Token bucket as default parameters: rate *r*, burst *b*. Sliding window if the interviewer forbids burst; then name **clock skew** across replicas.
+- Hot keys: a viral `campaign_id` at 20,000 rps into one Redis slot melts the limiter. **Shard** the counter (`hash(key) % S` plus a short window id), then **sum**. The cap becomes approximate by up to one shard’s remainder; say the error bound.
+- Local cache of “already 429” is a hint. It must not replace the shared counter on the allow path if you promised a global tenant cap.
+
+A lease (`SETNX` + TTL + fencing token) answers “who may write this row.” It does not refill 100 tokens per second. Using a lock to serialize every request through one owner is a **global mutex**, not a rate limiter.
+
+### 4. Config and hot reload
+
+Policy is data: key template, *r*, *b*, algorithm, class, fail-closed versus local-degraded, `Retry-After`. Store it in a control-plane object (versioned YAML/JSON), not in each proxy binary.
+
+Hot reload: push a **versioned snapshot** to edge, gateway, and mesh. Swap atomically per request—never mix old key schema with new rate on the same take. Stale snapshots are **derived**. If the control plane is down, keep serving the last-good snapshot and alarm on snapshot age; do not invent unlimited allow because config fetch failed on the TokenX fraud path.
+
+<Calculation label="Counter ops, hot shards, and N-times local burst (illustrative)">
+
+Gateway cluster: 50 pods. TokenX peak 8,000 POSTs/s. One atomic Redis script per allow/deny decision → **8,000** scripts/s. At ~0.3 ms in-region RTT to Redis, that is capacity-cheap; the risk is **skew**, not average RPS.
+
+Celebrity tenant 400 rps versus cap 100 rps burst 20: after the bucket empties, **300** rps see 429. That is fairness working. If the key were client IP, a NAT’d office of 40 tenants shares one bucket and a botnet shares another—wrong isolation unit.
+
+Viral campaign 20,000 rps on one Redis slot. Split into **S = 16** subcounters. Mean ~1,250 rps/shard. Sum of shards can over-admit by roughly one shard’s tokens if you take-then-sum loosely; a conservative design takes from a random shard with per-shard rate *r/S* (here 20,000/16 = 1,250/s if the campaign cap is 20,000—or 10,000/16 if the cap is 10,000). **State the cap and the shard math.** Label over-admit as approximate fairness, not as “the log will unique it away.” Uniqueness does not cap CPU.
+
+Clock skew 200 ms on a 1 s sliding window is a **20%** fairness error. Prefer token bucket refill using Redis server time in the script, not each pod’s wall clock.
+
+Local-only fallback: 50 collectors × 2,000 rps local cap = **100,000** rps worst case, 2× the 50,000 global ingest peak. Name that overshoot. Ads accept it for availability; TokenX must not.
+
+</Calculation>
+
+<ExecutionTimeline
+  title="One TokenX POST through a versioned gateway bucket"
+  steps={[
+    { title: "Snapshot", detail: "Gateway loads policy version v17: tenant key, token bucket r=100/s, burst=20, fail-closed on Redis loss for spendable POSTs.", state: "Control plane owns authoritative policy; the proxy holds a derived snapshot.", failure: "Hot-reload mid-script mixing v16 keys with v17 rates produces a stuck or silent unlimited tenant." },
+    { title: "Take", detail: "Atomic Redis script decrements the tenant bucket (sharded if this tenant is hot). Allow continues; deny returns 429 and Retry-After from remaining tokens.", state: "Redis owns derived counts only.", failure: "Non-atomic GET/SET; or treating the counter TTL as a unique transfer_id." },
+    { title: "Commit", detail: "On allow, the API still inserts the idempotency row and debits the ledger. Mesh may apply the same v17 snapshot as a safety net, not a second window.", state: "Ledger remains the money authority.", failure: "Stacking a different mesh window so a caller who passed the gateway is 429'd with another clock." },
+    { title: "Redis down", detail: "Spendable TokenX POSTs return 503 until the advertised fraud cap can be enforced. Ad Click collectors switch to per-pod local caps and keep writing click_id facts.", state: "Fail mode is part of v17, not an on-call improvisation.", failure: "Fail-open TokenX because 'payments must stay up' during a credential-stuffing event." }
+  ]}
+/>
+
+Fairness is **separate keys and separate buckets** for transfer versus debug, billed clicks versus scrape bots. Weighted fair queueing of in-flight work stays with backpressure; here you isolate budgets so one celebrity tenant cannot spend everyone else's 429 budget.
+
+</UnderTheHood>
+
+<MentalModel title="One bouncer, a shared clicker, a posted house rule">
+
+Think of a venue with several doors (edge, gateway, mesh, app). Guests should meet **one** posted capacity rule, not four uncoordinated clickers. Redis is the shared clicker. The clipboard of tonight’s cap is a **versioned snapshot**; swapping clipboards mid-count confuses the door. If the clicker breaks, the bank branch (TokenX) locks the door because the advertised abuse cap is part of the product. The stadium turnstile (Ad Click ingest) switches to a local usher with a lower number so billed tickets still enter, then unique-stamps them at the log—not at the clicker.
+
+A hotel keycard with a room number is a **lease**. It is not a “100 people per second” rule. Mixing them is how candidates accidentally design a global mutex.
+
+Retain: **one user-visible policy, derived counters, versioned snapshots, named Redis-down behavior, and 429 is not a commit.**
+
+</MentalModel>
+
+<ArchitectureDiagram title="Hops, shared counters, policy snapshots, and Redis-down forks" chart={"flowchart LR\n  CLI[Client] --> EDGE[Edge limiter]\n  EDGE --> GW[Gateway limiter]\n  GW --> MESH[Mesh sidecar]\n  MESH --> API[TokenX API]\n  API --> LED[(Authoritative ledger)]\n  POL[Policy control plane] --> SNAP[Hot-reload snapshot]\n  SNAP -.-> EDGE\n  SNAP -.-> GW\n  REDIS[(Redis counters)] --> GW\n  SHARD[Hot-key shards] --> REDIS\n  REDIS -. Redis down TokenX .-> FC[Fail-closed 503]\n  ADS[Ad Click] --> COL[Collector]\n  COL --> LOG[(Billed-fact log)]\n  REDIS -. Redis down ads .-> LOC[Local degraded cap]\n  LOC --> COL"}>
+
+**Authoritative:** policy documents in the control plane; TokenX ledger (balances, idempotency, uniqueness); Ad Click billed-fact log. **Derived:** hot-reload snapshots at edge/gateway/mesh, Redis shard counts, local degraded caps, `Retry-After`. Solid allow edges still end at the ledger or the log. Dashed edges are asynchronous config and **Redis-down** forks: TokenX **fail-closed** `503`, ads **fail-open** onto a local cap then the same uniqueness log. Recovery is last-good snapshot plus alarm, atomic scripts, shard hot keys, and never using the counter as a unique index.
+
+<ArchitectureWalkthrough
+  title="Defend every limiter state boundary"
+  stages={[
+    { name: "Policy plane", owner: "Control plane", state: "Versioned rate, burst, key template, fail mode", boundary: "Authoritative config. Proxies hold snapshots.", failure: "Control plane unreachable or a partial push.", recovery: "Serve last-good snapshot; alarm on age; do not fail-open TokenX fraud caps." },
+    { name: "User-visible hop", owner: "API gateway (TokenX); collector (ads)", state: "Request identity, remaining deadline, chosen key", boundary: "One posted policy per class. Mesh/edge may mirror it.", failure: "Four hops with four windows.", recovery: "Collapse to one Retry-After owner; keep others as identical safety nets." },
+    { name: "Counter store", owner: "Redis cluster plus shards", state: "Derived tokens/windows per key", boundary: "Admission only. Not a lock, not a ledger.", failure: "Hot slot, replica skew, or cluster loss.", recovery: "Shard hot keys; TokenX 503; ads local cap." },
+    { name: "Downstream authority", owner: "Ledger / billed-fact log", state: "transfer_id uniqueness; click_id facts", boundary: "Allow is not commit. Deny is proven non-accept.", failure: "Timeout after allow, before commit.", recovery: "Client retries the same idempotency or click_id; limiter may 429 a retry that is still the same business op—budget retries or peek-then-commit carefully." }
+  ]}
+/>
+
+</ArchitectureDiagram>
+
+<RealExamples title="TokenX fail-closed door; Ad Click local usher">
+
+### TokenX tenant fraud cap
+
+Contract: 100 rps/tenant, burst 20, key `tenant_id` plus route class `transfer`. Gateway enforces with Redis. Mesh sidecar loads **v17 of the same snapshot** so east-west retries cannot bypass the door. A 429 never reached the ledger. An allow still needs `(caller, idempotency_key)`. If Redis is down, return **503** with `Retry-After` on spendable POSTs because the advertised cap cannot be enforced. Fail-open here is a product incident during abuse, not “better availability.”
+
+### Ad Click keyed ingest
+
+Per-campaign 10,000 rps plus a bot IP list. Collectors take from Redis when it is healthy. On cluster loss, each collector enforces **2,000 rps local**. Global overshoot is named (pod count × local cap). **`click_id` uniqueness stays on the log.** Debug produce samples first ([graceful degradation](/learn/graceful-degradation)). Redis returning does not rewrite facts already appended.
+
+### Hot-reload during a celebrity tenant
+
+Policy changes burst 20 → 5 for tenant T. Push v18. In-flight v17 takes complete against v17. New requests use v18. Do not flush Redis keys belonging to a different schema until a generation prefix changes (`v18:tenant:T`). Mixed generations look like a “reset burst” exploit.
+
+<FailureScenario
+  title="Redis is gone and a lease looks tempting"
+  prompt="The shared counter cluster fails. A candidate also proposes SETNX leases so only one gateway pod admits traffic."
+  choices={[
+    { label: "Fail-open TokenX POSTs; drop all Ad Click until Redis returns.", impact: "Money path loses the advertised fraud cap; billed ingest loses the SLO you actually care about.", recovery: "Invert it: TokenX 503 fail-closed; ads local per-pod caps with click_id on the log." },
+    { label: "Serialize every request behind one SETNX owner as a 'perfect' global limiter.", impact: "A lease is not a token bucket. One owner becomes a mutex; throughput collapses to that pod's RPS; fencing still is not a refill rate.", recovery: "Keep leases for exclusive jobs. Keep buckets for admission. See distributed locks and leases." },
+    { label: "TokenX 503 on spendable APIs; ads collectors use local degraded caps; uniqueness stays off Redis.", impact: "Admission degrades per invariant. Over-admit on ads is named and bounded per pod.", recovery: "Restore Redis, keep shard maps, do not replay 429s as commits." },
+    { label: "Have the mesh retry 429s so users never see admission.", impact: "Retrying 429 without jitter recreates overload. 429 is the point of the design.", recovery: "Honor Retry-After; retry UNKNOWN timeouts with the same idempotency key, not 429." }
+  ]}
+/>
+
+</RealExamples>
+
+<InterviewTraps title="IC6 follow-ups this mock should survive">
+
+- **“Rate limiting gives exactly-once.”** It gives 429s and 503s. Uniqueness is a different store.
+- **“I will put token bucket, sliding log, and a lock in Redis and we are done.”** Algorithms were Module 5. Name placement, snapshot version, hot keys, and Redis-down.
+- **“Leases are how you rate limit in distributed systems.”** [Distributed locks and leases](/learn/distributed-locks-and-leases) fence stale writers. A bucket admits N/s. `SETNX` is not refill.
+- **“Edge plus mesh plus app, all at 100 rps, is defense in depth.”** It is **100/100/100** with three clocks unless they share one snapshot and one user-visible hop.
+- **“Fail-open is always more available.”** For a TokenX fraud cap it is more stealable. For Ad Click ingest, local fail-open is often the billed SLO.
+- **“INCR is our click_id.”** Counters reset, shard, and expire. Logs do not.
+- **“Local limits are equivalent to Redis.”** They are **N×** the cap.
+- **“Hot reload is just SIGHUP the YAML.”** Partial reload mid-take and unversioned keys look like burst resets.
+
+If the interviewer tightens to **strict global** 100 rps across regions, you need a regional budget split or a cross-region counter with extra RTT—not a wish. If they allow **approximate**, sharded local+Redis is honest.
+
+</InterviewTraps>
+
+<Tradeoffs title="Where the 429 comes from, and who pays for coordination">
+
+**Edge versus gateway versus service versus mesh:** cheaper shed and origin protection versus identity richness versus process protection versus east-west coverage. Cost is extra hops, sidecar CPU ([service mesh and proxies](/learn/service-mesh-and-proxies)), and the chance of stacked policies.
+
+**Local versus Redis versus sharded approximate:** exact global caps need coordination and create a new outage mode; local is available and **N×** wrong; shards bound hot keys and admit error.
+
+**Fail-closed versus local fail-open:** TokenX advertised abuse caps fail closed (`503`) so fraud cannot ride a Redis incident. Ad Click keyed ingest fails open to a **bounded** local cap so the billed path survives; uniqueness does not move to Redis.
+
+**One snapshot versus independently tuned hops:** coherent `Retry-After` and fairness versus team autonomy. Autonomy without a posted owner produces inexplicable 429 loops.
+
+**Token bucket versus sliding window versus leaky queue:** burst UX versus fairness versus added latency. Pick using Module 5; do not re-derive refill here unless asked.
+
+This design stops fitting when a single Redis region cannot meet the extra 2 ms, when a cap must be strict globally under partition (then you fail closed or split budgets), or when the real problem is ledger lock occupancy—admission will not unstick one hot wallet.
+
+</Tradeoffs>
+
+<KnowledgeCheck
+  question="You advertise a TokenX tenant fraud cap of 100 rps. Redis is down. Fifty gateway pods each have a local token bucket of 100 rps. What is the curriculum default?"
+  options={[
+    "Fail-open on local buckets so payments stay available; 5,000 rps is fine because uniqueness still holds",
+    "Fail-closed spendable POSTs with 503 until the advertised cap can be enforced; uniqueness would still apply if you did allow",
+    "SETNX a lease per tenant and let the lease owner admit unlimited traffic",
+    "Convert 429 into mesh retries so the client never sees admission control"
+  ]}
+  correct={1}
+  explanation="A cap you claimed is part of the product; local 50×100 rps is 5,000 rps, not 100. Uniqueness is a different store and still required on any allow. Leases are not refill. Retrying 429 fights the limiter. Ad Click may local-fail-open; that is a different path."
+/>
+
+<ScenarioCheck
+  scenario="Ad Click Redis fails during a viral campaign. Collectors can drop all clicks, accept unlimited clicks, or enforce 2,000 rps per pod locally. The same Redis cluster also backs TokenX gateway buckets. Finance fears lost ad revenue and transfer fraud in the same hour."
+  question="Which split matches this academy?"
+  options={[
+    { label: "Drop both TokenX and ads until Redis returns so every cap stays exact.", feedback: "Exact caps are not more important than the named ads ingest SLO. TokenX fail-closed is enough for money." },
+    { label: "TokenX 503 fail-closed on spendable APIs; ads ingest local per-pod caps with click_id uniqueness on the log; dashboards may lag.", feedback: "Admission degrades per invariant. Uniqueness is not Redis INCR. Over-admit on ads is named (pods × local cap)." },
+    { label: "Fail-open both; store uniqueness in the token bucket so one system remains.", feedback: "Buckets overflow, shard, and expire. They are not unique indexes. TokenX fail-open during Redis loss drops the fraud cap." },
+    { label: "Elect one collector with a fencing token to admit all campaigns globally.", feedback: "A lease serializes work; it does not implement r tokens/s and becomes a hot mutex. Leases are not rate limits." }
+  ]}
+  correct={1}
+  explanation="Same invariant split as graceful degradation and Module 5, composed into a distributed design: one posted policy, derived counters, TokenX fail-closed, Ad Click fail-open keyed ingest. A fencing token is the locks lesson, not a bucket."
+/>
+
+<InterviewAnswer>
+
+“I treat this as admission control, not uniqueness. Algorithms are token bucket by default—rate r, burst b—from the rate-limiting lesson. In the design I pick one user-visible hop, usually the API gateway for TokenX tenant and route class, with the mesh mirroring the same versioned policy snapshot so we do not stack three Retry-After clocks. Edge is an IP/bot shield, not tenant fairness. Counters live in Redis as derived state with atomic take and hot-key shards; the ledger and the billed-fact log stay authoritative. Policy hot-reloads as an atomic snapshot with a generation prefix on keys. If Redis dies, TokenX fail-closes spendable APIs with 503 because we advertised a fraud cap; Ad Click collectors fail-open onto a bounded local cap so keyed ingest survives, with click_id uniqueness still on the log. A lease is exclusive ownership, not a refill rate. 429 is not a commit and not exactly-once.”
+
+</InterviewAnswer>

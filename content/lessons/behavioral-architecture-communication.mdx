@@ -1,0 +1,179 @@
+---
+title: "Behavioral Architecture Communication"
+description: "Practice IC6 communication: decision records, incident learning, disagreement, and influence without weakening technical invariants."
+module: 7
+moduleTitle: "Architecture & Mock Interviews"
+order: 11
+duration: 38
+difficulty: "Advanced"
+tags:
+  - behavioral
+  - ADR
+  - incidents
+  - influence
+  - strategy
+objectives:
+  - "Write a decision record that a later incident can audit"
+  - "Narrate an incident with timeline, blast radius, and invariant impact"
+  - "Disagree in public without surrendering conservation or uniqueness"
+  - "Turn a strategy conflict into options with costs, not slogans"
+---
+
+<BigPicture title="Influence is part of the design">
+
+Staff interviews test whether you can move a system **and** a room. This lesson is not a soft-skills appendix. It is how you keep TokenX terminals and Ad Click uniqueness intact when a VP wants speed.
+
+You already have the technical loop in [driving a system design interview](/learn/driving-a-system-design-interview) and the review loop in [architecture review practice](/learn/architecture-review-practice). Here the artifact is language: ADRs, incident notes, and disagreement that still names a mechanism.
+
+Assume: you are the architect for TokenX and the Ad Click Aggregator. Stakeholders include payments legal, ads sales, SRE, and a platform team that owns Kafka.
+
+</BigPicture>
+
+<UnderTheHood title="Four scenes, each with a technical spine">
+
+### 1. Decision record (ADR)
+
+Template you can speak:
+
+- **Context:** peak 4.6k TokenX writes/s; legal wants seven-year audit.
+- **Options:** (A) SQL ledger + outbox, (B) Kafka-as-ledger, (C) public chain.
+- **Decision:** A. Kafka is integration, not conservation.
+- **Consequences:** write availability tracks DB quorum; warehouse is derived.
+- **Expiry:** revisit if measured commit p99 exceeds SLO at 2× headroom.
+
+Write it the day of the meeting. An ADR that exists only in Slack is not an ADR.
+
+### 2. Incident narrative
+
+Order: detection, impact on **invariants**, mitigation, fence, customer truth.
+
+Bad: “Kafka lagged so we lost transfers.”
+Good: “Outbox age hit 15 minutes; transfers still committed; notifications delayed; no conservation break; we paged the relay owner.”
+
+If money might be wrong, say **UNKNOWN** and stop writes until fenced. Do not soothe.
+
+<ExecutionTimeline
+  title="Incident communication that preserves truth"
+  steps={[
+    { title: "Detect", detail: "Alert: TokenX outbox age > 5 min, or Ad Click uniqueness error rate.", state: "Name the system and the SLO.", failure: "Paging the wrong owner.", recovery: "Runbook owner in the ADR." },
+    { title: "Scope invariant", detail: "Ask: conservation broken, uniqueness broken, or only derived lag?", state: "Board the invariant.", failure: "Calling lag data loss.", recovery: "Read ledger vs log, not the dashboard rumor." },
+    { title: "Mitigate", detail: "Fail closed on TokenX if quorum or fence is in doubt; ads may fail-open admission.", state: "Opposite defaults.", failure: "Copy-paste one policy.", recovery: "Separate comms channels." },
+    { title: "Learn", detail: "Blameless timeline, action items with owners, ADR update.", state: "Learning is a patch to the design.", failure: "Hero narrative.", recovery: "Mechanism change or explicit accepted risk." }
+  ]}
+/>
+
+### 3. Disagreement
+
+A platform lead wants “exactly-once Kafka so we can delete the ledger.”
+
+You: restate their goal (simpler ops). Then: Kafka EOS is a produce-plus-offset envelope, not TokenX conservation ([stream processing](/learn/stream-processing-and-windows)). Offer a joint spike with a Jepsen-style invariant test ([consistency testing](/learn/consistency-testing)). If they still insist, escalate with the ADR options table, not with mockery.
+
+### 4. Strategy
+
+Legal wants regional isolation; sales wants one global balance. Map to mechanisms: regional ledgers + escrow vs one quorum. Cost, latency, and failure are the columns. Pick in writing.
+
+<Calculation label="Disagreement with numbers">
+Global serializable commit p99 across 80 ms RTT is not 300 ms transfer SLO without a miracle
+
+Regional primary + async DR: RPO minutes named in the customer contract, not “zero RPO because Kafka”
+</Calculation>
+
+</UnderTheHood>
+
+<MentalModel title="Say the invariant in the first sentence">
+
+If your first sentence is a vendor, you already lost the room. If your first sentence is what must never happen, mechanisms have a place to sit.
+
+</MentalModel>
+
+<ArchitectureDiagram title="Communication artifacts around the same sources of truth" chart={"flowchart LR\n  Inv[Invariants] --> ADR[Decision record]\n  Inv --> Inc[Incident timeline]\n  Inv --> Dis[Disagreement table]\n  ADR --> Sys[Ledger and click log]\n  Inc --> Sys\n  Dis --> ADR\n  Inc -. rumor dashboard .-> Der[Derived views]\n  Der -. cannot close incidents .-> Inv"}>
+
+Dashed rumor path is how incidents go wrong. Close on authoritative stores.
+
+<ArchitectureWalkthrough
+  title="Who hears which truth"
+  stages={[
+    { name: "Exec", owner: "You", state: "Invariant and customer impact", boundary: "No vendor dump.", failure: "Zero-RPO slogan.", recovery: "Named RPO." },
+    { name: "SRE", owner: "On-call", state: "Runbook and fence", boundary: "Actions.", failure: "Chat-only mitigation.", recovery: "Ticket plus ADR." },
+    { name: "Legal", owner: "Audit", state: "Retention and terminals", boundary: "What was committed.", failure: "Request-log replay story.", recovery: "Committed journals only." },
+    { name: "Peer architect", owner: "Platform", state: "Options table", boundary: "Joint tests.", failure: "Status fight.", recovery: "Spike with an invariant checker." }
+  ]}
+/>
+
+</ArchitectureDiagram>
+
+<RealExamples title="Three conversations">
+
+**VP: ship multi-region this quarter.** You present LWW risk with a one-debit-erased story. Offer DR this quarter, active-active next year with escrow. Get a written expiry.
+
+**Incident: ads dashboards empty.** You tell sales the billed log is intact; invoices can rebuild; ETA is the job lag. You do not “refund all clicks.”
+
+**Peer: delete ADRs because they slow us.** You show the Kafka-as-ledger near-miss. Process is cheaper than a conservation incident.
+
+<FailureScenario
+  title="Communication failures"
+  prompt="What is the repair?"
+  choices={[
+    { label: "Called Kafka lag data loss", impact: "Legal and customers overreact or underreact.", recovery: "Correct in writing: derived lag vs ledger commit." },
+    { label: "Agreed to LWW in a hallway", impact: "No artifact; money at risk.", recovery: "Retract; ADR with reject." },
+    { label: "Blamed an individual for a missing unique index", impact: "Learning dies.", recovery: "System fix plus test." },
+    { label: "Promised zero RPO", impact: "Contract lie.", recovery: "Restate measured backup RPO." }
+  ]}
+/>
+
+</RealExamples>
+
+<InterviewTraps title="IC6 behavioral follow-ups">
+
+- Tell me about a time you said no. What was the invariant?
+- How do you write an ADR in 15 minutes?
+- Incident: who did you page, and what did you tell customers?
+- How do you disagree with a principal without escalating too early?
+- What metric tells you the strategy is wrong?
+
+Score communication on **precision about state**, not on charisma.
+
+</InterviewTraps>
+
+<Tradeoffs title="Alignment versus accuracy">
+
+**Blunt invariant first:** trust from SRE; friction with sales.
+
+**Comforting slogans:** short meeting; long incident.
+
+**ADRs for every choice:** noise; miss the few that matter (conservation, uniqueness, region).
+
+**No ADRs:** speed; archaeology after the outage.
+
+</Tradeoffs>
+
+<KnowledgeCheck
+  question="A VP asks you to confirm in an all-hands that TokenX is exactly-once because Kafka transactions are on. What do you say?"
+  options={[
+    "Agree for morale; fix the wording later",
+    "Refuse the slogan: conservation is the ledger transaction or exclusive terminals; Kafka is at-least-once integration after commit",
+    "Say the CDN is also exactly-once",
+    "Move the ledger into Kafka before the all-hands"
+  ]}
+  correct={1}
+  explanation="Behavioral excellence is not agreeing to a false guarantee in public."
+/>
+
+<ScenarioCheck
+  scenario="Legal wants to auto-replay a month of signed TokenX HTTP logs after a bad restore. Sales supports it to 'make customers whole.'"
+  question="How do you communicate the no?"
+  options={[
+    { label: "Write: request logs are UNKNOWN; we replay committed journals only, fence writes, and reconcile case-by-case. Offer a customer script that does not claim a completed transfer without a ledger row.", feedback: "Precision plus a usable alternative." },
+    { label: "Let legal win to be a team player.", feedback: "Can mint or double-spend." },
+    { label: "Stay silent in the meeting and revert later.", feedback: "No artifact; likely happens anyway." },
+    { label: "Blame SRE publicly.", feedback: "Breaks learning and does not protect the invariant." }
+  ]}
+  correct={0}
+  explanation="Influence is a written, true alternative—not hallway surrender."
+/>
+
+<InterviewAnswer>
+
+“I lead with the invariant: TokenX conservation and Ad Click uniqueness. I write short ADRs with options, consequences, and an expiry. In incidents I separate ledger or log truth from dashboard lag, I fail closed when money is UNKNOWN, and I name owners. When I disagree, I restate the other goal, put mechanisms on a table with numbers, and I will not publicly bless exactly-once Kafka as a ledger.”
+
+</InterviewAnswer>
