@@ -1,0 +1,237 @@
+---
+title: "Failure Detection and Recovery"
+description: "Treat timeouts as suspicion, fence stale owners at the resource, and recover Kafka brokers, controllers, and consumers without claiming safe failover."
+module: 3
+moduleTitle: "Kafka & Fault Tolerance"
+order: 7
+duration: 38
+difficulty: "Intermediate"
+tags:
+  - Kafka
+  - failure detection
+  - fencing
+  - heartbeats
+  - split brain
+objectives:
+  - Separate timeout-based suspicion from confirmed failure, including false positives and zombies
+  - Fence stale partition leaders and workers with a durable epoch at the resource, not by lease expiry alone
+  - Recover broker, controller, and consumer failures as different protocols, then size catch-up from leftover rate
+---
+
+<BigPicture title="A timeout is suspicion, not a death certificate">
+
+Failure detectors in production systems are almost always **timeouts plus gossip**: a heartbeat missed for `session.timeout.ms`, a replica that has not fetched within `replica.lag.time.max.ms`, a lease the lock service will not renew. None of those signals is ground truth. A 40-second garbage-collection pause, a brief network blip, or a stuck NIC looks identical to a crashed process until later evidence arrives. Acting on that suspicion too quickly **falsely declares death** and starts a replacement. Waiting too long **misses a zombie** that still believes it owns the shard and is still writing.
+
+Replacement therefore creates a **dual-owner window**. The detector may have already given the partition, lock, or group assignment to a successor while the previous holder is paused, partitioned, or finishing an in-flight call. Exclusion is not the timeout. Exclusion is a **fencing token, leader epoch, or generation checked at the resource**, after that high-water value is **durable**. Lease expiry at the coordinator does not notify the ledger. See [distributed locks and leases](/learn/distributed-locks-and-leases).
+
+This lesson is about cluster and process failure detection and the recovery that follows: broker death, controller death, consumer death, catch-up, high-watermark as a read gate, and leader-epoch truncation. It does not re-derive the consumer-group protocol; two clocks and the dual-owner window already live in [consumer groups and rebalancing](/learn/consumer-groups-and-rebalancing). Partition logs, ISR, and controller-versus-partition election live in [Kafka internals](/learn/kafka-internals). Promotion without two writers is the same shape as [replication and failover](/learn/replication-and-failover).
+
+TokenX settlement cannot treat group assignment as a mutex: a worker can die mid-ledger write and a successor can replay the same event. Ad Click collectors can die with lag that only leftover consume rate can drain. Neither system gets **safe failover** from a health check. Name the fence and name that the high-water token survives restart.
+
+</BigPicture>
+
+<UnderTheHood title="Suspect, elect, fence, then catch up">
+
+### Suspicion is a timer, with two error modes
+
+A detector that requires a heartbeat every `H` and declares death after `T` has two failure modes you must name in an interview:
+
+- **False positive:** the process is alive but silent (stop-the-world pause, packet loss, scheduler starvation). The system elects a successor. Availability of *that* owner drops; correctness is at risk until fencing holds.
+- **False negative:** the process still **heartbeats** while work is wedged (`max.poll.interval.ms` vs session), or `T` is so long that a crash is not declared. The detector thinks it is healthy. A process **partitioned from the detector but still writing the resource** is the other error: the detector will eventually **suspect** (false-positive crash declaration) while the zombie keeps writing—split brain, not a missed heartbeat.
+
+You cannot drive both error rates to zero with one timeout. Short `T` recovers faster and misfires more. Long `T` hides rolling restarts and extends the zombie-hold window. Size `T` as an operational SLO against measured pause and network tails, then assume it will still be wrong sometimes.
+
+Kafka uses several independent timers. They are not interchangeable:
+
+| Detector | What it watches | Who acts | What it does **not** prove |
+| --- | --- | --- | --- |
+| Broker session to the metadata quorum | Broker process liveness | Controller | Disk health, ISR catch-up, or fsync |
+| `replica.lag.time.max.ms` | Follower fetch progress | Partition leader | That the lagging replica is dead |
+| Consumer `session.timeout.ms` / heartbeats | Member liveness to the **group coordinator** | Coordinator | That the processing loop is making progress |
+| `max.poll.interval.ms` | Poll-loop liveness | Coordinator | Exclusive sink ownership |
+| Lock/lease TTL | Recorded ownership at the lock service | Lock service | That the store has observed a new epoch |
+
+Heartbeats and poll interval as *two consumer clocks* are already specified in the [consumer-groups lesson](/learn/consumer-groups-and-rebalancing). Here the point is cluster-wide: the same heartbeat-versus-work split exists for brokers (session up, replica fetch stalled) and for workers (lease renewed, ledger call hung).
+
+### Lease expiry is reassignment, not exclusion
+
+A lease or session timeout lets the **authority** grant the same resource to someone else. It does not retract bytes already on the wire, cancel a JDBC commit, or update the sink. Until the new owner **durably retains** a higher fencing token at the resource, and the resource **atomically compares** that token on every mutation, the old holder can still succeed.
+
+That is the same protocol as the locks lesson: retain-then-work, reload the high-water token after restart, reject lower epochs. Kafka's **leader epoch** is that token on the replica path. A consumer **generation** is that token only at the group coordinator (membership and offset commits). It is **not** a sink fence unless the ledger stores and checks it. Prefer a unique `event_id` in the same database transaction when the sink does not speak Kafka generations.
+
+<Callout type="warning" title="Do not say safe failover">
+
+Failover is safe only if you can name (1) who increments the epoch, (2) which resource rejects the old epoch, and (3) that the high-water token is durable across that resource's restart. A load-balancer health check, a DNS cutover, or a coordinator reassignment is none of those three.
+
+</Callout>
+
+<ExecutionTimeline
+  title="From missed heartbeat to a fenced successor"
+  steps={[
+    { title: "Suspect", detail: "Heartbeats from broker B7 or settlement-2 stop. After session.timeout.ms the metadata controller or group coordinator marks the member dead. That is suspicion under a timer, not proof of crash.", state: "Membership authority has withdrawn the old assignment. The log and the ledger have not.", failure: "A GC pause of 45 s with a 30 s session timeout is a false positive: a live process is declared dead and a successor starts." },
+    { title: "Elect", detail: "For a partition leader, the controller elects a current ISR member and increments the leader epoch. For a consumer, the coordinator bumps the group generation and assigns the partition. Controller process failover by itself does neither.", state: "New epoch or generation exists at the membership authority.", failure: "Electing a replica outside the ISR is unclean leader election: producers can lose offsets they treated as durable. That envelope is delivery policy, not detection." },
+    { title: "Fence", detail: "Replicas reject produce and fetch with a stale leader epoch. At the TokenX ledger the default fence is a unique event_id in the same database transaction as the mutation. Store kafka_generation only if the sink actually compares it; retain any such high-water token before protected work.", state: "The resource, not the timeout, excludes the old holder after it has observed a higher durable token or a unique event id.", failure: "If the ledger's max token is only in memory, a store restart can accept the zombie write. Group assignment never was a mutex." },
+    { title: "Catch up", detail: "The new leader keeps its local log; diverged former leaders truncate using leader-epoch end offsets, not a blind high-watermark rewind. Consumers still read only below HW. Workers drain lag only with leftover apply rate.", state: "HW is the exclusive ISR-agreed read gate. Catch-up is leftover rate times time, while produce continues.", failure: "If consume rate equals produce rate, lag never drains. If a non-ISR replica was elected, truncation can drop acknowledged prefixes." },
+  ]}
+/>
+
+### Split brain is two owners of one log or one sink
+
+**Split brain** means two processes both believe they may write the same partition, shard, or ledger key. Detection timeouts cause it; fencing contains it.
+
+- **Kafka partition leadership.** One metadata/controller authority (KRaft or ZooKeeper as implementation) assigns the leader and the epoch. Followers and clients must not invent a second leader map. A **zombie leader** that was isolated and then heals still has its old log and old epoch. Replicas that have learned epoch 9 **reject** epoch-8 produce and replica fetch. That is fencing at the log copies, the same idea as a store rejecting token 42 after retaining 43.
+- **Consumer generation.** The coordinator is authoritative for **membership**, not for ledger balances. Generation 13 proves the successor may fetch. It does not stop generation 12's in-flight `UPDATE`. Unless the sink checks generation or a unique event id, you have split brain at the **effect**, which is the usual TokenX bug.
+- **Controller versus partition.** Two controllers would be metadata split brain; the metadata quorum's terms exist to prevent that. A controller restart is not partition split brain. Existing partition leaders keep serving on the last assignment. See internals: controller failover ≠ partition reassignment.
+
+### Three Kafka deaths, three recoveries
+
+**Broker failure (data-plane leader or follower).** The controller removes the broker from membership when its metadata session expires. Partitions that had a leader on that broker get a **new leader from the current ISR**, with a new **leader epoch**. Followers catch up by replica fetch. The recovering former leader, if its log diverged, truncates a suffix using **leader-epoch end offsets** (KIP-101): it asks the current leader for the last offset of each epoch and cuts disagreeing local bytes. That is **not** “the new leader rewinds to the old high-watermark.” High-watermark remains the **consumer read gate**: ordinary consumers fetch offsets strictly below HW. Offsets the old leader held only locally sat above HW and must not have been consumed. Unclean election (a non-ISR replica) can still drop acknowledged offsets; keep it off unless you are explicitly accepting that delivery envelope.
+
+**Controller failure.** Metadata writes pause until a new controller loads the metadata log. Preferred-leader elections and ISR updates that need the controller wait. **Partition leaders already assigned keep serving.** Clients that hit a fenced or moved leader receive `NOT_LEADER_OR_FOLLOWER` or `FENCED_LEADER_EPOCH` and refresh metadata. Do not treat controller election as cluster-wide failover of every topic.
+
+**Consumer / worker failure.** The group coordinator (a broker) expires the member on session timeout or poll-interval expiry and starts a new generation. Recovery is: successor fetches from the last **committed offset** (group checkpoint, not sink proof), dual-owner window at the sink, catch-up of lag. Static membership delays that detection until the session timeout even if the process is a corpse—already covered as a group-protocol trade-off; here it is the false-negative detector for “host down, assignment still granted.”
+
+### Catch-up needs leftover rate, with produce still running
+
+Lag after death is not “how long the process was down.” It is backlog size divided by **leftover** copy or apply rate while new records still arrive.
+
+<Calculation label="Ad Click collector death: leftover consume rate">
+
+Assumptions (illustrative, not a measured cluster): partition 4 receives 12,000 clicks/s at 400 B each (4.8 MB/s into the leader before protocol overhead). Collector C4 dies. Suspicion takes session.timeout.ms = 45 s, then assignment moves. Applied offset is 3,600,000 behind the high-watermark when the successor starts (45 s of missed apply at 12,000/s = 540,000, plus 3,060,000 already queued—planning mix).
+If the successor applies 18,000 records/s and produce continues at 12,000 records/s, leftover catch-up rate is 6,000 records/s.
+Catch-up time: 3,600,000 / 6,000 = 600 s (10 min), ignoring rebalance pause, GC, and sink contention.
+If apply equals produce, lag never drains. If apply is 10,000/s, lag grows at 2,000/s without bound.
+Broker-side analogue: a follower **out of ISR** for 90 s at 8 MB/s leader produce accumulates 720 MB of missed bytes. Fetch at 20 MB/s leaves 12 MB/s leftover; 720 / 12 = 60 s to **rejoin the ISR** and become a durability witness again. HW did **not** stall on that corpse: remaining ISR members already defined the consumer-visible prefix.
+
+</Calculation>
+
+ISR rejoin is the replica version of leftover-rate math. Kafka HW is the exclusive prefix of the **current** ISR. When a follower leaves ISR, remaining members define HW; consumers do not wait for the dead replica. A lagging replica **still in ISR** does delay HW until it catches up or is dropped. Consumers wait for HW (replica coverage), not for a dead collector's apply loop.
+
+</UnderTheHood>
+
+<MentalModel title="Smoke alarm, hotel keycard, and the photocopier roster">
+
+A smoke alarm is a detector, not an arson report. It can scream because someone burnt toast (false positive) or stay quiet while a wiring fire smolders (false negative). Evacuating the building does not confiscate the old guest's keycard. The **door** checks the newest encoded generation; checkout time at the desk does not.
+
+Kafka's registrar (controller) names the clerk for each ledger (partition leader) and stamps an epoch on the appointment. Copyists (ISR) refuse pages stamped with an old epoch. A separate coat-check lead (group coordinator) hands attendants exclusive rails for this shift number (generation). The closet (sink) still needs the claim check—unique event id or a stored token—because an attendant can be mid-hang when the shift changes.
+
+The “safe to read” stamp on the ledger is how far every on-duty copyist has photocopied (high-watermark), not how far the last clerk's pen reached (log-end offset). When a clerk is replaced, the new clerk usually keeps the pages they already copied. The deposed clerk cuts pages that disagree with the epoch map; nobody throws away the whole book back to the last public stamp.
+
+Retain: **timeouts suspect; epochs fence; HW gates reads; catch-up is leftover rate; membership, log, and sink are three authorities.**
+
+</MentalModel>
+
+<ArchitectureDiagram
+  title="Membership, log, and sink authorities under suspicion and fencing"
+  chart={"flowchart LR\n  SUS[Timeout suspicion]\n  HB[Heartbeats and leases]\n  CTRL[Metadata controller]\n  GC[Group coordinator]\n  LOG[(Partition log)]\n  LEAD[Leader epoch 9]\n  ISR[Current ISR]\n  HW[High watermark]\n  ZOM[Zombie epoch 8]\n  MEM[Member gen 12]\n  SINK[(Ledger plus event IDs)]\n  TOK[Durable event id fence]\n  NEW[Successor gen 13]\n  REPL[Replica epoch check]\n  READ[Consumer read prefix]\n  SUS --> HB\n  HB --> CTRL\n  HB --> GC\n  CTRL --> LEAD\n  LEAD --> LOG\n  LOG -. replica fetch .-> ISR\n  ISR --> HW\n  HW --> READ\n  GC --> MEM\n  GC --> NEW\n  MEM --> SINK\n  NEW -->|unique event id first| TOK\n  TOK --> SINK\n  ISR --> REPL\n  ZOM -. stale produce .-> REPL\n  REPL -. reject epoch 8 .-> ZOM\n  MEM -. delayed ledger write .-> SINK"}
+>
+
+The **metadata controller** assigns partition leaders and **leader epochs**; the log does not elect the epoch. The **partition log** is authoritative for record bytes until retention. Replica fetch is **asynchronous** from that log into the current ISR. **High-watermark** is the exclusive consumer **read gate** derived from current ISR coverage—it is not an input to consumer generation. When a follower leaves ISR, remaining members define HW. The **group coordinator** assigns generation 12 then 13; that is membership, not a ledger mutex. The **ledger plus unique event ids** is the default TokenX fence. Dashed edges are replica fetch, stale produce, delayed apply, and epoch reject. Timeout suspicion is not a fence.
+
+<ArchitectureWalkthrough
+  title="Who may claim what after a death"
+  stages={[
+    { name: "Detect", owner: "Timeout plus heartbeat path", state: "Last successful session or replica fetch", boundary: "Suspicion after T, not confirmed crash.", failure: "GC pause or blip looks like death; a wedged process still writing looks healthy.", recovery: "Size T from measured tails, then assume dual owners until a resource fence holds." },
+    { name: "Metadata", owner: "Single controller", state: "Broker membership, leader map, leader epoch", boundary: "One metadata authority; controller failover loads that log.", failure: "Controller process dies.", recovery: "Elect a new controller. Existing partition leaders keep serving. This is not a cluster-wide partition reassignment." },
+    { name: "Log", owner: "ISR under the current leader epoch", state: "Log-end offsets and exclusive high-watermark", boundary: "ISR-only election; HW gates consumer reads.", failure: "Leader broker dies with LEO ahead of HW, or a zombie produce with epoch 8 arrives.", recovery: "Elect an ISR member and increment epoch. Replicas reject the old epoch. Former leaders truncate by leader-epoch end offsets, not by rewinding HW." },
+    { name: "Group", owner: "Group coordinator", state: "Generation and exclusive fetch assignment", boundary: "Fetch ownership for one group.id, not a sink mutex.", failure: "Member session or poll interval expires while a ledger call is in flight.", recovery: "Successor fetches from the committed offset. Treat overlap as certain. See consumer groups." },
+    { name: "Sink", owner: "Ledger or other resource", state: "Durable high-water token plus event-id uniqueness", boundary: "Retain-then-work; reload token after restart.", failure: "Delayed write from generation 12 or token 42 after generation 13 is assigned.", recovery: "Reject the stale epoch or no-op the duplicate event id in one local transaction, then checkpoint the Kafka offset." },
+  ]}
+/>
+
+</ArchitectureDiagram>
+
+<RealExamples title="TokenX dual owners and Ad Click lag after death">
+
+**TokenX settlement worker dies mid-ledger write.** Worker `settlement-2` has an **in-flight** `BEGIN` for event `S-991` that already left the JVM when the process is killed. Heartbeats stop. After `session.timeout.ms` the coordinator creates generation 13 and assigns partition 3 to `settlement-5`. `settlement-5` fetches `S-991` again because the Kafka offset was not committed. If that in-flight commit also lands, two processes owned the same ledger key during the window. **Group assignment is not a mutex.** Safety is `UNIQUE(event_id)` in the same transaction as the balance mutation, then the offset commit. A stored `kafka_generation` is optional and only a fence if the ledger compares it after a durable retain. Same shape as [locks and leases](/learn/distributed-locks-and-leases).
+
+A **partition leader** for the settlement topic dying is a different death: ISR election, epoch bump, replica reject of the old leader, catch-up. Do not page that as a consumer-group incident, and do not “fail over” by pointing producers at a follower.
+
+**Ad Click collector death.** Collectors in `group.id=adclick-ingest` own click partitions. When collector C4 dies, suspicion waits for the session timeout; lag versus high-watermark grows at the produce rate the whole time. After assignment, catch-up needs leftover apply rate as in the calculation: 3,600,000 records at 6,000 leftover records/s is ten minutes of stale dashboards if the aggregator reads applied state. Page on **partition lag**, not on member count. Adding collectors beyond the partition count does not drain C4's backlog. Replica catch-up after a **broker** leaves that topic's ISR is independent: remaining ISR members keep HW moving; the recovering follower uses leftover fetch rate to rejoin as a witness, not to unblock consumers who were waiting on a corpse. Aggregates remain derived; rebuild from the retained click log if the projection diverged during dual apply.
+
+<FailureScenario
+  title="Which detector fired, and what is still unsafe?"
+  prompt="TokenX partition 3 stops draining. Pick the failure. Name the suspicion, the fence that must exist, and the recovery that is not a slogan."
+  choices={[
+    { label: "Settlement worker GC pause beyond session timeout", impact: "False-positive death: the coordinator assigns the partition in a new generation while the paused JVM still holds an in-flight ledger write. Dual owners at the sink.", recovery: "Unique event id or a durable fencing generation at the ledger. Do not treat the new assignment as exclusion. Size session.timeout.ms against measured pause tails if false positives dominate pages." },
+    { label: "Partition leader broker isolated, then heals", impact: "Controller elects an ISR member and increments leader epoch. The isolated broker is a zombie leader: it may still try to accept produces with the old epoch.", recovery: "Replicas reject the stale epoch. Clients refresh on NOT_LEADER. The former leader truncates a diverged suffix using leader-epoch end offsets. HW stays the consumer read gate." },
+    { label: "Controller process dies", impact: "Metadata changes pause. Partition 3's current leader usually keeps serving. Lag that appears here is not explained by controller election.", recovery: "Wait for controller failover from the metadata log. Do not reassign every partition and do not write to a follower." },
+    { label: "Follower left ISR, then unclean election enabled after disk loss", impact: "A non-ISR replica can become leader and drop offsets producers treated as durable. Detection of lag is not the same as a safe promotion.", recovery: "Keep unclean leader election off for TokenX facts. Restore from remaining ISR members or a backup. Name the delivery envelope; do not call this safe failover." },
+  ]}
+/>
+
+</RealExamples>
+
+<InterviewTraps title="Detection slogans that fail at IC6">
+
+- **“The node is dead; the heartbeat timed out.”** You have suspicion. Ask about pause budgets, network blips, and what the zombie can still touch.
+- **“Lease expiry immediately excludes the old holder.”** Expiry reassigns at the lock or coordinator. The resource excludes a stale token only after it has durably observed a higher epoch. Cross-link [locks](/learn/distributed-locks-and-leases).
+- **“The new consumer generation fences the database.”** Generation fences offset commits at the coordinator. The sink must check a token or unique event id.
+- **“Controller failover is cluster failover.”** Metadata authority moves. Partition leaders usually keep serving. Fence and reassignment happen on **partition** leadership change.
+- **“After failover the new leader truncates to the old HW.”** HW is why consumers must not have read that suffix. The new ISR leader typically keeps its log; diverged followers truncate by **leader epoch**.
+- **“We fail over safely because the load balancer removed the old IP.”** DNS and L4 health checks are not fencing. Two writers need an epoch at storage.
+- **“ISR election means no data loss.”** ISR-only election plus `acks=all` and `min.insync.replicas` is the delivery envelope. Unclean election, page-cache power loss of the whole ISR, and retention expiry still lose prefixes. See [delivery](/learn/kafka-delivery-and-failure) and [internals](/learn/kafka-internals).
+- **“Lag will catch up when the collector restarts.”** Only if leftover apply or fetch rate is positive. Equals produce → flat. Below produce → unbounded growth.
+- **“Safe failover.”** Refuse the phrase unless you name the fence and the durable high-water token.
+
+Follow-up you should invite: “Where is the dual-owner window, and which store rejects the stale write after a crash-restart of that store?”
+
+</InterviewTraps>
+
+<Tradeoffs title="False positives, zombie time, and how hard you fence">
+
+- **Short versus long suspicion timeouts:** short `session.timeout.ms` / replica-lag bounds recover faster and create more false-positive elections and dual-owner windows; long timeouts hide deploys and leave corpses assigned.
+- **ISR-only versus unclean leader election:** ISR-only preserves the acknowledged prefix at the cost of unavailability when no ISR member remains; unclean restores a leader and can drop acked offsets. That is a delivery choice, not a detection tweak.
+- **Epoch fencing at replicas versus event-id idempotency at the sink:** replica epochs stop split-brain produces; they do not serialize ledger effects. Event ids (or a stored generation) close consumer overlap. You usually need both layers.
+- **Volatile versus durable high-water tokens:** in-memory max epoch is fast and loses exclusion across resource restart. Durable retain-before-work is the safety boundary.
+- **Controller-independent data plane:** partition leaders surviving controller death preserves availability of reads and writes on the last map, at the cost of frozen ISR and assignment changes until metadata returns.
+- **Catch-up capacity versus cost:** leftover consume or replica-fetch rate is extra CPU, disk, and sink capacity you pay for even when healthy, or you accept multi-minute lag after every death.
+
+Correctness is fencing plus idempotency. Timeouts only trade how quickly you *start* the unsafe window.
+
+</Tradeoffs>
+
+<KnowledgeCheck
+  question="A TokenX settlement JVM pauses for 45 s. session.timeout.ms is 30 s. The coordinator assigns partition 3 to another member. The paused JVM resumes and commits a ledger write. What failed, and what actually excludes the stale writer?"
+  options={[
+    "Nothing failed: lease expiry at the coordinator immediately invalidates any SQL from the old member",
+    "The timeout was a false-positive suspicion; exclusion requires a durable fencing token or unique event id checked at the ledger, which the coordinator does not update",
+    "max.poll.interval.ms is the only detector that matters, so a heartbeat timeout cannot reassign the partition",
+    "Controller failover already fenced every partition leader, so the sink cannot accept the write"
+  ]}
+  correct={1}
+  explanation="A pause longer than the session timeout looks like death. Reassignment is not exclusion. The ledger must reject a stale generation or no-op a duplicate event id, and that high-water state must survive store restart. Controller failover is a different protocol and does not fence SQL."
+/>
+
+<KnowledgeCheck
+  question="The Kafka controller process dies. Producers to an already-assigned partition leader continue to receive acknowledgements. Which statement is accurate?"
+  options={[
+    "Controller failover reassigns every partition and fences every leader, so those acknowledgements are unsafe",
+    "Existing partition leaders keep serving on the last metadata assignment; controller election restores metadata writes, not a cluster-wide partition failover",
+    "ISR is empty until a new controller exists, so high-watermark must rewind to zero",
+    "Consumers must stop because group generation is stored only in the controller process heap"
+  ]}
+  correct={1}
+  explanation="Controller failover is metadata recovery. Partition leadership changes when a partition's leader is re-elected (typically after a broker death) and a new leader epoch is installed. HW is an ISR read gate, not a controller heap. Group coordinators are brokers using the same metadata authority; they are not wiped because the previous controller process exited."
+/>
+
+<ScenarioCheck
+  scenario="settlement-2 is killed after sending a ledger commit for event S-991 but before committing the Kafka offset. Generation 13 assigns partition 3 to settlement-5, which fetches S-991. A delayed packet from settlement-2 later reaches Postgres. Unclean leader election is off; the partition leader did not change."
+  question="Which design preserves the balance invariant, and which claim about failover would be indefensible?"
+  options={[
+    { label: "Rely on exclusive group assignment: generation 13 proves settlement-2 can no longer write, which is safe failover.", feedback: "Assignment is fetch ownership. It does not cancel an in-flight commit. Calling this safe failover omits fencing at the ledger." },
+    { label: "Insert event_id S-991 with the mutation in one database transaction (and persist any fencing generation before work). Replay is a no-op. Do not call the cutover safe failover without that durable token.", feedback: "The dual-owner window is expected. The sink unique key or retained epoch is the fence. Group assignment was never the mutex." },
+    { label: "Commit the Kafka offset in the shutdown hook before the ledger write so settlement-5 skips S-991.", feedback: "A kill can skip the hook. Commit-before-apply is at-most-once loss, which TokenX settlement cannot accept." },
+    { label: "Promote a non-ISR replica as partition leader so the delayed write has no log to correspond to.", feedback: "That is unclean election and a different failure. It can drop acked offsets and still does not fence Postgres." },
+  ]}
+  correct={1}
+  explanation="Consumer death is not partition-leader failover. Preserve the ledger with idempotency or a durable high-water token. Refuse 'safe failover' unless that fence is named."
+/>
+
+<InterviewAnswer>
+
+“Failure detectors are timeouts plus suspicion, not truth. A GC pause or network blip is a false positive: we declare death and elect a successor. A false negative is a process that still heartbeats while work is wedged, or a timeout so long a crash is never declared. A zombie that still writes after suspicion is split brain—the dual-owner window—not a missed heartbeat. Heartbeats, leases, and session timeouts let a coordinator reassign. They do not instantly exclude the old holder. The resource must check a fencing token, leader epoch, or generation after that high-water value is durable—same protocol as the locks lesson. I will not say safe failover without naming that fence.
+
+In Kafka I separate three deaths. A broker that led a partition: elect from the ISR, increment leader epoch, replicas reject the old epoch, former leaders truncate by leader-epoch end offsets, not a blind HW rewind. HW stays the consumer read gate. Unclean election is a delivery-envelope choice that can drop acked offsets. A controller death moves metadata authority; it does not reassign every partition. A consumer death bumps generation at the coordinator; that is not a sink mutex. TokenX settlement uses a unique event id for the dual-owner window after worker death. Ad Click lag after a collector dies drains only at leftover consume rate while produce continues. Membership, log, and sink are three authorities.”
+
+</InterviewAnswer>

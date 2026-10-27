@@ -33,11 +33,11 @@ Status key: **Hardened** means the lesson meets the full learning standard, incl
 2. **Kafka Internals** — partitions, replicas, leaders, in-sync replicas, controller behavior, retention, and log segments. **Hardened**
 3. **Consumer Groups and Rebalancing** — ownership, cooperative rebalance, lag, state restore, and parallelism limits. **Hardened**
 4. **Ordering and Event Keys** — per-partition order, key choice, sequence numbers, causal order, and resequencing. **Hardened**
-5. **Stream Processing and Windows** — event time, processing time, watermarks, late data, state stores, and changelogs. **Planned**
-6. **Retries, Dead Letters, and Replay** — error taxonomy, retry topics, quarantine, replay controls, and operational ownership. **Planned**
-7. **Failure Detection and Recovery** — heartbeats, leases, fencing tokens, split brain, failover, and repair. **Planned**
-8. **Graceful Degradation** — bulkheads, circuit breakers, fallbacks, admission control, and dependency isolation. **Planned**
-9. **Disaster Scenarios** — broker loss, regional loss, corrupt events, accidental deletion, and recovery exercises. **Planned**
+5. **Stream Processing and Windows** — event time, processing time, watermarks, late data, state stores, and changelogs. **Hardened**
+6. **Retries, Dead Letters, and Replay** — error taxonomy, retry topics, quarantine, replay controls, and operational ownership. **Hardened**
+7. **Failure Detection and Recovery** — heartbeats, leases, fencing tokens, split brain, failover, and repair. **Hardened**
+8. **Graceful Degradation** — bulkheads, circuit breakers, fallbacks, admission control, and dependency isolation. **Hardened**
+9. **Disaster Scenarios** — broker loss, regional loss, corrupt events, accidental deletion, and recovery exercises. **Hardened**
 
 ## Module 4 — Performance
 
@@ -97,5 +97,5 @@ Complete the hardened foundation lesson in each module once to establish breadth
 
 - **Phase 0 — Complete:** the seven foundation lessons have corrected technical boundaries, explicit failure and recovery paths, challenging scenario checks, and reusable interactive learning components. Content validation covers frontmatter, section order, quiz counts, and Mermaid syntax.
 - **Phase 1A — Complete:** all nine Storage & Data lessons and all nine CAP & Consistency lessons are hardened, cross-linked, interactive, and validated.
-- **Phase 1B — In progress:** Module 3 now has four hardened lessons (delivery, internals, consumer groups, ordering). The academy contains 26 of 64 planned lessons. Continue with stream processing, retries, and disaster scenarios, then Modules 2, 4, 5, and 7.
+- **Phase 1B — In progress:** Module 3 is complete (9/9). The academy contains 31 of 64 planned lessons. Resume operating lessons in Modules 2, 4, 5, and 7.
 - **Phase 2 — Future, not implemented:** add an Architecture Reference Library of reusable patterns, decision guides, failure modes, and canonical diagrams cross-linked to lessons and mock interviews.
