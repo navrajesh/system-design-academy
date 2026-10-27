@@ -19,13 +19,13 @@ Status key: **Hardened** means the lesson meets the full learning standard, incl
 ## Module 2 — Scalability
 
 1. **Scaling Read-Heavy Services** — stateless compute, cache-aside, read replicas, autoscaling, and bottleneck analysis. **Hardened**
-2. **Load Balancing Deep Dive** — L4/L7, algorithms, health checks, connection draining, locality, and session affinity. **Planned**
-3. **Caching Patterns and Invalidation** — CDN, application and database caches, eviction, TTL jitter, stampede protection, and coherence. **Planned**
-4. **Write Scaling** — batching, partitioned ownership, asynchronous writes, write-behind, and contention. **Planned**
-5. **Autoscaling and Capacity Planning** — leading signals, headroom, warm-up, bin packing, and seasonal capacity. **Planned**
-6. **Fan-out Architectures** — fan-out on write/read, hybrid feeds, celebrity keys, ranking, and backfill. **Planned**
-7. **Multi-Region Design** — active/passive, active/active, locality, data sovereignty, and traffic evacuation. **Planned**
-8. **Migration at Scale** — shadow reads, dual writes, change-data capture, backfill, verification, and rollback. **Planned**
+2. **Load Balancing Deep Dive** — L4/L7, algorithms, health checks, connection draining, locality, and session affinity. **Hardened**
+3. **Caching Patterns and Invalidation** — CDN, application and database caches, eviction, TTL jitter, stampede protection, and coherence. **Hardened**
+4. **Write Scaling** — batching, partitioned ownership, asynchronous writes, write-behind, and contention. **Hardened**
+5. **Autoscaling and Capacity Planning** — leading signals, headroom, warm-up, bin packing, and seasonal capacity. **Hardened**
+6. **Fan-out Architectures** — fan-out on write/read, hybrid feeds, celebrity keys, ranking, and backfill. **Hardened**
+7. **Multi-Region Design** — active/passive, active/active, locality, data sovereignty, and traffic evacuation. **Hardened**
+8. **Migration at Scale** — shadow reads, dual writes, change-data capture, backfill, verification, and rollback. **Hardened**
 
 ## Module 3 — Kafka & Fault Tolerance
 
@@ -91,11 +91,11 @@ Status key: **Hardened** means the lesson meets the full learning standard, incl
 
 ## Recommended learning path
 
-Complete the hardened foundation lesson in each module once to establish breadth. Modules 1 and 6 are now complete, providing the storage and distributed-correctness spine. Continue with Module 3 for event-driven reliability, Modules 2, 4, and 5 for operating behavior, then Module 7 for repeated timed practice. Every mock interview should produce a short gap list that points back to a specific curriculum topic.
+Complete the hardened foundation lesson in each module once to establish breadth. Modules 1, 2, 3, and 6 are now complete, providing the storage, scalability, event-driven reliability, and distributed-correctness spine. Continue with Modules 4 and 5 for operating behavior, then Module 7 for repeated timed practice. Every mock interview should produce a short gap list that points back to a specific curriculum topic.
 
 ## Delivery phases
 
 - **Phase 0 — Complete:** the seven foundation lessons have corrected technical boundaries, explicit failure and recovery paths, challenging scenario checks, and reusable interactive learning components. Content validation covers frontmatter, section order, quiz counts, and Mermaid syntax.
 - **Phase 1A — Complete:** all nine Storage & Data lessons and all nine CAP & Consistency lessons are hardened, cross-linked, interactive, and validated.
-- **Phase 1B — In progress:** Module 3 is complete (9/9). The academy contains 31 of 64 planned lessons. Resume operating lessons in Modules 2, 4, 5, and 7.
+- **Phase 1B — In progress:** Modules 2 and 3 are complete (8/8 and 9/9). The academy contains 38 of 64 planned lessons. Resume operating lessons in Modules 4, 5, and 7.
 - **Phase 2 — Future, not implemented:** add an Architecture Reference Library of reusable patterns, decision guides, failure modes, and canonical diagrams cross-linked to lessons and mock interviews.
