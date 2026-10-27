@@ -1,0 +1,266 @@
+---
+title: "Design a Chat System"
+description: "Design 1:1 and group chat with per-conversation sequence numbers, derived presence, receipts, offline sync, encrypted media, and sockets that never own durable commit."
+module: 7
+moduleTitle: "Architecture & Mock Interviews"
+order: 4
+duration: 45
+difficulty: "Advanced"
+tags:
+  - chat
+  - ordering
+  - presence
+  - delivery
+  - encryption
+objectives:
+  - Separate durable message commit from WebSocket push and reconnect resume
+  - Order messages with per-conversation sequence numbers rather than wall clocks
+  - Treat presence, receipts, and device inboxes as derived state with explicit expiry and replay
+  - Place media bytes in object storage and ciphertext beyond the server's read boundary
+---
+
+<BigPicture title="Chat is an ordered append log, not a ledger and not a socket">
+
+A chat product looks realtime. The durable product is narrower: append opaque messages to a conversation, show them in a stable order, and catch devices up after they disappear. The interviewer is testing whether you keep those jobs on different stores.
+
+We will work one complete prompt:
+
+> **Design a chat system** that supports one-to-one and small-to-medium group conversations, delivery and read receipts, online presence, offline catch-up, image and video attachments, and optional end-to-end encryption.
+
+Scope for the first architecture: one region, conversations of tens to a few thousand members, client-generated message ids, and push over WebSockets with mobile push as fallback. Global last-write-wins “edit history,” searchable plaintext on the server, and billion-member broadcast rooms are out of scope unless the interviewer adds them.
+
+This is **not** TokenX. A chat append does not conserve balances. A TokenX transfer still needs a serializable ledger and an idempotency key on HTTP or gRPC. Do not commit money because a chat frame was sent. See [real-time connections](/learn/real-time-connections).
+
+### Requirements and invariants
+
+- A sender can create a message with a client message id and later read a stable server sequence for that conversation.
+- Recipients in the same conversation see the same relative order of committed messages. That order is a per-conversation sequence number, not a wall clock. [Time and ordering](/learn/time-and-ordering) already forbids treating NTP as a sequencer.
+- Presence is derived: last heartbeat plus expiry. It is allowed to be wrong across partitions.
+- Delivery and read receipts are derived, at-least-once facts keyed by message, device, and receipt type.
+- An offline client can resume from stored watermarks and fetch gaps from the message log. The socket buffer is not the archive.
+- Media bytes live in [object storage](/learn/object-storage-and-large-files). The metadata database owns visibility of an object key. End-to-end encryption means the server stores ciphertext it cannot decrypt.
+- Target p99 for send acknowledgement of a committed text message is 200 ms in-region under normal load. Catch-up of 500 messages may take seconds and is a different SLO.
+
+The “why” behind the architecture: **conversation order and durable identity live in the message log**. Everything else—presence, inboxes, sockets, unread badges—is rebuildable.
+
+</BigPicture>
+
+<UnderTheHood title="Work the chat design from numbers to commit, fan-out, and resume">
+
+### 1. Estimate the workload
+
+Assume 80 million registered users, 12 million daily active users, and 40 messages per active user per day. Design for a 10× evening peak. Average committed envelope is 1.5 KB of ciphertext plus metadata. Illustrative, not a measured product.
+
+<Calculation label="Chat planning envelope">
+Average messages = 12,000,000 × 40 / 86,400 ≈ 5,556 messages/s
+
+Peak messages at 10× ≈ 55,560 messages/s
+
+At 1.5 KB durable envelope: ≈ 83 MB/s before indexes and replication; ≈ 7.2 TB/day raw
+
+One year of raw message envelopes ≈ 2.6 PB before replicas, indexes, and backups
+
+5 million concurrent sockets, ping every 30 s: ping rate ≈ 167,000 frames/s
+
+Group of 80 members: one send becomes 80 derived inbox or push copies; celebrity rooms need hybrid fan-out, not 80 million log writes
+</Calculation>
+
+These numbers justify partitioned conversation logs, independent read and push scaling, and a hard cap on naive per-member materialization. They do not justify a global sequencer or treating Redis presence as the message store.
+
+### 2. Define the API contract
+
+- <code>POST /v1/conversations/{'{conversationId}'}/messages</code> with header <code>Idempotency-Key</code> or body <code>clientMessageId</code> and ciphertext payload. Returns <code>{'{messageId, conversationId, seq, committedAt}'}</code>.
+- <code>GET /v1/conversations/{'{conversationId}'}/messages?afterSeq=...&limit=...</code> is the offline-sync and gap-fill path.
+- <code>POST /v1/conversations/{'{conversationId}'}/receipts</code> records delivered or read for <code>{'{messageId, deviceId}'}</code>.
+- <code>POST /v1/media/uploads</code> creates an <code>UPLOADING</code> metadata row and short-lived signed URLs. Finalize flips the row to <code>AVAILABLE</code> only after checksum verification.
+- WebSocket <code>subscribe</code> carries a **resume token**: connection epoch plus per-conversation <code>last_seq</code>. The socket never assigns <code>seq</code>.
+
+Retrying send with the same client message id must not create a second sequence number. That rule is [idempotency and deduplication](/learn/idempotency-and-deduplication), applied to an append, not to a TokenX debit.
+
+### 3. Model authoritative data
+
+- <code>conversations(conversation_id, type, created_at)</code> — 1:1 or group identity.
+- <code>membership(conversation_id, user_id, role, joined_seq)</code> — who may read or append. A 1:1 chat is two membership rows, not a different protocol.
+- <code>messages(conversation_id, seq, message_id, sender_id, client_message_id, ciphertext, media_ref, committed_at)</code> — append-only log. Unique <code>(conversation_id, seq)</code> and <code>(sender_id, client_message_id)</code>.
+- <code>media_objects(object_id, storage_key, checksum, size, status)</code> — transactional metadata. Bytes are in the object store.
+- <code>outbox(event_id, conversation_id, seq, event_type)</code> — post-commit fan-out intent.
+
+Derived and rebuildable: presence TTLs, per-device inboxes, unread counters, WebSocket resume buffers, and push provider tickets. [Fan-out architectures](/learn/fan-out-architectures) own how copies multiply; they do not own the sequence.
+
+### 4. Execute one send
+
+The conversation partition, or a per-conversation sequencer on that partition, assigns the next <code>seq</code> inside the same transaction that inserts the message and outbox row. Wall-clock <code>committed_at</code> is display and TTL input. Two phones with skewed clocks cannot reorder seq 41 and seq 42.
+
+<ExecutionTimeline
+  title="Commit ciphertext, then push a copy"
+  steps={[
+    { title: "Fence the send", detail: "Authenticate, authorize membership, hash the ciphertext envelope, and look up the sender clientMessageId.", state: "The message table owns operation identity.", failure: "A repeated id with a different hash is a conflict, not a new seq." },
+    { title: "Assign sequence", detail: "Lock or atomically increment the conversation sequencer and insert the opaque row plus outbox event.", state: "One transaction owns (conversation_id, seq) and durability.", failure: "Sequencer or quorum loss rejects the send; the socket must not invent a seq." },
+    { title: "Ack the sender", detail: "Return messageId and seq over HTTP or as a commit frame that only repeats the database result.", state: "Durability is the log commit, not TCP delivery to peers.", failure: "Client timeout is resolved by replaying clientMessageId, then GET afterSeq." },
+    { title: "Fan-out and resume", detail: "Workers copy the event into device inboxes and live sockets. Offline members keep a watermark. Media remains a pointer to an object key.", state: "Inboxes, presence, and resume buffers are derived.", failure: "Lost WS frames are gaps; clients fetch the log rather than minting messages." }
+  ]}
+/>
+
+End-to-end encryption does not move the commit boundary. The server still orders ciphertext blobs it cannot read. It can see conversation id, seq, size, membership, and attachment keys. It cannot honestly offer server-side full-text search of bodies.
+
+### 5. Plan the evolution path
+
+At tens of thousands of commits per second, partition by <code>conversation_id</code>. Hot group chats are a measured sequencer bottleneck, not a reason to order by wall clock. Very large rooms switch that conversation to fan-out-on-read or hybrid skip, still reading one authoritative log. Multi-region active-active appends need a named conflict story (per-region conversations, or a consensus protocol). Last-write-wins on message bodies is not that story.
+
+</UnderTheHood>
+
+<MentalModel title="A numbered notebook, a radio, and a sealed envelope">
+
+Think of each conversation as a notebook with printed page numbers. The radio (WebSocket) tells people a new page exists. Presence is “I heard you rustle in the last 45 seconds.” Attachments are boxes in a warehouse with labels in the notebook. End-to-end encryption means the warehouse stores sealed envelopes; staff can stack them in order without opening them.
+
+TokenX is a different building: a notary that must not double-spend. Do not put the notary on the radio.
+
+Retain this loop:
+
+1. **Append** ciphertext under a client id into a per-conversation sequence.
+2. **Push** a derived copy over sockets or device push.
+3. **Expire** presence; **resume** from tokens and log fetch, not from wall clocks.
+4. **Never** treat a socket ack, a heartbeat, or a receipt as a money commit.
+
+</MentalModel>
+
+<ArchitectureDiagram title="Authoritative chat log with derived presence, inboxes, and sockets" chart={"flowchart LR\n  C[Client] -->|idempotent send ciphertext| API[Chat API]\n  C --> KEYS[Client key store]\n  API --> SVC[Chat service]\n  SVC --> SEQ[(Conversation sequencer)]\n  SVC --> LOG[(Authoritative message log)]\n  LOG --> ACK[(Receipt records)]\n  LOG --> FAN[Fan-out workers]\n  FAN --> INB[(Device inbox)]\n  FAN --> WS[WebSocket gateway]\n  FAN --> PUSH[Push fallback]\n  WS --> BUF[(Resume buffer)]\n  WS --> PRES[(Presence TTL)]\n  C -->|signed upload| OBJ[(Object store)]\n  SVC --> META[(Media metadata DB)]\n  META -.-> OBJ\n  C -. reconnect resume token .-> WS\n  LOG -. gap and offline sync .-> C"}>
+
+The message log plus per-conversation sequencer is the consistency boundary for order and identity. Media metadata commits the object key that is allowed to be visible; object bytes are immutable blobs and may be ciphertext. Presence, resume buffers, device inboxes, and push tickets are derived. Solid edges are durable send, metadata publish, and post-commit fan-out. Dashed edges are reconnect, gap fetch, and the metadata-to-bytes pointer. Recovery is: replay the client message id, fetch after seq from the log, expire presence, and never assign seq on the gateway.
+
+<ArchitectureWalkthrough
+  title="Defend every chat state boundary"
+  stages={[
+    { name: "Send API", owner: "Stateless chat service", state: "Auth context, request hash, no durable seq", boundary: "Builds one log transaction. Does not decrypt E2E ciphertext.", failure: "Process dies after forwarding.", recovery: "Client retries the same clientMessageId and reads GET afterSeq." },
+    { name: "Log commit", owner: "Partitioned quorum-backed store", state: "messages, sequencer, outbox, media metadata pointers", boundary: "Serializable or compare-and-set per conversation_id. Durability of order lives here.", failure: "Leader lost mid-commit.", recovery: "Only quorum-committed seq is returned; ambiguous sends resolve by client id." },
+    { name: "Live push", owner: "WebSocket gateway", state: "Sockets, bounded resume buffer, heartbeat timestamps", boundary: "Best-effort derived notify. Presence is last_seen plus TTL.", failure: "Deploy RSTs sockets; buffer evicts; partition shows ghosts until expiry.", recovery: "Reconnect with resume token; gaps GET the log; presence expires." },
+    { name: "Copies and media", owner: "Fan-out workers and object store", state: "Device inboxes, receipts, object bytes", boundary: "At-least-once copies after log commit. Bytes are not the membership authority.", failure: "Inbox lag, orphaned uploads, push provider timeout.", recovery: "Idempotent inbox insert on (device, seq); incomplete uploads stay UPLOADING; clients fetch the log." }
+  ]}
+/>
+
+</ArchitectureDiagram>
+
+<RealExamples title="1:1 send, group fan-out, encrypted media, and a dropped socket">
+
+### One-to-one send
+
+Alice sends ciphertext to a 1:1 conversation with Bob. The service checks membership, reuses Alice's <code>clientMessageId</code> if present, assigns seq 18, and commits. Bob's phone is online: the gateway pushes seq 18. Bob's tablet is offline: it later GET-syncs <code>afterSeq=17</code> and inserts 18. Both devices show the same order even if the tablet's clock is two minutes slow.
+
+### Group chat and receipts
+
+A 60-member group is still one log. Fan-out writes 60 derived inbox or socket copies. Receipts are not a second sequencer: <code>(message_id, device_id, delivered|read)</code> is idempotent. Unread badges drift and are repaired from watermarks. A 2-million-member “group” is a room: skip per-member inbox writes and mix from the log at read time, as in the fan-out lesson's celebrity path.
+
+### Encrypted image
+
+The client encrypts the image, uploads parts to the object store with a signed URL, then sends a chat message whose ciphertext includes the wrapped object key for members. The metadata row becomes <code>AVAILABLE</code> only after checksums match. The CDN may cache ciphertext blobs; it still cannot produce plaintext. The server can delete or tombstone a pointer; it cannot search the photo's contents.
+
+### Timeout after commit
+
+The log commits seq 18, the response is lost, and the WebSocket is already dead. Alice retries the same client id and receives seq 18 again. She does not mint seq 19. Bob reconnects with resume token <code>{'{epoch, last_seq: 17}'}</code>. If the gateway buffer missed 18, Bob GETs the gap. That fetch is the recovery path, not a new send.
+
+<FailureScenario
+  title="Explore chat degraded modes"
+  prompt="Select a failure and inspect what the architecture still promises."
+  choices={[
+    { label: "Conversation sequencer unavailable", impact: "Sends for that conversation cannot prove the next seq and reject or time out. History reads of already committed rows may still work.", recovery: "Wait for the partition leader; resolve in-flight sends by clientMessageId; do not order by wall clock as a fallback." },
+    { label: "WebSocket mesh drain", impact: "Live frames drop. Presence looks empty until heartbeats resume. Committed messages are unharmed.", recovery: "Clients reconnect with resume tokens; gaps sync from the log; mobile push covers background devices." },
+    { label: "Presence store lost", impact: "Online dots vanish or linger until TTL. No message seq is lost because presence was never authoritative.", recovery: "Rebuild last_seen from new heartbeats; keep expiry short; never authorize TokenX spend from a green dot." },
+    { label: "Object store part lost", impact: "An attachment stays UPLOADING. The chat row must not claim AVAILABLE. Peers may see a message with a broken media_ref.", recovery: "Client retries the same object id; finalize only after checksums; orphaned parts expire by lifecycle rule." }
+  ]}
+/>
+
+</RealExamples>
+
+<InterviewTraps title="IC6 follow-ups and a defensible rubric">
+
+### Questions the interviewer should be able to ask
+
+- How do 1:1 and group chat share one log model, and when does a “group” become fan-out-on-read?
+- Where is per-conversation order assigned, and why is wall-clock sort insufficient?
+- What does a delivery receipt prove, and what happens if it is duplicated?
+- How is presence allowed to lie, and what expiry did you pick?
+- How does an offline client catch up, and what is in the resume token versus the message log?
+- Where do media bytes live, and which transaction makes them visible?
+- What can the server still see under end-to-end encryption, and what can it not search?
+- Why is the WebSocket not the commit path, and how does reconnect avoid creating duplicate seqs?
+- TokenX product asks to “confirm a transfer in the chat socket.” What do you refuse?
+
+### IC6 scoring rubric
+
+- **Requirements:** 1:1 and group as membership plus one conversation log; encryption, media, receipts, and presence have named owners.
+- **Quantification:** daily messages to peak commits, storage, ping QPS, and write amplification for groups.
+- **Correctness:** client message id uniqueness, per-conversation seq, no wall-clock order, at-least-once receipts, E2E as a read boundary—not as “the server is honest.”
+- **Architecture:** log is authoritative; sockets, presence, inboxes, and push are derived; object store is bytes; metadata DB is the pointer.
+- **Operations:** sequencer loss, socket drain, gap fetch, orphan uploads, hot groups, backlog on fan-out.
+- **Evolution:** partition by conversation; hybrid fan-out for huge rooms; multi-region only with an explicit conflict protocol.
+- **Communication:** chat is not a ledger; TokenX money stays on keyed HTTP.
+
+A weak answer says “use WebSockets and Cassandra timestamps” or “exactly-once delivery to all devices.” A defensible answer names the sequencer, the idempotent client id, the derived push path, and the fetch-on-gap contract.
+
+</InterviewTraps>
+
+<Tradeoffs title="Why this design—and when it stops fitting">
+
+**Per-conversation sequencer in the log transaction:** gives a total order recipients can agree on, but that conversation's send availability tracks the partition. A global sequencer would serialize unrelated chats for no product gain.
+
+**WebSocket push after commit:** low latency notify and cheap typing hints, but deploys drop sockets, buffers are bounded, and delivery to other devices is at-least-once. HTTP-only polling is simpler operationally and slower to appear “live.”
+
+**Derived presence with heartbeat expiry:** cheap and partition-tolerant, but ghosts and false offlines are user-visible. Storing presence in the message log would mix ephemeral heartbeats with durable history.
+
+**Fan-out-on-write inboxes for small groups:** fast member reads, but write amplification grows with membership. Huge rooms must skip copies and read the log.
+
+**E2E ciphertext on the server:** protects bodies from datastore operators and from honest-but-curious search, but kills server-side moderation search, multi-device key wrapping becomes a client protocol, and metadata (who talked, when, how large) still leaks.
+
+**Media in object storage plus metadata DB:** scales bytes independently of the log, but introduces orphaned uploads and a two-phase “bytes then pointer” race until finalize.
+
+This design becomes inappropriate when a room has celebrity-scale membership without hybrid fan-out, when regulators require server-side content inspection that E2E forbids, or when someone tries to reuse the chat socket as a TokenX ledger. At that point you change the product or the protocol; you do not pretend a resume buffer conserves money.
+
+</Tradeoffs>
+
+<KnowledgeCheck
+  question="A client sends a chat message over WebSocket, the gateway crashes after the log commits seq 42, and the sender never receives an ack. What should happen?"
+  options={[
+    "The sender retries without a client message id so the conversation gets seq 43, which is safer than a gap",
+    "The sender retries the same clientMessageId; the service returns seq 42; peers that missed the push GET afterSeq from the log",
+    "The gateway buffer is the source of truth, so seq 42 is rolled back because no socket ack was stored",
+    "Devices sort by wall-clock committed_at so the missing ack cannot affect order"
+  ]}
+  correct={1}
+  explanation="Durability and order live in the conversation log. The socket is derived push. Idempotent client ids prevent a second seq. Gap fill is a log fetch, not a new append, and wall clocks are not the sequencer."
+/>
+
+<ScenarioCheck
+  scenario="Product wants a green 'online' dot that is linearizable, delivery receipts that prove the recipient read plaintext, and TokenX 'Pay in chat' that commits a transfer when the chat WebSocket receives a pay frame."
+  question="Which answer matches this curriculum?"
+  options={[
+    { label: "Keep presence as last_seen plus TTL; receipts as idempotent derived rows that do not imply the server read E2E plaintext; refuse money on the socket and POST TokenX with a transfer id.", feedback: "Presence may lie. Receipts are at-least-once metadata. Chat is not a ledger." },
+    { label: "Store presence in the same row as seq so online is as durable as history.", feedback: "Heartbeats would bloat the log and still expire; mixing them does not make presence linearizable." },
+    { label: "Because E2E is on, a read receipt means the server observed plaintext and can search it.", feedback: "The server orders ciphertext. Receipts are client assertions, not a decryption event." },
+    { label: "Committing TokenX on the pay frame is fine if the gateway uses sticky sessions.", feedback: "Stickiness is not a unique index and not a ledger. Sockets drop on restart." }
+  ]}
+  correct={0}
+  explanation="IC6 chat design keeps the log, the radio, the heartbeat, and the notary on separate contracts. E2E limits what the server can read; it does not make receipts or sockets authoritative for money."
+/>
+
+<ScenarioCheck
+  scenario="A 2,000-member group and a 2-million-member announcement channel share the same 'group chat' product name. An interviewer asks why you will not write 2 million inbox rows per announcement."
+  question="Which design shows the strongest judgment?"
+  options={[
+    { label: "Keep one authoritative log per conversation; push copies to inboxes for the 2,000-member group; skip per-member materialization for the announcement channel and mix from the log (hybrid fan-out); still assign seq on the log, not on WebSockets.", feedback: "Membership scale changes copy strategy, not the identity of the sequencer." },
+    { label: "Order both rooms by arrival timestamps at the nearest edge so you can avoid a sequencer.", feedback: "Clock skew and independent edges reorder history." },
+    { label: "Put every room on one global Kafka partition so all users share one order.", feedback: "Unrelated conversations should not share a hot key, and Kafka order is not a substitute for conversation seq in the database." },
+    { label: "Drop the log and treat each device inbox as authoritative so fan-out cost is 'just writes.'", feedback: "Inboxes diverge; offline sync has no single afterSeq." }
+  ]}
+  correct={0}
+  explanation="Fan-out is how copies multiply. The conversation log still owns order. Huge membership is the celebrity path, not a reason to abandon seq or to commit on a socket."
+/>
+
+<InterviewAnswer>
+
+“I treat chat as an append-only log per conversation. One-to-one and group are the same model: membership rows plus one sequencer. At about 12 million daily users and 40 messages each, I plan roughly 5,500 commits per second and 55,000 at a 10× peak, plus ping traffic on millions of sockets.
+
+A send carries a client message id and ciphertext. One transaction assigns the next seq, stores the opaque row, and writes an outbox event. Wall clocks are display. Peers are notified over WebSockets after commit; the socket does not own durability. Offline clients resume with a token of last seq and fetch gaps from the log. Presence is a heartbeat with expiry. Receipts are idempotent derived facts. Media bytes go to object storage; the metadata database publishes the pointer. Under end-to-end encryption the server can order envelopes it cannot read.
+
+If the gateway dies, clients retry the same id and sync the log. I would not order by NTP, would not make presence linearizable, and would not commit TokenX on a chat frame—money stays a keyed HTTP ledger. Large announcement rooms skip per-member inboxes and read the same log.”
+
+</InterviewAnswer>

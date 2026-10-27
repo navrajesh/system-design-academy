@@ -1,0 +1,263 @@
+---
+title: "Design a URL Shortener"
+description: "Design create, redirect, optional aliases, and derived analytics with explicit ID collision, cache, and store-failure boundaries."
+module: 7
+moduleTitle: "Architecture & Mock Interviews"
+order: 2
+duration: 42
+difficulty: "Advanced"
+tags:
+  - url-shortener
+  - identifiers
+  - cache
+  - redirects
+  - abuse
+objectives:
+  - "Turn create, redirect, and optional alias requirements into ID and cache constraints"
+  - "Size a 100M-URL catalog at 10k writes/s and 100k redirects/s with units"
+  - "Choose hash, counter, or Snowflake-style IDs and name the collision boundary"
+  - "Defend 301 vs 302, derived CDN cache, and store-versus-cache failure"
+---
+
+<BigPicture title="A mapping product, not a ledger and not ad billing">
+
+A URL shortener is a **key-value mapping** with a tiny public key, a cached HTTP redirect, and an optional analytics sidecar. The interviewer is testing whether you can quantify a read-heavy path, pick an identifier that survives collision and enumeration, and keep **authoritative mapping** separate from **derived** caches and counters.
+
+Work this prompt:
+
+> **Design a URL shortener** that lets an authenticated caller create a short URL, resolve it with an HTTP redirect, inspect coarse click analytics, and optionally attach a custom alias.
+
+In scope: create, redirect, optional aliases, abuse controls, cache placement, and rebuildable analytics. Out of scope unless the interviewer adds them: TokenX balances or transfers, billed advertising click tracking, arbitrary file hosting, and a full multi-region active-active write story.
+
+TokenX spendable balances are a serializable ledger problem. An Ad Click Aggregator billed `click_id` is a different uniqueness and windowing product. Do not reuse those invariants here. A short code is not a wallet, and a redirect hit is not a billed impression.
+
+### Requirements and invariants
+
+- <code>POST /v1/links</code> creates a mapping from a generated or custom <code>short_code</code> to a destination URL and returns the short URL.
+- <code>GET /{'{short_code}'}</code> redirects the browser to the stored destination.
+- Analytics answers “about how many redirects in this window?” They may lag and may over-count under retry. They do not authorize creates.
+- Custom aliases are optional, first-writer-wins, and subject to reserved-word and lookalike policy.
+- Target p99 is 200 ms for create under normal load and 50 ms for a cached redirect at the edge.
+
+The invariant that actually drives the design: **at most one live mapping per <code>short_code</code>**, enforced by a named unique constraint on the mapping store—not by a hash function, a cache SET, or a rate limiter.
+
+</BigPicture>
+
+<UnderTheHood title="Quantify, pick an ID, then place cache around the mapping">
+
+### 1. Estimate the workload
+
+Use this **illustrative** envelope in the interview, and say so: **100 million** stored mappings, peak **10,000 creates/s**, peak **100,000 redirects/s**. Creates at 10k/s are a campaign burst, not a claim that the catalog grows by 864 million rows every day. Average create rate is much lower; the catalog size is the working set you must store, replicate, and cache.
+
+<Calculation label="URL shortener planning envelope">
+Catalog: 100,000,000 mappings × 500 B/row (code, URL ≤2 KB truncated in indexes, owner, expiry, timestamps) ≈ 50 GB raw
+
+Three replicas plus secondary indexes ≈ 150–250 GB durable mapping state
+
+Peak create write traffic: 10,000 writes/s × 500 B ≈ 5 MB/s before write-ahead logs and replication
+
+Peak redirect: 100,000 GET/s. Uncached origin egress at 300 B/response ≈ 30 MB/s
+
+At a 95% CDN hit ratio: origin redirect QPS ≈ 5,000/s; a flush or 301-cache stampede exposes all 100,000/s
+</Calculation>
+
+Redirects dominate. That is why [CDNs and edge architecture](/learn/cdns-and-edge-architecture) and [caching patterns and invalidation](/learn/caching-patterns-and-invalidation) sit on the read path, while the mapping KV or database remains the only place a create may commit. Partition the mapping by <code>short_code</code>; do not invent a global hotspot. See [partitioning vs sharding vs aggregation](/learn/partitioning-vs-sharding-vs-aggregation).
+
+<InteractiveCalculation mode="cache-load" title="Redirect origin QPS is miss rate times edge QPS" initialRate={100000} />
+
+### 2. Define the API contract
+
+- <code>POST /v1/links</code> with header <code>Idempotency-Key</code> and body <code>{'{destinationUrl, alias?, ttlDays?}'}</code>. Returns <code>{'{shortCode, href}'}</code>.
+- Replaying the same caller-scoped idempotency key with the same request hash returns the original code. A different hash is a conflict.
+- <code>GET /{'{shortCode}'}</code> returns 302 (default) or 301 with a <code>Location</code> header. Status is a product choice, not a free performance win.
+- <code>GET /v1/links/{'{shortCode}'}/stats</code> reads **derived** counters and may be stale.
+- Custom alias creates fail with 409 if the unique constraint on <code>short_code</code> already holds a row.
+
+### 3. Generate IDs without pretending hashes are unique
+
+Three common generators, one collision boundary:
+
+- **Hash of the destination** (for example SHA-256 truncated, then base62): same URL can collapse to the same code, which is only correct if the product wants global URL dedupe. Birthday collisions and two tenants wanting different codes for one URL still happen. Insert the candidate; on unique-constraint violation, perturb and retry. The hash is a candidate, not an authority.
+- **Sharded counter, then base62:** compact codes (6–7 characters). 62^7 ≈ 3.5×10^12 codes, far above 10^8 mappings. Cost: a counter range is a write hotspot, sequential codes are enumerable for scraping, and you must allocate disjoint ranges per writer. [Partitioning](/learn/partitioning-vs-sharding-vs-aggregation) applies to counter ranges the same way it applies to mapping shards.
+- **Snowflake-style** (timestamp + worker id + sequence): no global counter, time-sortable, more bits, clock-skew and worker-id reuse hazards. Still insert under the same unique constraint. Do not claim uniqueness from the timestamp field alone.
+
+Base62 (or base58) is an encoding, not a uniqueness protocol. Whatever generator you pick, the mapping row commit is the moment the code exists.
+
+### 4. Execute one create, then one redirect
+
+<ExecutionTimeline
+  title="Create then redirect critical path"
+  steps={[
+    { title: "Admit and scan", detail: "Authenticate, apply per-account and per-IP create limits, then scan the destination for malware, phishing, and reserved alias policy.", state: "No mapping row yet. Rate limit is admission only.", failure: "Limiter or scanner timeout must fail closed on create; do not mint a code for an unscanned destination." },
+    { title: "Allocate code", detail: "Use the idempotency key lookup, then hash, counter, or Snowflake candidate. Custom aliases skip generation and still take the unique index.", state: "Candidate only. Collision is possible until commit.", failure: "Duplicate key: retry a new candidate; do not overwrite another tenant's destination." },
+    { title: "Commit mapping", detail: "Insert short_code, destination, owner, expiry, and request hash in one durable write with UNIQUE(short_code) and UNIQUE(caller_id, idempotency_key).", state: "Mapping KV/DB is authoritative.", failure: "Timeout after commit: replay the idempotency key and return the stored code." },
+    { title: "Redirect and derive", detail: "GET checks CDN, then app cache, then the mapping store. The Location header is copied into derived caches. Click events enqueue asynchronously.", state: "CDN and Redis are photocopies. Counters are derived.", failure: "Cache miss herd hits the store; analytics lag does not block the 302." }
+  ]}
+/>
+
+Creates belong behind [rate limiting](/learn/rate-limiting). Redirects should not share the create limiter key: a viral GET storm is a cache and origin problem, not an excuse to 429 every reader if the mapping is public.
+
+### 5. 301 versus 302, and who may cache
+
+A **301 Moved Permanently** tells browsers and many CDNs they may reuse <code>Location</code> for a long time, often ignoring your wish to move the destination later. Subsequent clicks may never reach your origin, so analytics under-count. A **302 Found** (or 307) is the usual default: you keep the right to change <code>Location</code>, and you can set <code>Cache-Control</code> / CDN TTL yourself (illustrative: 60 s at edge, 10 s in app cache, with jitter).
+
+Caching is still a derived view. A 302 with <code>s-maxage=60</code> is a freshness *budget*, not linearizability with the mapping store. After you update a destination, old Location headers remain until TTL, purge, or versioned cache keys expire. See [caching patterns](/learn/caching-patterns-and-invalidation).
+
+### 6. Analytics are derived, optionally as blobs
+
+Enqueue an at-least-once redirect event after you have a mapping hit. Increment counters in a store that is **not** the mapping authority. If you keep raw hourly slices for later re-aggregation, write immutable objects—see [object storage and large files](/learn/object-storage-and-large-files)—and treat them as rebuildable input, not as the live redirect path. Do not import Ad Click windowing or billed uniqueness into this design unless the interviewer changes the product.
+
+</UnderTheHood>
+
+<MentalModel title="Tiny public key, fat private record, photocopied Location">
+
+Think of a coat-check token. The plastic number is public and short. The coat, owner, and expiry live behind the counter. Photocopying the number onto a sticky note on the door (CDN) makes lookup fast, but the sticky note is not the logbook. If someone reprints a number, the logbook's unique index—not the photocopy—rejects it.
+
+Retain this loop:
+
+1. **Requirement:** create, redirect, optional alias, approximate counts.
+2. **Constraint:** 100M mappings, 10k writes/s peak, 100k redirects/s peak, abuse, hot viral keys.
+3. **Decision:** unique mapping store; compact ID with insert-retry; 302 plus explicit edge TTL; rate-limit creates.
+4. **Consequence:** cache and counters can be wrong or missing; creates fail when the store cannot prove uniqueness.
+
+</MentalModel>
+
+<ArchitectureDiagram title="Authoritative URL mapping versus derived redirect cache and counters" chart={"flowchart LR\n  C[Creator] --> RL[Create rate limiter]\n  RL --> AB[Abuse scanner]\n  AB --> W[Write API]\n  W --> ID[ID allocator]\n  ID --> MAP[(Authoritative mapping store)]\n  W --> MAP\n  B[Browser] --> CDN[CDN edge cache]\n  CDN -->|HIT derived Location| B\n  CDN -->|MISS| SH[Origin shield]\n  SH --> APP[App redirect cache]\n  APP -->|MISS| RED[Redirect service]\n  RED --> MAP\n  RED -.-> Q[Analytics queue]\n  Q --> CTR[(Derived click counters)]\n  Q --> OBJ[(Hourly analytics blobs)]\n  MAP -. unique conflict or store down .-> W\n  CDN -. miss or TTL expiry .-> SH\n  MAP -. mapping store unavailable .-> RED"}>
+
+The mapping store owns <code>short_code → destination</code> in one consistency boundary. Unique constraints on <code>short_code</code> and on <code>(caller_id, idempotency_key)</code> are inside that boundary. CDN, origin shield, and app cache hold **derived** Location photocopies. Click counters and hourly blobs are a second, asynchronous, at-least-once boundary. Solid edges are the create commit and the cache-fill read. Dashed edges are failure or async paths: unique-constraint / store-down back to writes, cache miss toward origin, mapping unavailability on redirect, and analytics enqueue.
+
+<ArchitectureWalkthrough
+  title="Defend every URL-shortener state boundary"
+  stages={[
+    { name: "Create edge", owner: "Gateway plus abuse controls", state: "Auth context, create quota, destination scan result", boundary: "Admission only. No short_code authority.", failure: "Client timeout after the write API accepted the request.", recovery: "Replay the same idempotency key; read the stored mapping rather than inserting again." },
+    { name: "Mapping commit", owner: "KV or database with unique indexes", state: "short_code, destination, owner, expiry, request hash", boundary: "Durable mapping. Collision is a unique-constraint error.", failure: "Leader or quorum loss during insert.", recovery: "Fail the create. Do not serve a code the store cannot prove. Redirects may continue from derived cache until TTL." },
+    { name: "Redirect caches", owner: "CDN, shield, and app cache", state: "Derived Location, status, and Cache-Control", boundary: "Freshness budget, not the mapping logbook.", failure: "Flush, stampede, or cache process death.", recovery: "Singleflight fills from the mapping store; shed or serve stale-if-error only if the product allows a wrong destination." },
+    { name: "Analytics path", owner: "Queue, counters, object storage", state: "Click events, window sums, hourly blobs", boundary: "At-least-once after a mapping hit.", failure: "Queue lag or duplicate delivery.", recovery: "Rebuild counters from blobs; never write analytics back into the mapping row as authority." }
+  ]}
+/>
+
+</ArchitectureDiagram>
+
+<RealExamples title="Create, viral redirect, and a destination change">
+
+### Successful create
+
+A caller posts <code>https://example.com/launch</code> with an idempotency key. The write path rate-limits, scans the destination, allocates a 7-character base62 code from a sharded counter, and inserts the mapping. The unique index accepts the row. The API returns <code>https://short.example/aB3dE9x</code>. A retry with the same key returns that code; it does not allocate a second one.
+
+### Viral hot key
+
+A celebrity posts the same short URL. Redirect QPS on one <code>short_code</code> jumps from tens to tens of thousands. Hash sharding of the catalog does not split one key. The CDN must hold that Location. On miss, singleflight one origin fill. A dedicated hot-key replica in the app cache is reasonable. Do not add 1,000 mapping shards to fix one celebrity code.
+
+### Destination update versus 301
+
+The owner points the code at a new landing page. If you issued **301** with a long browser cache, many clients never ask again. If you issued **302** with a 60 s edge TTL, the wrong Location lasts until expiry or purge. Either way, say the staleness window. Do not claim “invalidate the CDN” is linearizable with every phone's HTTP cache.
+
+<FailureScenario
+  title="Explore URL-shortener degraded modes"
+  prompt="Select a failure and inspect what the architecture promises."
+  choices={[
+    { label: "Mapping store down", impact: "Creates cannot prove uniqueness and must fail. Redirects continue only for codes still in derived cache, possibly with stale Location.", recovery: "Keep the store fail-closed for writes. Serve cached redirects with an explicit stale window, or fail open only if a wrong destination is acceptable." },
+    { label: "CDN and app cache cold", impact: "Up to 100,000 redirect/s reach the mapping store. Tail latency rises; a hot code can overload one shard.", recovery: "Origin shield, singleflight, admission on origin fills, and pre-warm celebrity keys. Do not 429 public redirects unless the store is actually overloaded." },
+    { label: "Analytics queue down", impact: "Redirects still succeed. Counters freeze. Hourly blobs stop landing.", recovery: "Buffer or drop click events by policy, then rebuild derived sums from retained blobs or sampled logs. Do not block GET on queue health." },
+    { label: "Spam create flood", impact: "Untrusted destinations and alias squatting exhaust ID space, scanner workers, and write QPS.", recovery: "Fail closed on create via account and IP limits, scan before commit, reserve aliases, and quarantine codes whose destinations fail later scans." }
+  ]}
+/>
+
+</RealExamples>
+
+<InterviewTraps title="IC6 follow-ups for a URL shortener">
+
+### Questions the interviewer should be able to ask
+
+- Where does a short code become unique, and what happens on hash collision?
+- Why not treat a Redis SET as the mapping authority?
+- 301 or 302, and what happens to analytics and destination edits?
+- What is the origin QPS at 100k edge redirects and a 5% miss ratio, including a flush?
+- How do you stop sequential codes from being scraped, and aliases from impersonating brands?
+- What fails when the cache dies versus when the mapping store dies?
+- How do you handle one viral key without recasting the whole catalog?
+- Are click counts exact, and how is that different from billed ad clicks?
+
+### IC6 scoring rubric
+
+- **Requirements:** create, redirect, optional alias, derived analytics; explicitly excludes TokenX balances and Ad Click billing.
+- **Quantification:** 100M mappings, 10k writes/s, 100k redirects/s, row size, replica storage, origin QPS after hit ratio—all with units.
+- **Correctness:** unique constraint on <code>short_code</code>, idempotency unique constraint, insert-retry for generators, no exactly-once claim on analytics.
+- **Architecture:** mapping store authoritative; CDN/app cache and counters derived; dashed failure and async edges named.
+- **Operations:** abuse, enumeration, hot keys, cache stampede, store loss, queue lag, purge versus TTL.
+- **Evolution:** delay extra mapping shards until measured; isolate hot keys with cache, not with wishful partition counts.
+- **Communication:** 301/302 is a product trade, not a slogan; cache freshness is a budget.
+
+A weak answer says “hash the URL, put it in Redis, 301 everything, Kafka gives exact counts.” A defensible answer names the unique index, the cache as a photocopy, and the store-versus-cache failure split.
+
+</InterviewTraps>
+
+<Tradeoffs title="Why this design—and when it stops fitting">
+
+**Unique mapping in KV or a relational store:** one collision story and a simple redirect miss fill, but create availability tracks store quorum or primary health.
+
+**Hash IDs:** good when global URL dedupe is desired; bad when two owners need two codes, and still requires insert-retry.
+
+**Sharded counters plus base62:** shortest codes and easy bulk allocation; enumerable IDs and counter-range hotspots unless ranges are partitioned.
+
+**Snowflake-style IDs:** no global counter; longer codes, worker-id ops, and clock assumptions.
+
+**302 plus short edge TTL:** destination edits and origin analytics remain possible; origin QPS and CDN cost stay higher than a hard 301.
+
+**301 plus long browser cache:** lowest origin load; you lose destination agility and most subsequent click signals.
+
+**Derived click counters and hourly blobs:** cheap to scale and rebuild; duplicates and lag are expected. Promoting them to mapping authority would be a correctness bug.
+
+This design becomes inappropriate when the product needs globally unique billed events (that is an Ad Click Aggregator), spendable balances (TokenX), or immediate worldwide destination updates with no stale Location. Those require different authorities, not a smarter TTL.
+
+</Tradeoffs>
+
+<KnowledgeCheck
+  question="You must be able to change a short code's destination within about a minute and still see most clicks at the origin. Which redirect policy fits?"
+  options={[
+    "301 with a one-year CDN TTL because fewer origin hits always win",
+    "302 or 307 with an explicit short Cache-Control / s-maxage, accepting higher origin QPS",
+    "Store the Location only in Redis and skip the mapping database",
+    "Return 200 with an HTML meta-refresh so browsers never cache"
+  ]}
+  correct={1}
+  explanation="A temporary redirect plus a named freshness budget keeps destination edits possible and leaves origin on the click path. 301 plus a long TTL freezes Location in browsers and edges. Redis-only storage drops the unique-constraint authority. Meta-refresh is slower and still cacheable in messy ways."
+/>
+
+<ScenarioCheck
+  scenario="Peak load is 100,000 redirects/s. The CDN is cold after a misissued purge. The mapping store is healthy. One celebrity short_code is 40% of traffic."
+  question="What is the strongest first response that preserves correct destinations?"
+  options={[
+    { label: "Singleflight origin fills, origin-shield the mapping store, pin the celebrity key in app cache, and admit remaining miss QPS so one shard cannot melt.", feedback: "Correctness still comes from the mapping store; the defense is coalescing and isolating the hot key." },
+    { label: "Hash-shard the celebrity code onto 256 mapping partitions so each holds 1/256 of that key.", feedback: "One key does not split across hash shards. You would only add coordination without reducing hotspot cardinality." },
+    { label: "Fail open with a hardcoded Location for unknown codes so origin stays quiet.", feedback: "That serves the wrong destination and breaks the mapping invariant." },
+    { label: "Switch all responses to 301 with max-age of one year during the incident.", feedback: "That may trap a wrong or empty Location in browsers after a cold purge, which is worse than a temporary origin overload." }
+  ]}
+  correct={0}
+  explanation="Hot-key rescue is cache coalescing and admission, not repartitioning a single code. The mapping store remains authoritative while derived layers refill."
+/>
+
+<ScenarioCheck
+  scenario="Two write replicas try to commit the same base62 code generated from a truncated URL hash. There is no unique index. A cache SET succeeded on the first replica."
+  question="What uniqueness property does this system actually have?"
+  options={[
+    { label: "None you can defend: two destinations may share one public code, and the cache can advertise either photocopy.", feedback: "Without UNIQUE(short_code) on the authoritative store, collision is a silent overwrite or split-brain. Cache SET is derived." },
+    { label: "Exactly-once mapping because the hash is cryptographically unique.", feedback: "A truncated hash is not a uniqueness protocol, and this lesson does not get exactly-once without a named unique constraint." },
+    { label: "Exactly-once mapping because Redis SETNX is linearizable for all clients.", feedback: "Even a successful SETNX is not the durable mapping authority unless it is the named store with a stated durability contract—and the prompt said the database had no unique index." },
+    { label: "Safe because analytics Kafka will detect the duplicate later.", feedback: "Derived counters cannot repair two live destinations for one code." }
+  ]}
+  correct={0}
+  explanation="Uniqueness is the mapping store's unique constraint (or an equivalent compare-and-set with a documented durability and fencing story). Hashes, caches, and analytics pipelines do not mint that property."
+/>
+
+<InterviewAnswer>
+
+“I scope a URL shortener to create mappings, HTTP redirects, optional custom aliases, and derived analytics—not TokenX balances and not billed ad clicks.
+
+Illustrative envelope: 100 million stored mappings, 10 thousand peak creates per second, 100 thousand peak redirects per second. At about 500 bytes a row, the catalog is tens of gigabytes before three replicas and indexes. Redirects are the hot path.
+
+The mapping KV or database is authoritative. A unique constraint on short_code is the collision boundary; a second unique constraint on caller plus idempotency key stops retry from minting extra codes. Hash IDs insert and retry. Sharded counters give compact base62 codes but are enumerable. Snowflake-style IDs avoid a global counter and still need that unique index. Creates are rate-limited and abuse-scanned.
+
+Redirects read derived CDN and app caches. I default to 302 with an explicit short TTL so destinations can change and origin still sees many clicks. 301 plus a long TTL is a product choice that freezes Location. Cache loss raises origin QPS; mapping-store loss fails creates and leaves only leftover cache for GET. Viral codes need singleflight, not extra shards. Click counters and hourly blobs are at-least-once derivatives and never the mapping authority.”
+
+</InterviewAnswer>

@@ -1,0 +1,168 @@
+---
+title: "Architecture Review Practice"
+description: "Run an IC6 architecture review: requirement change, bottleneck, failure drill, migration, and cost, with written decisions and rollback."
+module: 7
+moduleTitle: "Architecture & Mock Interviews"
+order: 10
+duration: 40
+difficulty: "Advanced"
+tags:
+  - architecture-review
+  - bottlenecks
+  - migration
+  - cost
+  - incidents
+objectives:
+  - "Turn a requirement change into invariants, estimates, and a migration plan"
+  - "Separate measured bottlenecks from fashionable rewrites"
+  - "Drill failure and recovery with named RPO, fencing, and owners"
+  - "Record decisions so a later interviewer can audit the argument"
+---
+
+<BigPicture title="The review is a cross-examination of a living system">
+
+Prompt: you are the staff engineer reviewing TokenX plus Ad Click after a year in production. A PM wants **multi-region writes**, **10× traffic**, **a new analytics warehouse**, and **halved spend**. You have 45 minutes with an interviewer playing security, finance, and SRE.
+
+This is not a greenfield sketch. It is [migration at scale](/learn/migration-at-scale), [cost-performance](/learn/cost-performance-engineering), [disaster scenarios](/learn/disaster-scenarios), and [driving a system design interview](/learn/driving-a-system-design-interview) applied to an existing design.
+
+**Authoritative still:** TokenX ledger terminals; Ad Click billed log + uniqueness horizon. Everything else is a candidate to move, shard, or delete.
+
+</BigPicture>
+
+<UnderTheHood title="Five review moves with numbers">
+
+### 1. Restate invariants before features
+
+Write the invariants on the board: TokenX conservation; Ad Click click_id uniqueness horizon; p99 transfer 300 ms in the primary region. A multi-region **active-active LWW balance** is rejected before diagrams.
+
+### 2. Demand a bottleneck with units
+
+“10× traffic” on TokenX: 4,630 writes/s → 46,300/s. Ask whether lock wait, disk, or network is the measured limiter. If load tests still show 12,000/s headroom, 10× is a **capacity program**, not a rewrite.
+
+<Calculation label="Cost of a fashionable Kafka add">
+If analytics already consumes the outbox at 4,630 events/s × 1 KB × RF=3 ≈ 14 MB/s
+
+A second “real-time” cluster copying the same events doubles broker and sink cost without changing conservation
+
+Warehouse export daily 20 GB compressed plus egress: name the region and the scan job owner
+</Calculation>
+
+### 3. Failure drill
+
+Pick one: primary region loss, poison click schema, accidental topic delete, leaked fencing token. For each: detection, fence, RPO/RTO, who pages, what is **not** auto-replayed (UNKNOWN TokenX requests).
+
+### 4. Migration sequence
+
+Shadow reads → dual writes with a compare job → cut reads → remove old writes. Verification samples must include TokenX conservation checksums and Ad Click invoice rebuilds. Rollback is a switch, not hope ([migration](/learn/migration-at-scale)).
+
+### 5. Decision record
+
+One page: context, options, chosen mechanism, invariants preserved, operational load, expiry of the decision.
+
+<ExecutionTimeline
+  title="Review a 10× plus multi-region ask"
+  steps={[
+    { title: "Invariants", detail: "Restate conservation, uniqueness, SLOs, and fail-closed versus fail-open.", state: "Board is the contract.", failure: "Skipping this invites LWW money.", recovery: "Stop the meeting." },
+    { title: "Measure", detail: "Show lock p99, outbox age, campaign hot-key, cost per 1k transfers.", state: "Telemetry owns the bottleneck.", failure: "Anecdote-driven shard.", recovery: "Capacity test first." },
+    { title: "Options", detail: "Vertical + read replicas versus shard protocol versus regional ownership.", state: "Each option names a failure.", failure: "Copy-paste active-active.", recovery: "Escrow or single-writer region." },
+    { title: "Migrate", detail: "Dual write, verify, cut, rollback switch.", state: "Derived systems follow the log.", failure: "Cut without checksums.", recovery: "Hold the cut." }
+  ]}
+/>
+
+</UnderTheHood>
+
+<MentalModel title="A review is a trial of evidence">
+
+Claims need exhibits: metrics, invoices, game-day notes. Architecture fashion is hearsay.
+
+</MentalModel>
+
+<ArchitectureDiagram title="Review surfaces on TokenX and Ad Click" chart={"flowchart LR\n  Inv[Invariants board] --> Cap[Capacity evidence]\n  Cap --> Opt[Option set]\n  Opt --> Mig[Migration with verify]\n  Mig --> Rec[Decision record]\n  Cap --> Fail[Failure drill]\n  Fail --> Rec\n  Opt -. reject LWW balances .-> Inv\n  Mig -. rollback switch .-> Opt"}>
+
+Dashed rejects and rollbacks are first-class. The diagram is a process, not a vendor topology.
+
+<ArchitectureWalkthrough
+  title="Hats in the room"
+  stages={[
+    { name: "Product", owner: "PM", state: "Feature ask", boundary: "Cannot waive conservation.", failure: "Scope creep mid-review.", recovery: "Park in a later ADR." },
+    { name: "SRE", owner: "On-call", state: "Error budget", boundary: "Pages and RTO.", failure: "No owner for DLQ.", recovery: "Assign before ship." },
+    { name: "Finance", owner: "Cost", state: "Unit economics", boundary: "Cost per transfer and per million clicks.", failure: "Unbounded metrics cardinality.", recovery: "Quota." },
+    { name: "Security", owner: "Threat model", state: "Keys, restore, fence", boundary: "No auto-replay of request logs.", failure: "Restore to writable old epoch.", recovery: "Fence first." }
+  ]}
+/>
+
+</ArchitectureDiagram>
+
+<RealExamples title="Three reviews that fail without evidence">
+
+**Multi-region TokenX.** Accept regional primary + async DR, or CRDT-free escrow. Reject LWW.
+
+**Ad Click 10×.** Split hot campaign aggregation; keep uniqueness on click_id. Do not “just add partitions” if the sink is a single row.
+
+**Warehouse.** Export committed outbox/log. Do not dual-write from the API into Snowflake as a second ledger.
+
+<FailureScenario
+  title="Review-time failures"
+  prompt="How does the review respond?"
+  choices={[
+    { label: "No metrics", impact: "Cannot locate the bottleneck.", recovery: "Instrument first; delay the rewrite." },
+    { label: "LWW balances proposed", impact: "Conservation dies.", recovery: "Reject; offer regional ownership." },
+    { label: "Cutover without checksum", impact: "Silent money or invoice drift.", recovery: "Hold; dual-read until match." },
+    { label: "Shared bulkhead to save cost", impact: "Ads steal TokenX workers.", recovery: "Cost the isolation; do not merge pools." }
+  ]}
+/>
+
+</RealExamples>
+
+<InterviewTraps title="IC6 follow-ups">
+
+- What evidence would make you shard TokenX this quarter?
+- Write the rollback switch in one sentence.
+- Who owns poison-message replay?
+- How do you cost a derived warehouse versus a second Kafka cluster?
+- What does the ADR expire?
+
+</InterviewTraps>
+
+<Tradeoffs title="Speed of change versus auditability">
+
+**Ship with an ADR:** slower meeting; cheaper incident.
+
+**Big-bang rewrite:** narrative velocity; unknown rollback.
+
+**Optimize cost first:** may starve isolation.
+
+**Optimize isolation first:** higher bill; safer money.
+
+</Tradeoffs>
+
+<KnowledgeCheck
+  question="A review proposes active-active last-write-wins TokenX balances to hit a 10× multi-region OKR. What do you do?"
+  options={[
+    "Accept because availability is a higher SLO than money",
+    "Reject LWW for spendable balances; require regional ownership, escrow, or a global transaction protocol, with measurements that actually need it",
+    "Move balances to the Ad Click uniqueness store",
+    "Add more Kafka partitions to serialize money"
+  ]}
+  correct={1}
+  explanation="LWW can drop a debit. 10× and multi-region are separate problems with different protocols."
+/>
+
+<ScenarioCheck
+  scenario="Finance wants to merge TokenX and Ad Click thread pools after the review to save 30% compute. SRE shows ads ingest stealing workers during a sports final, lengthening transfer p99."
+  question="What does the review record?"
+  options={[
+    { label: "Keep bulkheads; cost the isolation as the price of fail-closed money; optimize inside each pool.", feedback: "Opposite degrade policies cannot share a pool." },
+    { label: "Merge pools and raise TokenX timeouts.", feedback: "Timeouts do not restore isolation." },
+    { label: "Fail-open TokenX to match ads.", feedback: "Wrong invariant." },
+    { label: "Delete the ADR so the merge is unofficial.", feedback: "Hides the decision." }
+  ]}
+  correct={0}
+  explanation="Architecture review includes saying no to a cost save that breaks isolation."
+/>
+
+<InterviewAnswer>
+
+“In a review I write invariants first: TokenX conservation, Ad Click uniqueness horizon, and the SLOs. I ask for measured bottlenecks in units before any rewrite. Multi-region writes cannot be last-write-wins on balances. Migrations dual-write with checksums and a rollback switch. I record the decision, the owner of replay, and the cost of isolation—including why ads and money do not share a bulkhead.”
+
+</InterviewAnswer>

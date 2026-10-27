@@ -1,0 +1,168 @@
+---
+title: "Design a Metrics Platform"
+description: "Design metric ingest, cardinality control, rollups, query, and alerting with cost as a first-class SLO, not as an afterthought dashboard."
+module: 7
+moduleTitle: "Architecture & Mock Interviews"
+order: 6
+duration: 45
+difficulty: "Advanced"
+tags:
+  - metrics
+  - cardinality
+  - rollups
+  - alerting
+  - cost
+objectives:
+  - "Quantify series count, sample rate, and storage from label cardinality"
+  - "Keep raw samples or short-retention write path separate from rollup query path"
+  - "Treat alerting as a derived consumer with its own completeness assumptions"
+  - "Name the cardinality explosion that looks like a Kafka problem but is a label problem"
+---
+
+<BigPicture title="Every unique label set is a new time series">
+
+Prompt: **Design a metrics platform** (ingest, store, query, alert) for product and infra telemetry.
+
+A **time series** is a metric name plus a label set. Cardinality is combinatorial: `http_requests{path,code,pod,user_id}` with unbounded `user_id` will not fit in memory. This lesson composes [time-series storage](/learn/time-series-and-append-only-storage), [profiling and observability](/learn/profiling-and-observability), and [cost-performance](/learn/cost-performance-engineering).
+
+TokenX exposes ledger commit latency and outbox age as **bounded-label** series. Ad Click may emit campaign-level rates; per-click series are a billing log, not Prometheus.
+
+</BigPicture>
+
+<UnderTheHood title="Cardinality math, then the write and query split">
+
+### Envelope (illustrative)
+
+10,000 pods × 50 metrics × 20 label combinations = 10 million series. 15 s scrape. 2 bytes compressed per sample (optimistic). 15-day raw retention, then 1-minute rollups for 1 year.
+
+<Calculation label="Samples and storage">
+Samples/s = 10e6 series / 15 s ≈ 667,000 samples/s
+
+Raw retention samples = 667,000 × 15 × 86,400 ≈ 8.64e11 samples
+
+At 2 B/sample ≈ 1.73 TB compressed raw for 15 days, before indexes, replication, and replication of query caches
+
+If someone adds unbounded user_id with 1e6 values, series become 10e6 × 1e6 — that is not a scrape-interval tune
+</Calculation>
+
+<InteractiveCalculation mode="little-law" title="Query frontend concurrency under a 667k sample/s scrape (illustrative)" initialRate={2000} />
+
+### Architecture
+
+- **Ingest:** agents or remote-write; bounded labels; drop or aggregate high-cardinality at the edge.
+- **Write path:** append-only chunks in TSDB; recent data hot in memory; WAL for crash.
+- **Rollups:** recording rules or downsampling jobs — **derived**.
+- **Query:** fan-out to shards by metric or time; timeouts and partial results must be labeled ([tail latency](/learn/tail-latency-control)).
+- **Alerting:** evaluates recording rules on a schedule. Alert history is not the TSDB source of truth for raw samples.
+- **Exemplars / traces:** pointers into traces; missing a complete trace is not “the counter lied.”
+
+Do not use a TokenX serializable transaction per sample. Durability is WAL+replication of the TSDB, with an explicit loss window on crash if you run a single replica.
+
+<ExecutionTimeline
+  title="From scrape to page"
+  steps={[
+    { title: "Scrape or remote-write", detail: "Agent ships samples with a bounded label policy.", state: "Policy is the cardinality gate.", failure: "A new unbounded label.", recovery: "Relabel drop; gate the deploy." },
+    { title: "Append", detail: "TSDB writes WAL and in-memory head.", state: "Recent raw is authoritative for that retention.", failure: "Single replica crash before remote WAL.", recovery: "Name RPO minutes; replicate if the SLO requires it." },
+    { title: "Rollup", detail: "Downsample to 1-minute after 15 days.", state: "Rollups are derived.", failure: "Query the wrong resolution for a 10 s incident.", recovery: "Keep raw long enough for the debug SLO." },
+    { title: "Alert", detail: "Rule engine reads rollups or raw; pages on burn rate.", state: "Alerting is a consumer.", failure: "Partial query success treated as zero.", recovery: "Fail open on missing data or page on incomplete—pick one and document it." }
+  ]}
+/>
+
+</UnderTheHood>
+
+<MentalModel title="A series is a filing cabinet, not a folder label">
+
+Adding `user_id` is opening a million cabinets, not scribbling a note on one drawer. Cost and query latency follow cabinet count.
+
+</MentalModel>
+
+<ArchitectureDiagram title="Bounded ingest, raw TSDB, derived rollups and alerts" chart={"flowchart LR\n  Ag[Agents] -->|bounded labels| Ing[Ingest gateway]\n  Ing --> TS[(Raw TSDB WAL)]\n  TS --> Roll[(Derived rollups)]\n  TS --> Q[Query frontend]\n  Roll --> Q\n  Q --> Al[Alert manager]\n  Ing -. drop unbounded labels .-> Drop[Relabel drop]\n  Q -. partial timeout .-> Q"}>
+
+Raw samples in the retention window are the operational source for debug. Rollups and alert state are derived. Dashed drop is policy, not a second TSDB.
+
+<ArchitectureWalkthrough
+  title="Where cardinality is owned"
+  stages={[
+    { name: "Relabel", owner: "Agent/gateway", state: "Allowlist of labels", boundary: "Prevents series explosion.", failure: "Bypass with a new exporter.", recovery: "Admission on remote-write; quota per tenant." },
+    { name: "TSDB", owner: "Shard by metric", state: "WAL + chunks", boundary: "Raw retention durability.", failure: "Hot metric shard.", recovery: "Split; never put user_id on the series." },
+    { name: "Rollup", owner: "Compaction jobs", state: "Coarser tables", boundary: "Derived.", failure: "Job lag.", recovery: "Query raw until caught up; show completeness." },
+    { name: "Alert", owner: "Rule evaluators", state: "Alert instances", boundary: "Must handle missing data.", failure: "Silence on partial scrape.", recovery: "Explicit missing-as-firing or missing-as-OK." }
+  ]}
+/>
+
+</ArchitectureDiagram>
+
+<RealExamples title="User-id explosion, TokenX RED, Ad Click">
+
+**Unbounded label.** A developer adds `user_id`. Memory and compaction fall over. Fix is drop+quota, not “add Kafka partitions.”
+
+**TokenX RED.** `tokenx_transfer_commit` with `tenant_tier,result` — tens of series, not per-wallet.
+
+**Ad Click.** Per-campaign rates OK if campaign count is bounded; per-click metrics belong on the billed log.
+
+<FailureScenario
+  title="Metrics platform failures"
+  prompt="What still holds?"
+  choices={[
+    { label: "Cardinality bomb", impact: "Ingest latency and OOM on a shard.", recovery: "Relabel drop, tenant quota, emergency deny list." },
+    { label: "Alert on partial query", impact: "False clear during an outage.", recovery: "Treat incomplete as firing or unknown, never as zero." },
+    { label: "Rollup lag", impact: "Dashboards look stale.", recovery: "Fall back to raw; show lag." },
+    { label: "Using metrics as TokenX ledger", impact: "Samples are not conservation.", recovery: "Money stays in the ledger." }
+  ]}
+/>
+
+</RealExamples>
+
+<InterviewTraps title="IC6 follow-ups">
+
+- Show the series-count equation.
+- What is your drop policy?
+- Raw versus rollup for a 30 s incident?
+- How do alerts behave on missing scrapes?
+- Cost per series per month?
+- Why exemplars are not complete traces ([profiling](/learn/profiling-and-observability))?
+
+</InterviewTraps>
+
+<Tradeoffs title="Fidelity versus bill">
+
+**Long raw retention:** debug power; SSD and compaction cost.
+
+**Aggressive rollup:** cheap; blinds short incidents.
+
+**High scrape rate:** better resolution; linear sample cost.
+
+**Per-tenant quotas:** fairness; angry developers.
+
+</Tradeoffs>
+
+<KnowledgeCheck
+  question="Series were 10 million. A label with one million values is added. What failed first conceptually?"
+  options={[
+    "Kafka minISR",
+    "Cardinality: series count multiplies by the new label’s values unless dropped at ingest",
+    "Little’s Law for the alert manager",
+    "TokenX serializable isolation"
+  ]}
+  correct={1}
+  explanation="Metrics cost is combinatorial in label values. Partitions and isolation models are the wrong first diagnosis."
+/>
+
+<ScenarioCheck
+  scenario="On-call sees zero errors on a dashboard during a region loss. The query frontend returned partial data from 1 of 3 shards and treated missing as zero."
+  question="What is the IC6 fix?"
+  options={[
+    { label: "Surface incompleteness; page on unknown; never display missing shards as a successful zero SLO.", feedback: "Partial success is not a green SLO." },
+    { label: "Increase scrape interval to reduce load.", feedback: "Does not fix missing-as-zero." },
+    { label: "Store metrics in the TokenX ledger for linearizability.", feedback: "Wrong system." },
+    { label: "Switch to event-time windows on the TSDB.", feedback: "TSDB already uses scrape time; this is a query completeness bug." }
+  ]}
+  correct={0}
+  explanation="Alerting and SLO math must define missing data."
+/>
+
+<InterviewAnswer>
+
+“I start from series count: name times label combinations times scrape rate. I bound labels at ingest with quotas. A TSDB keeps raw samples for a short debug window and derived rollups for long query. Alerting is a consumer that must not treat partial queries as zero. TokenX and Ad Click get low-cardinality RED metrics; per-click or per-wallet series belong in logs or the ledger, not in the TSDB.”
+
+</InterviewAnswer>
