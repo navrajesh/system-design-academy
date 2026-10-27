@@ -1,0 +1,93 @@
+{
+  "phase": "2a",
+  "title": "Architecture Reference",
+  "description": "Phase 2A ships the Storage & Data landscape, a layered explorer, three deep dives, two matrices, and a database-failover walkthrough. Other module landscapes are not implemented yet.",
+  "urlPrefix": "/reference",
+  "landscapes": [
+    {
+      "id": "storage",
+      "module": 1,
+      "title": "Storage & Data",
+      "status": "available",
+      "href": "/reference/landscapes/storage",
+      "description": "Where data lives, which product owns it, and how reads, writes, and failover actually behave."
+    },
+    {
+      "id": "scalability",
+      "module": 2,
+      "title": "Scalability",
+      "status": "later",
+      "href": null,
+      "description": "Phase B+. Load balancers, cache tiers, and write scaling products."
+    },
+    {
+      "id": "kafka-fault-tolerance",
+      "module": 3,
+      "title": "Kafka & Fault Tolerance",
+      "status": "later",
+      "href": null,
+      "description": "Phase B+. Partitioned logs and consumer recovery."
+    },
+    {
+      "id": "performance",
+      "module": 4,
+      "title": "Performance",
+      "status": "later",
+      "href": null,
+      "description": "Phase B+. Runtimes, queues, tails, and admission control."
+    },
+    {
+      "id": "networking",
+      "module": 5,
+      "title": "Networking",
+      "status": "later",
+      "href": null,
+      "description": "Phase B+. DNS, protocols, CDN, mesh, and rate limiters."
+    },
+    {
+      "id": "consistency",
+      "module": 6,
+      "title": "CAP & Consistency",
+      "status": "later",
+      "href": null,
+      "description": "Phase B+. Quorum, consensus, CRDTs, and leases."
+    },
+    {
+      "id": "composition",
+      "module": 7,
+      "title": "Architecture & Interviews",
+      "status": "later",
+      "href": null,
+      "description": "Phase B+. How mock-interview systems assemble the products above."
+    }
+  ],
+  "deepDives": [
+    {
+      "id": "postgresql",
+      "title": "PostgreSQL",
+      "href": "/reference/technologies/postgresql",
+      "landscape": "storage"
+    },
+    {
+      "id": "redis",
+      "title": "Redis",
+      "href": "/reference/technologies/redis",
+      "landscape": "storage"
+    },
+    {
+      "id": "dynamodb",
+      "title": "DynamoDB",
+      "href": "/reference/technologies/dynamodb",
+      "landscape": "storage"
+    }
+  ],
+  "explorerHref": "/reference/architecture",
+  "failureHref": "/reference/failures/database-failover",
+  "requiredRelatedSlugs": [
+    "relational-vs-nosql-selection",
+    "indexes-and-query-execution",
+    "caching-patterns-and-invalidation",
+    "replication-and-failover",
+    "transactions-across-boundaries"
+  ]
+}

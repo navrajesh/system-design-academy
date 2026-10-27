@@ -1,0 +1,72 @@
+[
+  {
+    "id": "mysql",
+    "title": "MySQL / InnoDB",
+    "product": "MySQL",
+    "landscape": "storage",
+    "workload": "Relational OLTP, similar placement to PostgreSQL, with a large existing operational ecosystem and group-replication / InnoDB cluster options.",
+    "consistency": "Single-primary or group replication depending on deployment. Replicas lag. Do not treat 'semi-sync' as lossless without naming acknowledgements.",
+    "durability": "InnoDB redo + binlog. Crash recovery is not the same as replica promotion safety.",
+    "latency": "Indexed PK lookups in-region are low ms; binlog apply lag is the replica story.",
+    "failure": "Primary death needs fencing. GTID/binlog position is a timeline; dual writers corrupt replicas.",
+    "whenToChoose": "SQL + transactions when the organization already operates MySQL well, or you need a specific MySQL ecosystem feature.",
+    "whenNot": "When you needed Dynamo-style item scale or Cassandra multi-master ingest. Failover slogans without fencing still split-brain.",
+    "relatedSlugs": ["relational-vs-nosql-selection", "replication-and-failover"]
+  },
+  {
+    "id": "mongodb",
+    "title": "MongoDB",
+    "product": "MongoDB",
+    "landscape": "storage",
+    "workload": "Document access with secondary indexes, aggregation, and replica-set HA. Flexible schema is not a substitute for access-pattern design.",
+    "consistency": "Primary reads by default in a replica set. Secondary reads are lagged. Majority write concern is not linearizability of all reads.",
+    "durability": "WiredTiger + majority journal to a voting majority when you ask for it. w:1 can lose acknowledged writes on failover.",
+    "latency": "Good for targeted document reads; unindexed scans and large documents dominate tails.",
+    "failure": "Replica-set election in seconds. Rollback of w:1 writes is possible. Shard cluster failures are independent per shard.",
+    "whenToChoose": "Document model that matches how you read, with replica-set majority writes for durable OLTP.",
+    "whenNot": "Multi-document transactions as a default across shards, or treating the cluster as a cache. Not a drop-in for SQL constraints.",
+    "relatedSlugs": ["relational-vs-nosql-selection", "data-modeling-from-access-patterns"]
+  },
+  {
+    "id": "cassandra",
+    "title": "Apache Cassandra",
+    "product": "Cassandra",
+    "landscape": "storage",
+    "workload": "High-ingest wide rows and query tables. Availability-oriented writes with tunable per-request consistency.",
+    "consistency": "ONE/QUORUM/ALL. QUORUM ≠ linearizable. Repairs reconcile later. LWW and tombstones are part of the model.",
+    "durability": "Commitlog + SSTables. Hinted handoff is not a substitute for repair.",
+    "latency": "Strong ingest p50; compaction/GC tails. LOCAL_QUORUM vs cross-DC ALL changes the budget.",
+    "failure": "Node loss expected. ALL becomes unavailable. Wrong gc_grace can resurrect deletes.",
+    "whenToChoose": "When write availability and pre-modeled query tables beat ad-hoc SQL, and you will staff repair.",
+    "whenNot": "TokenX-style constrained multi-row ledgers, small teams, or 'just use QUORUM' as a correctness slogan.",
+    "relatedSlugs": ["relational-vs-nosql-selection", "cap-and-consistency-models"]
+  },
+  {
+    "id": "opensearch",
+    "title": "OpenSearch",
+    "product": "OpenSearch",
+    "landscape": "storage",
+    "workload": "Full-text search, logs, and analytics on derived documents. Near-real-time index, not an OLTP primary.",
+    "consistency": "Refresh interval, not commit. Search hits can miss recent primary writes and can include later-deleted docs until refresh.",
+    "durability": "Primary + replica shards. Still rebuildable from the source of truth.",
+    "latency": "Query latency depends on heap, shard count, and aggregations. Refresh is a visibility delay, not durability.",
+    "failure": "Yellow/red clusters, split-brain if discovery is wrong, mapping explosions, ingest backlog.",
+    "whenToChoose": "Search and log analytics beside a real primary. Reindex is an allowed recovery.",
+    "whenNot": "Spendable balances, unique allocation, or any authority that cannot be rebuilt. Never treat _id hits as the ledger.",
+    "relatedSlugs": ["time-series-and-append-only-storage", "caching-patterns-and-invalidation"]
+  },
+  {
+    "id": "s3",
+    "title": "Object storage (S3-class)",
+    "product": "S3",
+    "landscape": "storage",
+    "workload": "Immutable or versioned blobs, backups, data lake files. Metadata catalog usually lives in a database.",
+    "consistency": "New PUTs are typically read-after-write in a region; listings and overwrite/delete can lag. Not a row store.",
+    "durability": "Storage class and cross-region replication settings. 'Eleven nines' marketing is not a restore time.",
+    "latency": "PUT/GET in tens to hundreds of ms plus TTFB for large objects. Multipart for large files.",
+    "failure": "Slow PUT, incomplete multipart, Glacier restore delay, or permission/KMS outages.",
+    "whenToChoose": "Large binary objects and backup archives. Pair with a DB for the catalog and authz.",
+    "whenNot": "Low-latency item mutations, compare-and-swap ledgers, or listing-as-query. Object storage is not PostgreSQL.",
+    "relatedSlugs": ["object-storage-and-large-files", "backup-restore-and-disaster-recovery"]
+  }
+]

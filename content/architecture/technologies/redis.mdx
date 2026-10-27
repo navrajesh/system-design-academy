@@ -1,0 +1,112 @@
+---
+kind: deep-dive
+id: redis
+title: "Redis"
+description: "Derived cache hop: data structures, optional persistence, async replicas, and why RDB/AOF is not a ledger."
+landscape: storage
+relatedSlugs:
+  - caching-patterns-and-invalidation
+  - rate-limiting
+  - replication-and-failover
+---
+
+<LibraryBigPicture>
+
+Redis is an in-memory data structure server. On the Storage & Data explorer it is the **default cache hop**: derived, synchronous GET/SET from the app, sitting beside the primary, not in front of DNS.
+
+It is **excellent** at hot keys, rate-limit counters, session blobs, and singleflight locks **if** you accept loss, staleness, and eviction. It is **not** PostgreSQL. Turning on AOF does not make spendable TokenX balances safe.
+
+If you need the latest committed ledger row, read the primary (or a replica that has applied your position token). If you need public bytes near the user, use a CDN. Comparison: the cache vs replica vs CDN matrix on the landscape page. Mechanism: <LessonCrossLink slug="caching-patterns-and-invalidation" />.
+
+</LibraryBigPicture>
+
+<LibraryUnderTheHood>
+
+### Execution
+
+A single-threaded command loop (plus I/O threads in later versions) executes commands against in-memory keys. Complexity is per command, not “O(1) magic”: `KEYS`, big `SMEMBERS`, and huge values become your p99.
+
+**Cache-aside:** GET → miss → load primary → SET with TTL. The application owns fill and delete. Write-through and write-behind are different designs; do not mix their failure stories.
+
+### Persistence is optional and incomplete
+
+- **RDB:** point-in-time fork snapshot. Restart after crash loses everything since the last dump.
+- **AOF:** append commands; `appendfsync` everysec can lose about a second. Always is a latency tax and still is not WAL-with-constraints.
+- Persistence helps **warm restart**, not dual-writer safety and not unique financial occupancy.
+
+### Replication
+
+Replicas are asynchronous by default. A failover (Sentinel or cluster) can lose writes the old master had in memory but not on the replica. Cluster hash slots move; clients must handle `MOVED`.
+
+<ExecutionTimeline
+  title="Cache-aside read of campaign metadata"
+  steps={[
+    { title: "GET", detail: "App asks Redis for campaign:{id}:{version}.", state: "Derived. May be absent or stale.", failure: "Treat a miss as 'campaign does not exist' instead of loading the primary." },
+    { title: "Miss load", detail: "Read PostgreSQL/DynamoDB. Singleflight so 5,000 misses do not become 5,000 identical queries.", state: "Primary is authoritative.", failure: "Stampede; thundering herd after flush." },
+    { title: "SET TTL", detail: "Write Redis with a versioned key. Delete on publish, do not rely on TTL alone for correctness.", state: "Cache is derived again.", failure: "Cache a spendable balance with a 5 minute TTL." },
+    { title: "Hit path", detail: "Later GETs skip the primary until TTL or invalidation.", state: "Stale-until-notify.", failure: "Redis down: fail-closed TokenX spend vs fail-open ads must be an explicit product choice." }
+  ]}
+/>
+
+Rate-limit counters in Redis are also derived: they are not the billing ledger. See <LessonCrossLink slug="rate-limiting" />.
+
+</LibraryUnderTheHood>
+
+<ArchitectureAndDataFlow>
+
+App → Redis is **sync**. Redis → replica is **async**. Redis does not sit in the authoritative commit path of PostgreSQL.
+
+<MermaidDiagram
+  title="Redis as derived cache beside the primary"
+  chart={"flowchart LR\n  APP[App service] -->|sync GET SET| R[(Redis derived)]\n  APP -->|sync miss path| PG[(Primary authoritative)]\n  R -.->|async replica| RR[(Redis replica)]\n  PG -.->|invalidation optional| R"}
+/>
+
+Failure: Redis empty or split. Caller should load the primary for correctness-sensitive reads. Recovery: treat the cache as empty; rebuild. Do not promote a Redis replica as a second ledger. Related failover thinking for stores that **are** authoritative: <LessonCrossLink slug="replication-and-failover" />.
+
+</ArchitectureAndDataFlow>
+
+<SelectionCriteria>
+
+Choose Redis when:
+
+- Keys are derived, bounded, and evictable.
+- You need sub-millisecond hits and can survive a flush.
+- Data structures (ZSET, STRING counters) match the operation.
+
+Substitutes:
+
+1. **Memcached** — simpler RAM cache, no persistence story to misuse; no rich structures.
+2. **Primary read / replica read** — when SQL freshness beats RAM; use a position token for read-your-writes.
+3. **CDN** — when the object is HTTP-cacheable and shared, not per-user ledger state.
+
+</SelectionCriteria>
+
+<FailureModes>
+
+- **Process restart / OOM eviction:** keys vanish. AOF/RDB may restore a **stale** subset.
+- **Stampede:** miss storm after flush; bound with singleflight, probabilistic early expire, or a lock.
+- **Sentinel split-brain:** two masters if fencing is weak; both are still not a relational primary.
+- **Hot key:** one slot/CPU; sharding the key or local coalescing is required.
+- **Ops cost:** memory $$, eviction policy, and the temptation to store authority because it is fast.
+
+TokenX: fail-closed on ledger reads if the **primary** is down; a Redis miss is not a failed transfer. Ad Click: stale-if-error on derived dashboards can be acceptable.
+
+</FailureModes>
+
+<LibraryInterviewTraps>
+
+- “Redis is durable because we enabled AOF” — name `appendfsync`. It still has no unique multi-row ledger constraints.
+- “Redis Cluster is linearly scalable” — slots and hot keys remain. Cross-slot transactions are limited.
+- “Cache hit rate 99% so the database is fine” — a flush makes the primary the origin at 100% of former hits.
+- “Put the session and the balance in Redis” — sessions maybe; balances no, unless you redefine the product as lossy.
+- Follow-up: what happens when Redis is empty for 30 s at 50k QPS? Answer in primary QPS, pool size, and shed policy.
+
+</LibraryInterviewTraps>
+
+<LibraryMentalModel>
+
+Redis is a **whiteboard on the wall**: fast to read, easy to wipe, dangerous as the only copy of the contract. PostgreSQL is the signed filing cabinet. AOF is a faded photo of the whiteboard, not a notary.
+
+Remember: **derived, optional persistence, async replicas — design the miss and the flush, not just the hit.**
+
+</LibraryMentalModel>

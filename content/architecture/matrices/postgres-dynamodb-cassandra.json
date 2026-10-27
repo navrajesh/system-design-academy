@@ -1,0 +1,63 @@
+{
+  "id": "postgres-dynamodb-cassandra",
+  "title": "PostgreSQL vs DynamoDB vs Cassandra",
+  "description": "Pick an engine from access pattern and the consistency/durability you can actually name. This is not a popularity ranking.",
+  "relatedSlugs": ["relational-vs-nosql-selection", "replication-and-failover", "cap-and-consistency-models"],
+  "columns": [
+    { "id": "workload", "label": "Workload" },
+    { "id": "consistency", "label": "Consistency" },
+    { "id": "latency", "label": "Latency" },
+    { "id": "scaling", "label": "Scaling" },
+    { "id": "failure", "label": "Failure" },
+    { "id": "costOps", "label": "Cost / ops" },
+    { "id": "whenNot", "label": "When not to choose" }
+  ],
+  "rows": [
+    {
+      "id": "postgresql",
+      "product": "PostgreSQL",
+      "cells": {
+        "workload": "Relational rows, joins, unique constraints, multi-row transactions in one database. Ad-hoc query and reporting on the same model.",
+        "consistency": "Single-primary snapshot isolation (default READ COMMITTED). Replicas are lagged. Linearizable cluster-wide reads are not implied by 'the leader'.",
+        "latency": "Low ms for indexed primary-key lookups in-region. Joins and sequential scans dominate p99. Commit waits on WAL fsync and any synchronous replica.",
+        "scaling": "Vertical first. Read replicas for stale-tolerant reads. Write scale needs sharding or partitioning you operate.",
+        "failure": "Primary crash: promote a replica after fencing. Async replica promotion can lose acknowledged writes. Split-brain if two writers exist.",
+        "costOps": "You run backups, vacuum, failover, connection pooling, and major upgrades. Predictable instance + storage cost.",
+        "whenNot": "When the access pattern is a single-key item store at global write scale, or you cannot staff WAL, vacuum, and fenced failover."
+      }
+    },
+    {
+      "id": "dynamodb",
+      "product": "DynamoDB",
+      "cells": {
+        "workload": "Partition-key + optional sort-key item access, designed from queries first. Sparse indexes. Not SQL joins.",
+        "consistency": "Eventually consistent reads by default. Strongly consistent reads are same-region quorum reads, not global linearizability. Global tables are last-writer-wins.",
+        "latency": "Single-digit ms typical for in-region item ops when the partition is healthy. Hot keys and GSI backfill create tails.",
+        "scaling": "Partitions split with storage/throughput. You still own the partition key. Transactions are bounded (transact items), not arbitrary SQL.",
+        "failure": "Hot partition throttling, regional impairment, conflicting multi-region writes. No user-operated WAL promote.",
+        "costOps": "On-demand or provisioned WCU/RCU plus storage and indexes. Ops shift to data modeling, TTL, and capacity alarms rather than vacuum.",
+        "whenNot": "When you need multi-row relational constraints, ad-hoc SQL, or a globally linearizable ledger. Do not treat default reads as linearizable."
+      }
+    },
+    {
+      "id": "cassandra",
+      "product": "Cassandra",
+      "cells": {
+        "workload": "Wide-row, time-series-ish, high ingest with query tables designed up front. Availability-oriented multi-master writes.",
+        "consistency": "Tunable quorum (ONE/QUORUM/ALL) per request. QUORUM is not linearizable. Repairs and hinted handoff reconcile later. LWW/tombstones matter.",
+        "latency": "Good p50 ingest. p99 suffers from compaction, GC, and inconsistent replica sets. LOCAL_QUORUM in-region vs cross-DC ALL.",
+        "scaling": "Hash/vnode partitioning. Add nodes for write fan-out. You operate compaction and repair continuously.",
+        "failure": "Node loss is normal. Unavailable if you chose ALL. Counter and LWT paths have different failure stories. Delete tombstones can resurrect data if grace is wrong.",
+        "costOps": "High operator load: compaction, repair, JVM, disk. Multi-DC multiplies it. Managed C* reduces but does not delete the model constraints.",
+        "whenNot": "When you need foreign keys, multi-row ACID in one statement, or a small team that cannot run repair. TokenX spendable balances are a poor default here."
+      }
+    }
+  ],
+  "assumptions": [
+    "Single-region numbers unless a cell says multi-region.",
+    "PostgreSQL default: one writable primary, streaming replicas, WAL on local disk.",
+    "DynamoDB default: eventual reads, provisioned or on-demand in one region; global tables are a separate mode.",
+    "Cassandra default: RF=3, client consistency named per query, not 'the cluster is consistent'.",
+    "Latency figures are order-of-magnitude interview planning numbers, not SLOs from a named production fleet."
+  ]
+}

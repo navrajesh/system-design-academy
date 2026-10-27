@@ -1,0 +1,370 @@
+{
+  "version": 1,
+  "id": "storage-data-path",
+  "title": "Storage and data request path",
+  "description": "Canonical Module 1 path from client to durable stores and derived views. PostgreSQL is the default primary. DynamoDB is a selectable alternative primary, not a replica of Postgres. Redis is a derived cache hop.",
+  "assumptions": [
+    "Single-region unless a node says otherwise.",
+    "Synchronous edges wait for a response within the caller timeout. Asynchronous edges enqueue and return before the sink commits.",
+    "Postgres streaming replica is optional and is never a second primary.",
+    "DynamoDB is an alternative item primary, not a SQL replica of PostgreSQL.",
+    "Failover is not instantaneous, lossless, or transparent. Fencing and UNKNOWN in-flight outcomes are in the database-failover walkthrough."
+  ],
+  "layers": [
+    { "id": "client", "title": "Client", "order": 1 },
+    { "id": "edge", "title": "DNS / CDN / WAF", "order": 2 },
+    { "id": "ingress", "title": "Load balancer / API gateway", "order": 3 },
+    { "id": "compute", "title": "Application services", "order": 4 },
+    { "id": "cache", "title": "Redis cache", "order": 5 },
+    { "id": "primary", "title": "Primary database", "order": 6 },
+    { "id": "streaming", "title": "Event streaming / workers", "order": 7 },
+    { "id": "object", "title": "Object storage", "order": 8 },
+    { "id": "observe", "title": "Observability", "order": 9 }
+  ],
+  "nodes": [
+    {
+      "id": "client",
+      "layerId": "client",
+      "title": "Client",
+      "product": "Browser or mobile app",
+      "ownership": "derived",
+      "optional": false,
+      "alternativeGroup": null,
+      "defaultSelected": true,
+      "paths": ["read", "write"],
+      "relatedSlugs": ["idempotency-and-deduplication"],
+      "href": null,
+      "summary": "Issues HTTPS reads and writes. Timeouts are UNKNOWN, not failed commits. Writes need idempotency keys.",
+      "detail": {
+        "consistency": "UI state is not a consistency boundary.",
+        "durability": "None. Retrying a write without an idempotency key can double-apply.",
+        "failure": "Timeout, offline, or cancelled request.",
+        "recovery": "Retry with the same idempotency key; do not assume the server rolled back."
+      }
+    },
+    {
+      "id": "dns",
+      "layerId": "edge",
+      "title": "DNS",
+      "product": "DNS (Route 53 / CoreDNS-class)",
+      "ownership": "derived",
+      "optional": false,
+      "alternativeGroup": null,
+      "defaultSelected": true,
+      "paths": ["read", "write"],
+      "relatedSlugs": ["dns-and-service-discovery"],
+      "href": null,
+      "summary": "Resolves hostname to edge or origin. TTL cache can send traffic to a drained VIP. DNS is not fencing.",
+      "detail": {
+        "consistency": "Cached answers can be stale for the TTL.",
+        "durability": "Not a data store.",
+        "failure": "NXDOMAIN, SERVFAIL, or stale VIP after failover.",
+        "recovery": "Short TTL plus health-checked records; still not a lock."
+      }
+    },
+    {
+      "id": "cdn",
+      "layerId": "edge",
+      "title": "CDN",
+      "product": "CDN / edge cache",
+      "ownership": "derived",
+      "optional": true,
+      "alternativeGroup": null,
+      "defaultSelected": true,
+      "paths": ["read"],
+      "relatedSlugs": ["cdns-and-edge-architecture", "caching-patterns-and-invalidation"],
+      "href": null,
+      "summary": "Optional derived cache for cacheable GETs. Not on the TokenX ledger write path.",
+      "detail": {
+        "consistency": "TTL / explicit versioning. Stale-if-error is a product choice.",
+        "durability": "Edge objects are rebuildable.",
+        "failure": "Origin shield outage or poisoned cache entry.",
+        "recovery": "Purge by key; fall back to origin; do not serve ledger balances from CDN."
+      }
+    },
+    {
+      "id": "waf",
+      "layerId": "edge",
+      "title": "WAF",
+      "product": "Web application firewall",
+      "ownership": "derived",
+      "optional": true,
+      "alternativeGroup": null,
+      "defaultSelected": true,
+      "paths": ["read", "write"],
+      "relatedSlugs": ["network-security-boundaries"],
+      "href": null,
+      "summary": "Optional filter. Fail-open vs fail-closed is an availability decision. Owns no business state.",
+      "detail": {
+        "consistency": "Not applicable.",
+        "durability": "Not applicable.",
+        "failure": "False positives or fail-open under overload.",
+        "recovery": "Rule rollback; bypass is a security incident, not a data repair."
+      }
+    },
+    {
+      "id": "load-balancer",
+      "layerId": "ingress",
+      "title": "Load balancer",
+      "product": "L4/L7 VIP",
+      "ownership": "derived",
+      "optional": false,
+      "alternativeGroup": null,
+      "defaultSelected": true,
+      "paths": ["read", "write"],
+      "relatedSlugs": ["load-balancing-deep-dive"],
+      "href": null,
+      "summary": "Spreads connections. Health checks are liveness, not proof the primary is writable.",
+      "detail": {
+        "consistency": "Sticky sessions do not create read-your-writes on a replica.",
+        "durability": "None.",
+        "failure": "Unhealthy targets, slow drain, or health-check false healthy.",
+        "recovery": "Deregister, drain, and fail connections that still hit a fenced primary."
+      }
+    },
+    {
+      "id": "api-gateway",
+      "layerId": "ingress",
+      "title": "API gateway",
+      "product": "API gateway",
+      "ownership": "derived",
+      "optional": false,
+      "alternativeGroup": null,
+      "defaultSelected": true,
+      "paths": ["read", "write"],
+      "relatedSlugs": ["rate-limiting", "http-apis-and-protocol-choice"],
+      "href": null,
+      "summary": "Auth, rate limit, routing. Rate-limit counters in Redis are derived, not the ledger.",
+      "detail": {
+        "consistency": "Authn tokens and limit counters are eventually consistent across gateway replicas unless a central store is specified.",
+        "durability": "Request logs are not commit proof.",
+        "failure": "429 vs timeout. Timeout is UNKNOWN to the client.",
+        "recovery": "Shed load; do not auto-replay UNKNOWN writes."
+      }
+    },
+    {
+      "id": "app-service",
+      "layerId": "compute",
+      "title": "Application service",
+      "product": "Stateless app workers",
+      "ownership": "derived",
+      "optional": false,
+      "alternativeGroup": null,
+      "defaultSelected": true,
+      "paths": ["read", "write"],
+      "relatedSlugs": ["transactions-across-boundaries", "idempotency-and-deduplication"],
+      "href": null,
+      "summary": "Orchestrates idempotency lookup and cache policy. Crash after commit and before response is UNKNOWN.",
+      "detail": {
+        "consistency": "Process memory is not a consistency boundary.",
+        "durability": "None until the primary acknowledges.",
+        "failure": "OOM, deploy, or timeout holding a DB connection.",
+        "recovery": "Idempotent retry; never hold a SQL transaction across an HTTP call."
+      }
+    },
+    {
+      "id": "redis",
+      "layerId": "cache",
+      "title": "Redis",
+      "product": "Redis",
+      "ownership": "derived",
+      "optional": false,
+      "alternativeGroup": null,
+      "defaultSelected": true,
+      "paths": ["read", "write"],
+      "relatedSlugs": ["caching-patterns-and-invalidation"],
+      "href": "/reference/technologies/redis",
+      "summary": "Default cache-aside hop. RDB/AOF does not make Redis the system of record for TokenX balances.",
+      "detail": {
+        "consistency": "Cached values can be stale. Replica reads are asynchronously lagged.",
+        "durability": "Optional RDB/AOF. Restart can lose recent writes even with AOF depending on fsync policy.",
+        "failure": "Flush, OOM eviction, or split-brain under Sentinel/cluster misconfig.",
+        "recovery": "Rebuild from the primary. TokenX money paths fail closed on uncertain freshness; ad-click dashboards may fail open on labeled stale reads."
+      }
+    },
+    {
+      "id": "postgres-primary",
+      "layerId": "primary",
+      "title": "PostgreSQL primary",
+      "product": "PostgreSQL",
+      "ownership": "authoritative",
+      "optional": false,
+      "alternativeGroup": "primary-store",
+      "defaultSelected": true,
+      "paths": ["read", "write"],
+      "relatedSlugs": ["relational-vs-nosql-selection", "indexes-and-query-execution", "replication-and-failover", "transactions-across-boundaries"],
+      "href": "/reference/technologies/postgresql",
+      "summary": "Default relational primary. Durability is WAL fsync plus replica acknowledgement policy. Failover needs fencing.",
+      "detail": {
+        "consistency": "Single-primary reads are the commit snapshot the session sees. Replicas lag.",
+        "durability": "Defined by synchronous_commit and whether a standby acknowledged the WAL flush.",
+        "failure": "Primary crash, disk full, or split-brain if two writers exist.",
+        "recovery": "Fence the old writer, promote a replica with the latest eligible WAL, increment timeline; in-flight commits may be UNKNOWN."
+      }
+    },
+    {
+      "id": "postgres-replica",
+      "layerId": "primary",
+      "title": "PostgreSQL replica",
+      "product": "PostgreSQL streaming replica",
+      "ownership": "derived",
+      "optional": true,
+      "alternativeGroup": "primary-store",
+      "defaultSelected": true,
+      "paths": ["read"],
+      "relatedSlugs": ["replication-and-failover", "scaling-read-heavy-services"],
+      "href": "/reference/technologies/postgresql",
+      "summary": "Optional derived read. Applied WAL position defines freshness. Not a second primary.",
+      "detail": {
+        "consistency": "Read-your-writes only with a position token on this timeline.",
+        "durability": "Replica flush is not a client commit unless the primary waited for it.",
+        "failure": "Lag, WAL recycle forcing rebuild, or accidental promotion without fencing.",
+        "recovery": "Rebuild from backup+WAL; never dual-write."
+      }
+    },
+    {
+      "id": "dynamodb",
+      "layerId": "primary",
+      "title": "DynamoDB",
+      "product": "DynamoDB",
+      "ownership": "authoritative",
+      "optional": false,
+      "alternativeGroup": "primary-store",
+      "defaultSelected": false,
+      "paths": ["read", "write"],
+      "relatedSlugs": ["relational-vs-nosql-selection", "cap-and-consistency-models"],
+      "href": "/reference/technologies/dynamodb",
+      "summary": "Alternative item primary. Default reads are eventually consistent. Strongly consistent reads are same-region and are not cluster-wide linearizability.",
+      "detail": {
+        "consistency": "Eventual by default. ConsistentRead is a quorum read in one region, not global linearizability. Global tables are last-writer-wins.",
+        "durability": "Replicated storage class of the table; not a user-visible WAL you can replay yourself.",
+        "failure": "Hot partition, region impairment, or conflicting multi-region writes.",
+        "recovery": "Conditional writes / transactions for occupancy; do not LWW TokenX balances across regions."
+      }
+    },
+    {
+      "id": "outbox-kafka",
+      "layerId": "streaming",
+      "title": "Outbox and workers",
+      "product": "Transactional outbox plus optional log (Kafka-class, not required in Phase A)",
+      "ownership": "derived",
+      "optional": true,
+      "alternativeGroup": null,
+      "defaultSelected": true,
+      "paths": ["write"],
+      "relatedSlugs": ["transactions-across-boundaries", "kafka-delivery-and-failure"],
+      "href": null,
+      "summary": "Async fan-out after primary commit. Not a second source of money. Kafka durability still needs RF/acks/ISR named.",
+      "detail": {
+        "consistency": "At-least-once to consumers. Order is per partition key, not global.",
+        "durability": "Only after the outbox row or Kafka produce is acknowledged under the named config.",
+        "failure": "Producer timeout, ISR shrink, or consumer lag.",
+        "recovery": "Replay committed outbox/journal only; request logs without commit are UNKNOWN."
+      }
+    },
+    {
+      "id": "workers",
+      "layerId": "streaming",
+      "title": "Workers",
+      "product": "Async consumers",
+      "ownership": "derived",
+      "optional": true,
+      "alternativeGroup": null,
+      "defaultSelected": true,
+      "paths": ["write"],
+      "relatedSlugs": ["consumer-groups-and-rebalancing", "retries-dead-letters-and-replay"],
+      "href": null,
+      "summary": "At-least-once consumers for search, warehouses, notifications. Must not become a second TokenX writer.",
+      "detail": {
+        "consistency": "Sinks must be idempotent.",
+        "durability": "Consumer offset is not the business commit.",
+        "failure": "Poison messages, lag, or dual processing during rebalance.",
+        "recovery": "DLQ + replay; fence work with owner/epoch if needed."
+      }
+    },
+    {
+      "id": "s3",
+      "layerId": "object",
+      "title": "Object storage",
+      "product": "S3-class",
+      "ownership": "authoritative",
+      "optional": true,
+      "alternativeGroup": null,
+      "defaultSelected": true,
+      "paths": ["read", "write"],
+      "relatedSlugs": ["object-storage-and-large-files", "backup-restore-and-disaster-recovery"],
+      "href": null,
+      "summary": "Authoritative for immutable object bytes once PUT is acknowledged. Ledger rows stay in the primary DB.",
+      "detail": {
+        "consistency": "New objects typically read-after-write in a region; listings and overwrite can lag.",
+        "durability": "Storage class / replication configuration, not infinite.",
+        "failure": "Slow PUT, partial multipart, or restore delay from Glacier-class.",
+        "recovery": "Checksum and retry multipart; metadata in the DB is the catalog."
+      }
+    },
+    {
+      "id": "opensearch",
+      "layerId": "object",
+      "title": "OpenSearch",
+      "product": "OpenSearch",
+      "ownership": "derived",
+      "optional": true,
+      "alternativeGroup": null,
+      "defaultSelected": true,
+      "paths": ["read"],
+      "relatedSlugs": ["time-series-and-append-only-storage"],
+      "href": null,
+      "summary": "Rebuildable search index. Near-real-time refresh is not a commit. Never spend from search hits.",
+      "detail": {
+        "consistency": "Near-real-time, not read-your-writes unless you refresh and wait.",
+        "durability": "Replica shards; still derived from the primary.",
+        "failure": "Yellow/red cluster, mapping explosion, or lagging ingest.",
+        "recovery": "Reindex from the source of truth."
+      }
+    },
+    {
+      "id": "observability",
+      "layerId": "observe",
+      "title": "Observability",
+      "product": "Metrics, logs, traces",
+      "ownership": "derived",
+      "optional": false,
+      "alternativeGroup": null,
+      "defaultSelected": true,
+      "paths": ["read", "write"],
+      "relatedSlugs": ["profiling-and-observability"],
+      "href": null,
+      "summary": "Derived telemetry for detection. Missing spans do not mean missing commits.",
+      "detail": {
+        "consistency": "Sampled and delayed.",
+        "durability": "Retention windows; not a ledger.",
+        "failure": "Dropped traces during overload.",
+        "recovery": "Use it to detect lag and failover; repair from WAL/backups, not from logs alone."
+      }
+    }
+  ],
+  "edges": [
+    { "id": "e-client-dns", "from": "client", "to": "dns", "kind": "sync", "paths": ["read", "write"], "label": "Resolve hostname" },
+    { "id": "e-dns-cdn", "from": "dns", "to": "cdn", "kind": "sync", "paths": ["read"], "label": "Optional edge cache" },
+    { "id": "e-dns-waf", "from": "dns", "to": "waf", "kind": "sync", "paths": ["read", "write"], "label": "Optional filter" },
+    { "id": "e-cdn-lb", "from": "cdn", "to": "load-balancer", "kind": "sync", "paths": ["read"], "label": "Origin miss" },
+    { "id": "e-waf-lb", "from": "waf", "to": "load-balancer", "kind": "sync", "paths": ["read", "write"], "label": "Forward allowed" },
+    { "id": "e-dns-lb", "from": "dns", "to": "load-balancer", "kind": "sync", "paths": ["read", "write"], "label": "Direct origin" },
+    { "id": "e-lb-gw", "from": "load-balancer", "to": "api-gateway", "kind": "sync", "paths": ["read", "write"], "label": "HTTP to gateway" },
+    { "id": "e-gw-app", "from": "api-gateway", "to": "app-service", "kind": "sync", "paths": ["read", "write"], "label": "Routed request" },
+    { "id": "e-app-redis", "from": "app-service", "to": "redis", "kind": "sync", "paths": ["read", "write"], "label": "Cache get/set" },
+    { "id": "e-app-pg", "from": "app-service", "to": "postgres-primary", "kind": "sync", "paths": ["read", "write"], "label": "SQL primary" },
+    { "id": "e-app-replica", "from": "app-service", "to": "postgres-replica", "kind": "sync", "paths": ["read"], "label": "Optional replica read" },
+    { "id": "e-pg-replica", "from": "postgres-primary", "to": "postgres-replica", "kind": "async", "paths": ["write"], "label": "Streaming WAL" },
+    { "id": "e-app-ddb", "from": "app-service", "to": "dynamodb", "kind": "sync", "paths": ["read", "write"], "label": "Item primary (alt)" },
+    { "id": "e-pg-outbox", "from": "postgres-primary", "to": "outbox-kafka", "kind": "async", "paths": ["write"], "label": "Committed outbox" },
+    { "id": "e-ddb-outbox", "from": "dynamodb", "to": "outbox-kafka", "kind": "async", "paths": ["write"], "label": "Stream / CDC" },
+    { "id": "e-outbox-workers", "from": "outbox-kafka", "to": "workers", "kind": "async", "paths": ["write"], "label": "Consume" },
+    { "id": "e-workers-s3", "from": "workers", "to": "s3", "kind": "async", "paths": ["write"], "label": "Spill / backup" },
+    { "id": "e-workers-search", "from": "workers", "to": "opensearch", "kind": "async", "paths": ["write"], "label": "Index documents" },
+    { "id": "e-app-s3", "from": "app-service", "to": "s3", "kind": "sync", "paths": ["read", "write"], "label": "Object GET/PUT" },
+    { "id": "e-client-obs", "from": "client", "to": "observability", "kind": "async", "paths": ["read", "write"], "label": "Traces / RUM" },
+    { "id": "e-app-obs", "from": "app-service", "to": "observability", "kind": "async", "paths": ["read", "write"], "label": "Logs / metrics" },
+    { "id": "e-pg-obs", "from": "postgres-primary", "to": "observability", "kind": "async", "paths": ["read", "write"], "label": "Lag / failover metrics" }
+  ]
+}

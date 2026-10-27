@@ -1,0 +1,109 @@
+---
+kind: deep-dive
+id: postgresql
+title: "PostgreSQL"
+description: "Relational primary: WAL, MVCC, replicas, and fenced failover. Default store on the Storage & Data explorer."
+landscape: storage
+relatedSlugs:
+  - relational-vs-nosql-selection
+  - indexes-and-query-execution
+  - replication-and-failover
+  - transactions-across-boundaries
+---
+
+<LibraryBigPicture>
+
+PostgreSQL is a **row-store primary** for access patterns that need SQL, unique constraints, and multi-row transactions **inside one database**. On the academy explorer it is the default authoritative hop after the application service.
+
+It is **not** a global linearizable fabric, a cache, or an object store. Replica lag is expected. Promoting a replica without fencing can create two writers. Acknowledged commits can still be missing on the promotee if replication was asynchronous.
+
+Place it when the invariant lives in relational constraints (TokenX ledger rows, uniqueness of `transfer_id`). Use DynamoDB instead when the access path is a partition key at item scale. Use Redis beside it, not as the ledger. See <LessonCrossLink slug="relational-vs-nosql-selection" />.
+
+</LibraryBigPicture>
+
+<LibraryUnderTheHood>
+
+### Execution
+
+A client session sends SQL. The backend process plans, locks, and versions rows with **MVCC**. Readers do not block writers on the same snapshot rules you named (default `READ COMMITTED`). Indexes are derived access paths over heap tuples; an index-only scan still consults visibility. Details: <LessonCrossLink slug="indexes-and-query-execution" />.
+
+A commit records records in the **write-ahead log (WAL)** and flushes according to `synchronous_commit`. The client acknowledgement is “this LSN is durable on the servers you waited for,” not “every replica and every cache agrees.”
+
+### Replication units
+
+Streaming replicas apply WAL. Track at least: primary flush LSN, replica received, replica flushed, replica applied. “Connected” is not “caught up.” Example: 15 MB/s WAL × 120 s disconnect = 1.8 GB backlog; catch-up at 30 MB/s net is 60 s before CPU contention.
+
+### Transactions across processes
+
+A PostgreSQL transaction does not include Redis, Kafka, or HTTP. Cross-store work uses an outbox in the **same** commit as the business row, then async consumers. See <LessonCrossLink slug="transactions-across-boundaries" />.
+
+<ExecutionTimeline
+  title="TokenX debit commit on PostgreSQL"
+  steps={[
+    { title: "Begin + fence", detail: "Checkout a pool connection. INSERT uniqueness (tenant_id, transfer_id) so retries collide on the key.", state: "Authoritative occupancy of the transfer id.", failure: "Hold the transaction while calling HTTP or Kafka." },
+    { title: "Mutate rows", detail: "UPDATE the balance row in the same transaction. Celebrity accounts queue on the row lock.", state: "MVCC versions; other sessions see committed data only.", failure: "Read in one transaction, write in another without the unique key." },
+    { title: "WAL flush", detail: "COMMIT waits for local WAL fsync, and for a synchronous standby if configured.", state: "Durability is the flush policy, not the SQL parse.", failure: "synchronous_commit=off while telling the user the transfer is final." },
+    { title: "Outbox then response", detail: "Outbox row committed with the debit. Client ACK after COMMIT. Workers are async.", state: "Kafka is derived.", failure: "Produce to Kafka inside the SQL transaction and call that exactly-once." }
+  ]}
+/>
+
+</LibraryUnderTheHood>
+
+<ArchitectureAndDataFlow>
+
+The application talks **synchronously** to the primary. WAL to replicas is **asynchronous** unless you paid for synchronous apply/flush. Outbox to Kafka is async. Redis beside the primary is derived.
+
+<MermaidDiagram
+  title="PostgreSQL primary, replica, and async outbox"
+  chart={"flowchart LR\n  APP[App service] -->|sync SQL| PG[(PostgreSQL primary authoritative)]\n  PG -->|WAL async unless specified| REP[(Streaming replica derived)]\n  PG -->|same commit| OB[(Outbox table)]\n  OB -.->|async| K[Kafka workers]\n  APP -->|optional GET| REDIS[(Redis derived)]"}
+/>
+
+Ownership: heap + WAL on the primary are authoritative for SQL rows. Replica apply position is derived freshness. Redis and search are derived. Failure: primary crash stops sync writes; callers time out. Recovery: fence old writer, promote latest eligible replica, increment timeline — <LessonCrossLink slug="replication-and-failover" />.
+
+</ArchitectureAndDataFlow>
+
+<SelectionCriteria>
+
+Choose PostgreSQL when:
+
+- You need unique constraints, joins, or multi-row invariants in **one** database.
+- Operators can run backups, vacuum, connection pooling, and fenced failover.
+- Read-your-writes can go to the primary or wait for a position token.
+
+Defensible substitutes:
+
+1. **MySQL / InnoDB** — same class; pick from operational skill, not slogans.
+2. **DynamoDB** — when the query is a partition key and you accept item-level transactions and eventual default reads.
+3. **Cockroach / Spanner-class** — when you need SQL **and** a named distributed consistency model you will actually operate; they are not “Postgres with magic HA.”
+
+</SelectionCriteria>
+
+<FailureModes>
+
+- **Primary crash:** detection is lease/health, often seconds. In-flight commits are UNKNOWN. Promotion can drop acknowledged WAL that never reached the promotee under async replication.
+- **Split brain:** two writers if the old primary is not fenced. Fencing is revoke lease + storage/VIP + epoch, not DNS TTL.
+- **Disk / WAL full:** commits stall; this is not a cache miss.
+- **Replica lag / recycle:** if required WAL is gone, rebuild from backup. Retrying the stream cannot invent bytes.
+- **Cost/ops:** vacuum, bloat, pooling, major version upgrades, PITR drills. Managed Postgres still needs your failover runbook.
+
+Do not tell an interviewer failover is lossless unless you name synchronous replica acknowledgement **and** fencing **and** the UNKNOWN retry story.
+
+</FailureModes>
+
+<LibraryInterviewTraps>
+
+- “We will fail over with no data loss” — only if every acknowledged commit was on the promotee and the old writer is fenced. Async replicas do not provide that.
+- “Replicas give us linearizable reads” — replica apply is lagged; linearizable reads need current authority proof.
+- “Postgres is too slow, add Redis” — measure the plan, locks, and pool. Cache-aside does not fix a sequential scan or a celebrity row.
+- “A transaction makes the whole architecture atomic” — only the PostgreSQL tables in that commit.
+- Follow-up: what is your RPO if the replica is 1.8 GB behind? Answer in WAL bytes and time, then say which client ACKs you might lose.
+
+</LibraryInterviewTraps>
+
+<LibraryMentalModel>
+
+Treat PostgreSQL as a **court stenographer with a numbered transcript** (WAL). Copies of the transcript can lag. Promoting a copy requires taking the old stenographer’s pen away. Redis is a sticky note on the gallery rail — useful, not the transcript.
+
+Remember: **fsync policy defines durability, apply LSN on a timeline defines freshness, fencing defines whether failover is safe.**
+
+</LibraryMentalModel>

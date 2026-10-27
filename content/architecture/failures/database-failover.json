@@ -1,0 +1,95 @@
+{
+  "id": "database-failover",
+  "title": "PostgreSQL-class primary failure",
+  "description": "Walk a primary crash from detection through fencing, promotion, retries, and user-visible UNKNOWN. This path is not instantaneous, lossless, or transparent.",
+  "relatedSlugs": ["replication-and-failover", "failure-detection-and-recovery", "idempotency-and-deduplication", "transactions-across-boundaries"],
+  "assumptions": [
+    "One writable PostgreSQL primary, one or more streaming replicas, WAL on disk, application connection pool.",
+    "synchronous_commit is on for the primary's local flush; replica apply is asynchronous unless a step says otherwise. Acknowledged commits can still be missing on the promoted replica.",
+    "A quorum membership service (Patroni/etcd-class, RDS multi-AZ, or equivalent) is allowed to revoke the writer lease. Client timeouts alone do not authorize promotion.",
+    "Clients retry writes only with idempotency keys. Timeouts are UNKNOWN, not rollback.",
+    "Observability is derived. Missing metrics do not prove a commit was lost or succeeded."
+  ],
+  "steps": [
+    {
+      "id": "normal",
+      "title": "Healthy primary",
+      "timeline": "t0: primary holds the writer lease/epoch. WAL flushes locally. Replicas apply behind by measured lag (example: 40–200 ms under 15 MB/s WAL).",
+      "inFlight": "In-flight commits wait on WAL fsync and client round trip. Pool connections are checked out.",
+      "consistency": "Primary reads see the session snapshot. Replica reads may miss the last commit unless the client carries a {timeline, LSN} token and waits.",
+      "durability": "A commit the primary acknowledged is on the primary's WAL. It is on a replica only if that replica flushed that LSN.",
+      "userVisible": "p99 is pool wait + SQL + fsync. No failover UX.",
+      "recovery": "Not in this step. Keep lag and lease metrics on a dashboard; they are detection inputs later."
+    },
+    {
+      "id": "detection",
+      "title": "Detect loss of writer",
+      "timeline": "t1: primary process, disk, or network dies. Lease renewals stop. Health checks fail after the configured interval (often seconds, not milliseconds).",
+      "inFlight": "Clients blocked on the dead primary hit timeouts. The server may have flushed WAL without sending the Ready response.",
+      "consistency": "There is no current proven writer. Replica state is whatever LSN they flushed. Do not read 'the old hostname' as authority.",
+      "durability": "Unknown for in-flight statements. Already-acked commits exist on the old primary's disk if the disk is intact, and on replicas that received them.",
+      "userVisible": "Errors, spinner timeouts, HTTP 504/UNKNOWN. Not a clean 409.",
+      "recovery": "Do not promote on a single probe. Require lease expiry plus replica data comparison. DNS/VIP still pointing at the corpse is expected for TTL seconds."
+    },
+    {
+      "id": "in-flight",
+      "title": "In-flight commit impact",
+      "timeline": "t1–t2: statements that were in WAL-flush or in the TCP response path have no client-visible outcome.",
+      "inFlight": "Three classes: (1) never reached WAL, (2) WAL flushed, client not told, (3) client told OK but replica never got the record.",
+      "consistency": "Two clients can now disagree: one saw timeout, one saw OK if it completed earlier. Session state on the app is not a source of truth.",
+      "durability": "Class (2) is durable on the old primary and maybe not on the promotion candidate. Class (3) is durable on the old primary; promotion can drop it if that replica was behind.",
+      "userVisible": "Retries without idempotency double-apply class (2)/(3) if the new primary has the row, or create a second row if it does not.",
+      "recovery": "Treat timeout as UNKNOWN. Look up the idempotency key on the new primary after promotion. Do not auto-replay unsigned request logs."
+    },
+    {
+      "id": "promotion",
+      "title": "Fence and promote",
+      "timeline": "t2: coordinator fences the old writer (revoke lease, block writes at storage/VIP, increment epoch). Then it promotes the replica with the latest eligible flushed WAL.",
+      "inFlight": "Old primary, if it heals, must be rejected: fenced epoch, STONITH, or rewind. Unfenced heal is split-brain.",
+      "consistency": "After promotion, the new timeline is not an ancestor of unreplicated old-primary WAL. Equal LSN numbers on the old timeline are invalid.",
+      "durability": "Any WAL only on the fenced primary and not on the promotee is unreadable unless you rewind/merge by hand. That is data loss relative to a client who heard OK.",
+      "userVisible": "A window of errors while VIP/DNS/pool move. Connection reset, not a seamless swap.",
+      "recovery": "Write a no-op or timeline history on the new primary. Routers must require the new epoch. Do not claim the cutover was lossless."
+    },
+    {
+      "id": "client-retry",
+      "title": "Client retries",
+      "timeline": "t3: app retries with the same idempotency key after backoff. Pool reconnects to the new writer.",
+      "inFlight": "If the original commit is on the new primary, the unique key hits and returns the prior result. If it is not, the retry commits a new authoritative row.",
+      "consistency": "Read-your-writes tokens must include timeline/epoch. A retry that lands on a lagging replica can miss the new commit.",
+      "durability": "The retry is durable only when the new primary acknowledges under the current fsync policy.",
+      "userVisible": "User may see success on retry, duplicate side effects if the key was missing, or a second timeout.",
+      "recovery": "Idempotency store on the primary with UNIQUE (tenant, operation, key). At-least-once clients plus uniqueness, not exactly-once networking."
+    },
+    {
+      "id": "consistency",
+      "title": "Consistency after cutover",
+      "timeline": "t3–t4: replicas that were behind the promotee must rewind or rebuild. Caches still hold pre-failover values.",
+      "inFlight": "Cache-aside hits can return rows the new timeline never had, or miss rows it just committed.",
+      "consistency": "Session monotonicity is broken across timelines. Linearizable reads require proving current authority (lease/ReadIndex), not 'hostname role=primary'.",
+      "durability": "Caches and search indexes are derived; rebuilding them does not restore lost WAL.",
+      "userVisible": "Stale profile reads, missing 'success' records, or brief duplicates in derived views.",
+      "recovery": "Invalidate or version-bump cache keys. Search reindex from the new primary. Do not LWW TokenX balances from a replica."
+    },
+    {
+      "id": "recovery",
+      "title": "Restore redundancy",
+      "timeline": "t4–t5: attach a new replica, restore sync durability targets, confirm backups include the new timeline.",
+      "inFlight": "Catch-up generates WAL apply load. Routing correctness-sensitive reads to a catching replica is unsafe.",
+      "consistency": "Until a second copy exists, a second crash is a longer outage and a worse RPO.",
+      "durability": "RPO is 'last WAL on the current primary' until another replica or archive acknowledges.",
+      "userVisible": "Degraded SLO: higher p99 while catch-up and vacuum/checkpoint catch the new writer.",
+      "recovery": "Seed from snapshot+WAL, never from unsigned request logs. Fence any node still on the old timeline."
+    },
+    {
+      "id": "user-visible",
+      "title": "What users should be told",
+      "timeline": "Whole incident: detection delay + fence + promote + reconnect is typically seconds to minutes, not a single RTT.",
+      "inFlight": "Some users saw success, some saw error, some saw retry success. Support must not promise all three match.",
+      "consistency": "After recovery, the ledger is the new primary. Disputes are UNKNOWN until the idempotency row is read there.",
+      "durability": "If a user got OK and that WAL was only on the fenced disk, the honest answer is possible acknowledged loss under async replica policy.",
+      "userVisible": "Status page: writes paused, elevated errors, some requests uncertain. Do not tell customers the cutover hid all loss.",
+      "recovery": "Reconcile UNKNOWN with the idempotency table and customer receipts. Compensation is a business transaction, not a silent overwrite."
+    }
+  ]
+}
