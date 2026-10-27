@@ -117,7 +117,7 @@ The accepted-event boundary is the durable log. Minute state and rollups are der
 
 1. **“Timestamp is the event ID.”** Clocks collide and retry; carry an independently stable identifier.
 2. **“Exactly-once means no deduplication.”** End-to-end side effects still require idempotent keys and transactional boundaries.
-3. **“Close the window and ignore late events.”** State the allowed lateness, correction path, and product behavior for final reports.
+3. **“Close the window and ignore late events.”** A watermark is not a lossless financial close. Keep the original event ID, correct from durable raw facts, and publish a versioned result instead of minting a second identity.
 4. **“Compression makes storage negligible.”** Include replicas, indexes, compaction headroom, metadata, and backups.
 5. **“Append-only means nothing is deleted.”** Retention, privacy erasure, cryptographic deletion, tombstones, and backup expiry still need an enforceable policy.
 
@@ -136,10 +136,15 @@ At IC6, distinguish authoritative facts from disposable views and state how ever
 </Tradeoffs>
 
 <KnowledgeCheck
-  question="At 100 million events/day and 800 bytes/event, what is the approximate raw payload before replication and indexes?"
-  options={["8 GB/day", "80 GB/day", "800 GB/day", "2.4 TB/day"]}
-  correct={1}
-  explanation="100,000,000 multiplied by 800 bytes is 80,000,000,000 bytes, or about 80 GB in decimal units."
+  question="A click arrives 18 hours after the dashboard watermark closed the billing day. It carries a stable event ID that is not yet in the published daily total. Which assumption failed, and what should close do?"
+  options={[
+    "The watermark is a lossless close, so ignore the click",
+    "The dashboard row is authoritative, so overwrite yesterday in place with no version",
+    "The watermark is only a live-estimate bound; keep the original event ID on the durable raw fact and emit a versioned delayed-close correction",
+    "Closed days cannot reuse identities, so mint a second event ID so the counter increments"
+  ]}
+  correct={2}
+  explanation="The failed assumption is that a closed watermark means lossless billing. Live dashboards may freeze early; financial close must still apply the retained raw fact under its original event ID and publish a new aggregate version. Minting a second identity would double-count on replay."
 />
 
 <ScenarioCheck

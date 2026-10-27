@@ -60,7 +60,7 @@ Modules 1 and 6 are complete in topic coverage and conform to the automated cont
 
 ## Outstanding technical audit findings
 
-The Modules 1 and 6 audit found **13 items**. High findings through Batch 4 (TrueTime and disaster-recovery replay) are remediating on `fix/distributed-systems-audit`; **4 Medium and Low items remain**. Correctness defects and unstated protocol assumptions take priority over editorial improvements.
+The Modules 1 and 6 audit found **13 items**. High findings through Batch 5 (CAP quorum, index uniqueness/height, and failure-oriented checks) are remediating on `fix/distributed-systems-audit`; **Batch 6 residual High-clarity items remain**. Correctness defects and unstated protocol assumptions take priority over editorial improvements.
 
 | Priority | Finding | Required remediation |
 | --- | --- | --- |
@@ -72,15 +72,15 @@ The Modules 1 and 6 audit found **13 items**. High findings through Batch 4 (Tru
 | Medium (this branch) | Read-position tokens omit shard/log identity and failover lineage | Token is `{shard, epoch/timeline, commit position}` with ancestry and current-authority checks |
 | Medium (this branch) | TrueTime's 7 ms example does not define epsilon versus full interval width | ε is half-width; wait until earliest > t (~2ε); overlap wait with replication |
 | Medium (this branch) | Signed request logs are treated as sufficient evidence for post-restore replay | Auto-replay committed journals only; request-only outcomes are UNKNOWN; fence before new writes |
-| Medium | The CAP quorum diagram visually implies all three replicas are required | Show leader plus either follower as a 2-of-3 quorum |
-| Low | An idempotency key is called globally unique despite tenant-scoped schema | Describe uniqueness within tenant and operation scope |
-| Low | B-tree height arithmetic uses an ambiguous definition of level | Define branching levels, leaf level, fanout assumptions, and fill factor |
+| Medium (this branch) | The CAP quorum diagram visually implies all three replicas are required | Leader plus either follower as a 2-of-3 quorum; minority isolated; quorum ≠ full cluster |
+| Low (this branch) | An idempotency key is called globally unique despite tenant-scoped schema | Uniqueness is `UNIQUE (tenant_id, operation, idempotency_key)` |
+| Low (this branch) | B-tree height arithmetic uses an ambiguous definition of level | Height includes leaf; fanout and fill factor stated; not exact disk I/O |
 | Low (this branch) | Kafka partitioning is said to preserve campaign event order too broadly | Broker append/offset order distinguished from event-time and causal order |
-| Low | Several knowledge checks are arithmetic-only or have implausible distractors | Replace selected checks with failure-oriented production scenarios |
+| Low (this branch) | Several knowledge checks are arithmetic-only or have implausible distractors | Object-storage, time-series, restore, and replication checks now test violated assumptions |
 
 ## Next milestone
 
-1. Review High remediations through Batch 4 (TrueTime and DR replay), then continue remaining Medium/Low batches.
+1. Review High remediations through Batch 5, then Batch 6 residual High-clarity items.
 2. Re-run the complete validation suite and review the affected diagrams and exercises on desktop and mobile.
 3. Begin Module 3, **Kafka & Fault Tolerance**, with Kafka Internals, Consumer Groups and Rebalancing, and Ordering and Event Keys before progressing to stream processing and disaster scenarios.
 

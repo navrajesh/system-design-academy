@@ -28,7 +28,11 @@ It is not a permanent selection of two letters, and “consistency” in CAP mea
 
 With N replicas, a common rule is <code>W + R &gt; N</code>, so a read quorum overlaps the last write quorum. This does not automatically guarantee linearizability: sloppy quorums, concurrent versions, clock-based conflict resolution, and failed read repair can change behavior. A linearizable leader design also needs one active epoch, fencing against stale leaders, and a read protocol that proves the leader still holds authority.
 
-Leader-based systems route writes through one elected leader. During a partition, only a side that can establish a valid quorum may retain or elect a leader for coordinated writes. Other replicas reject those writes or serve explicitly stale reads. Even the quorum side can be unavailable briefly during election or when latency exceeds the operation deadline.
+Leader-based systems route writes through one elected leader. In a **three-replica** group, majority is **2-of-3**: the leader plus **either** follower, not all three copies. During a partition, only a side that can form that majority may retain or elect a leader for coordinated writes.
+
+The **isolated minority** cannot commit linearizable writes. It may still serve explicitly stale, labeled reads if product policy allows. **Epoch fencing** rejects minority writes that carry an older epoch, even if that replica still believes it is leader.
+
+**Quorum availability is not full-cluster availability.** A majority can keep committing while one replica is down. The group still has no majority—and cannot commit linearizable writes—if two of three replicas are lost, or if a partition splits **1/1/1**. Even a live majority can be unavailable during election or when the operation deadline expires.
 
 The policy can differ by operation:
 
@@ -48,16 +52,19 @@ Then define operation-level guarantees: read-your-writes, monotonic reads, causa
 
 </MentalModel>
 
-<ArchitectureDiagram title="Operation-specific behavior during a partition" chart={"flowchart LR\n  C[TokenX client] --> R[Regional router]\n  R -->|debit: quorum required| L[Leader, epoch 52]\n  L -->|replicate log entry| R1[(Replica A)]\n  L -->|replicate log entry| R2[(Replica B)]\n  R1 -->|majority commit| L\n  R2 -->|majority commit| L\n  R -. network partition .- R3[(Isolated replica, epoch 51)]\n  R3 -->|stale portfolio read + as-of version| C\n  R3 -->|debit rejected: no authority| X[Retry or fail]\n  L -->|committed debit| C"}>
+<ArchitectureDiagram title="Operation-specific behavior during a partition" chart={"flowchart LR\n  C[TokenX client] --> R[Regional router]\n  R -->|debit needs 2-of-3| L[Leader, epoch 52]\n  L -->|replicate| FA[Follower A]\n  FA -->|ack; follower B not required| Q([Committed debit])\n  L --> Q\n  R -. partition .- ISO[(Isolated follower B)]\n  ISO -->|labeled stale portfolio read| C\n  ISO -->|debit rejected; fenced| X[No linearizable write]\n  Q --> C"}>
 
-The replicated log owns authoritative balance order. Epoch 52 fences the isolated epoch-51 replica from accepting debits. Product policy still permits that isolated replica to answer a portfolio query if the response exposes its version and staleness. Consistency and availability are chosen per operation, not per product logo.
+The group has **three replicas**: leader, follower A, and follower B. Authoritative TokenX transfer order lives in the replicated log after a **2-of-3** commit: the leader plus **either** follower. In this partition that pair is leader + A; B is the isolated minority, not a fourth copy. The same debit could have committed with leader + B if A had been the isolated one. Waiting for all three acks is a stricter durability choice, not the majority rule.
+
+The isolated minority cannot commit linearizable writes. Product policy may still let it answer a portfolio query if the response exposes version and staleness. Epoch 52 fences epoch-51 writes. Majority-side writes can continue while B is unreachable. They cannot continue under a **1/1/1** split or after losing two of three replicas, because no majority remains. Quorum availability is not full-cluster availability. Consistency and availability are chosen per operation, not per product logo.
 
 <ArchitectureWalkthrough
   title="Follow authority through a TokenX partition"
   stages={[
-    { name: "Normal operation", owner: "Epoch-52 leader", state: "Committed transfer log and balances", boundary: "Debits complete only after quorum commit.", failure: "Leader loses contact with a majority.", recovery: "Stop coordinated writes until a valid leader is established." },
-    { name: "Partition", owner: "Majority and isolated replica", state: "Divergent knowledge, not necessarily divergent committed state", boundary: "Only the quorum side may establish write authority.", failure: "The isolated replica still believes it is leader.", recovery: "Epoch fencing makes its writes reject at storage or downstream boundaries." },
-    { name: "Degraded reads", owner: "Product read policy", state: "Versioned, potentially stale portfolio view", boundary: "Staleness is allowed only for named read operations.", failure: "A stale response is used to authorize a debit.", recovery: "Route authorization exclusively through quorum-backed balance state." },
+    { name: "Normal operation", owner: "Epoch-52 leader", state: "Committed transfer log and balances", boundary: "Debits complete after a 2-of-3 quorum: leader plus either follower.", failure: "Leader loses contact with a majority.", recovery: "Stop coordinated writes until a valid leader is established." },
+    { name: "Partition", owner: "2-of-3 majority versus isolated minority", state: "Divergent knowledge, not necessarily divergent committed state", boundary: "Leader plus either follower may commit; the minority cannot.", failure: "The isolated replica still believes it is leader, or operators wait for all three copies.", recovery: "Epoch fencing rejects minority writes; do not confuse quorum availability with needing the full cluster." },
+    { name: "No majority", owner: "None", state: "No intersecting 2-of-3 set", boundary: "A 1/1/1 split or two-of-three replica loss cannot commit linearizable writes.", failure: "Clients treat remaining singles as if any live replica were a quorum.", recovery: "Reject or delay until a majority of the configured membership is reachable." },
+    { name: "Degraded reads", owner: "Product read policy", state: "Versioned, potentially stale portfolio view", boundary: "Staleness is allowed only for named read operations, and responses must be labeled.", failure: "A stale response is used to authorize a debit.", recovery: "Route authorization exclusively through quorum-backed balance state." },
     { name: "Repair", owner: "Replication protocol", state: "Follower catches up to committed log", boundary: "Uncommitted divergent entries never become authoritative.", failure: "Client retries an ambiguous debit with a new ID.", recovery: "Reuse the original idempotency key and query its committed result." }
   ]}
 />
@@ -87,6 +94,8 @@ A feed read can usually remain available under partition and reconcile later, wh
 - Using last-write-wins with unsynchronized wall clocks for financial state.
 - Demanding strong consistency for every derived view.
 - Forgetting client session guarantees after failover.
+- Drawing three replica arrows as if every write needed all three copies. In RF=3, majority is 2-of-3: leader plus either follower.
+- Treating “a quorum is up” as “the cluster is fully available.” The isolated replica is still down for its clients; a 1/1/1 split or two-of-three loss has no majority at all.
 
 </InterviewTraps>
 
@@ -94,11 +103,25 @@ A feed read can usually remain available under partition and reconcile later, wh
 
 Linearizable operations require coordination and can become unavailable without a quorum or within a deadline. Eventual consistency keeps selected operations available but pushes conflict semantics into the application. Causal consistency preserves meaningful order with less coordination than total order, at extra metadata cost.
 
+Waiting for all three replicas on every TokenX debit buys extra copy durability at the cost of availability: a single follower outage would stall commits even though a 2-of-3 majority still exists. Majority commit keeps writes available through one replica loss and still cannot commit after two losses or a 1/1/1 split.
+
 Strong coordination is inappropriate for derived views whose value decays slowly and whose unavailability would hurt users more than bounded staleness. Eventual conflict resolution is inappropriate when two accepted operations can jointly violate a non-mergeable invariant such as uniqueness or conserved balance.
 
 </Tradeoffs>
 
-<KnowledgeCheck question="During a network partition, what should a replica without quorum do with a TokenX debit that requires a linearizable balance?" options={["Accept it and use wall-clock last-write-wins", "Reject or delay it because write authority cannot be proven", "Accept it if portfolio reads are allowed", "Create a new leader epoch locally"]} correct={1} explanation="The operation's no-double-spend invariant requires proven write authority. The same replica may still serve explicitly stale, non-authoritative reads under a different operation policy." />
+<KnowledgeCheck question="During a network partition, what should a replica without quorum do with a TokenX debit that requires a linearizable balance?" options={["Accept it and use wall-clock last-write-wins", "Reject or delay it because write authority cannot be proven", "Accept it if portfolio reads are allowed", "Create a new leader epoch locally"]} correct={1} explanation="The operation's no-double-spend invariant requires proven write authority. Epoch fencing rejects minority writes. The same replica may still serve explicitly stale, labeled, non-authoritative reads under a different operation policy." />
+
+<KnowledgeCheck
+  question="TokenX has three replicas. The leader and follower A can communicate; follower B is partitioned. A linearizable debit is proposed. Which statement is accurate?"
+  options={[
+    "The debit cannot commit until B receives it, because RF=3 requires all three copies",
+    "Leader plus A is a 2-of-3 majority, so the debit can commit while B stays isolated, rejects writes, and may serve labeled stale reads",
+    "B should accept the debit because the minority must remain available",
+    "The cluster is fully available because a quorum exists"
+  ]}
+  correct={1}
+  explanation="Majority is 2-of-3: the leader plus either follower, not all three replicas. The isolated minority cannot commit linearizable writes; epoch fencing rejects them. Quorum availability is not full-cluster availability; B is still down for that replica's clients."
+/>
 
 <ScenarioCheck
   scenario="A three-replica inventory service uses W=2 and R=2. During a partition, the isolated replica accepts writes into a sloppy quorum on substitute nodes and resolves conflicts by timestamp."
@@ -113,8 +136,20 @@ Strong coordination is inappropriate for derived views whose value decays slowly
   explanation="A linearizability argument must cover membership, authority, commit order, and the read protocol—not just quorum arithmetic."
 />
 
+<KnowledgeCheck
+  question="Which three-replica layout can still commit a linearizable TokenX debit?"
+  options={[
+    "Leader and one follower can talk; the third replica is down",
+    "Each replica is isolated from the other two (1/1/1)",
+    "Any two of the three replicas are down",
+    "Only the isolated minority replica is reachable, and it still holds an old leader epoch"
+  ]}
+  correct={0}
+  explanation="Leader plus either follower is a 2-of-3 majority, so one replica failure still allows a quorum commit. A 1/1/1 split and two-of-three loss leave no majority. An isolated old leader is fenced and cannot commit."
+/>
+
 <InterviewAnswer>
 
-“I avoid labeling an entire product CP or AP. CAP becomes relevant when replicas cannot communicate, so I classify operations by invariant. Token transfer authorization requires a fenced leader and quorum-backed, linearizable state; a side without authority rejects the debit. A portfolio read can remain available with an as-of version, and analytics can buffer and reconcile. I then state membership, commit, read, failover, conflict, and client-session behavior rather than relying on W + R arithmetic alone.”
+“I avoid labeling an entire product CP or AP. CAP becomes relevant when replicas cannot communicate, so I classify operations by invariant. Token transfer authorization requires a fenced leader and a 2-of-3 majority on three replicas—the leader plus either follower—not all three copies. The isolated minority cannot commit that debit; epoch fencing rejects its writes, and it may still serve a labeled stale portfolio if product policy allows. Quorum availability is not full-cluster availability: the majority can write while one replica is down, but a 1/1/1 split or two-of-three loss has no majority. I then state membership, commit, read, failover, conflict, and client-session behavior rather than relying on W + R arithmetic alone.”
 
 </InterviewAnswer>
