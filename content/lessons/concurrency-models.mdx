@@ -1,0 +1,216 @@
+---
+title: "Concurrency Models"
+description: "Choose thread-per-request, event loops, and worker pools from blocking, CPU, and lock-contention costs—not from a fashion for async."
+module: 4
+moduleTitle: "Performance"
+order: 3
+duration: 37
+difficulty: "Intermediate"
+tags:
+  - concurrency
+  - event loop
+  - async I/O
+  - thread pools
+  - contention
+  - Amdahl
+objectives:
+  - Contrast thread-per-request, event-loop, and async I/O models by what actually blocks
+  - Size occupancy with Little's Law and stop thread explosion from matching that occupancy
+  - Keep CPU-bound work on a worker pool so it cannot stall the I/O loop
+  - Separate lock wait from queue wait, and apply Amdahl's serial fraction to TokenX rows versus Ad Click NIO
+---
+
+<BigPicture title="Concurrency is occupancy of a named resource, not a thread count">
+
+Three production models show up in interviews as if they were religions:
+
+- **Thread-per-request (or request-per-OS-thread):** each in-flight call owns a stack. Blocking I/O parks that thread until the kernel unblocks it. TokenX ledger access through JDBC is this shape: the thread **holds a pool connection** while the database runs.
+- **Event loop:** a small number of threads **never** block on I/O. They register sockets, run callbacks or `async`/`await` continuations, and must finish CPU work in microseconds to milliseconds. Ad Click collectors that use non-blocking I/O (NIO) belong here.
+- **Async I/O with worker pools:** the loop owns readiness; a **bounded** pool owns blocking JDBC, file fsync, or CPU-heavy JSON/crypto. The pool is a bulkhead. It is not “the event loop, but more cores.”
+
+The question is always **what is occupied**: an OS thread, a JDBC connection, a Kafka poller, a row lock, or the single event-loop thread. [Latency, throughput, and queues](/learn/latency-throughput-and-queues) gives <code>L = λW</code> for that boundary. This lesson chooses the execution model that can **hold** L without stalling unrelated work. Contention on a TokenX account row is still one owner ([Write scaling](/learn/write-scaling)). Query time that holds the JDBC thread is [Indexes and query execution](/learn/indexes-and-query-execution). Broker and client I/O shapes are [Kafka internals](/learn/kafka-internals). Who may run a consumer loop is [Consumer groups and rebalancing](/learn/consumer-groups-and-rebalancing).
+
+**Authoritative versus derived:** occupancy of the ledger connection and the uniqueness write is occupancy of **money**. Occupancy of a collector event loop is occupancy of **ingest sockets**. Occupancy of a dashboard thread is derived and can wait.
+
+</BigPicture>
+
+<UnderTheHood title="Blocking, workers, locks, then Amdahl and Little's Law">
+
+### Thread-per-request: simple stacks, expensive occupancy
+
+A servlet or a typical JDBC service assigns one thread from a pool for the whole request. If 2,000 transfers/s each stay in the API for 200 ms end-to-end, Little’s Law says about 400 requests in flight. If **every** in-flight request needs a thread, you need on the order of **400 threads** plus headroom, not 8 because you have 8 cores.
+
+The scarce resource is often **not** the CPU. It is the **connection** held for 15–80 ms of uniqueness plus `UPDATE`. Assumptions (illustrative): 2,000 transfers/s, 80% hit the ledger, hold 20 ms: `L_conn = 2,000 × 0.80 × 0.020 = 32` busy connections. A 40-thread executor with a 40-connection pool is ~80% busy **on the mean**. p99 hold time of 80 ms pushes occupancy toward `2,000 × 0.80 × 0.080 = 128` and the pool **queues**. That wait is **queue wait in the pool**, distinct from **row lock wait inside Postgres**.
+
+**Thread explosion:** raising the Tomcat `maxThreads` from 200 to 2,000 to “match Little’s Law” creates 2,000 stacks, 2,000 parked threads on a stuck dependency, and a thundering herd into the ledger. The model needs a **bound** equal to safe occupancy of the **downstream** pool, then admission control—not a thread per waiter.
+
+### Event loop and async I/O: never block the loop
+
+An event loop (Node.js, Netty worker, Python asyncio, Go’s network poller in spirit) multiplexes thousands of sockets on **one or a few** threads. Non-blocking `read`/`write` and Kafka clients configured for selector I/O fit this. The contract: **do not call JDBC, `sleep`, a large `MessageDigest` over a 2 MB payload, or a synchronized lock that can wait** on the loop thread.
+
+If the loop blocks 50 ms on a CPU-heavy click-normalization at 10,000 clicks/s, **every** connection on that loop stalls for 50 ms. That is not “async.” That is a stop-the-world on the ingest path. Tail latency of unrelated SDKs jumps together.
+
+**Async I/O** means the kernel notifies readiness; your code still runs to completion on some thread. `await db.query()` on a truly non-blocking driver keeps the loop free. `await` of a thread-pool JDBC wrapper **moves** the block to the pool—good—if the pool is sized and timed out. If the wrapper runs JDBC **on the loop**, you have a costume.
+
+### CPU-bound work: worker pool, not stolen I/O threads
+
+Hashing, JSON schema validation of oversized debug payloads, compression, and signature checks are **CPU**. They belong on a **fixed-size worker pool** (cores, not connections). Offload from the event loop; **do not** grow the loop’s thread count to 200 to run hashes.
+
+Illustrative Ad Click collector: 80,000 clicks/s, 400 B facts, 0.05 ms CPU to CRC and validate on the happy path → `80,000 × 5×10^-5 = 4` cores of CPU. A 4–8 worker pool is the right magnitude. Running that CRC on a **single** Netty event-loop thread makes ingest throughput about `1 / 0.00005 = 20,000` clicks/s **serial**, and stalls NIO.
+
+TokenX PKCS checks on a transfer should use the same rule: crypto on a worker; JDBC on the ledger pool; the HTTP thread (if you still have one) only coordinates.
+
+<Calculation label="Occupancy, thread explosion, and Amdahl on a locked row">
+
+Little’s Law at three boundaries (illustrative TokenX 2,000 transfers/s):
+
+- Whole API: W = 200 ms → L = 2,000 × 0.2 = 400 in-flight requests.
+- JDBC: 80% × 20 ms mean → 32 connections busy; p99 80 ms → 128 needed if you provision for that tail without queueing (you will not; you will bound and shed).
+- Event-loop collectors at 80,000 clicks/s with 2 ms in-process W → L = 80,000 × 0.002 = 160 concurrent click handlers. An event loop can hold those as **state machines**, not as 160 OS threads.
+
+Thread explosion: setting API threads = 400 to “cover” L without bounding the JDBC pool moves the queue into Postgres and into lock wait ([Indexes and query execution](/learn/indexes-and-query-execution) for the query that holds the row).
+
+Amdahl: let serial fraction s be the time that **cannot** run in parallel on one account—the row lock plus commit. If a transfer is 35% serial on that row and 65% parallelizable (auth, JSON, metadata cache), speedup with N extra API threads on **the same account** is `1 / (s + (1-s)/N)`. For N = 8: `1 / (0.35 + 0.65/8) = 1 / 0.43125 ≈ 2.32×`, not 8×. Celebrity keys do not yield to thread counts. Unrelated accounts **do** parallelize: that is sharding, not more threads on one lock ([Write scaling](/learn/write-scaling)).
+
+</Calculation>
+
+<InteractiveCalculation mode="little-law" title="In-flight requests versus JDBC occupancy versus pool size" />
+
+### Lock contention versus queue wait
+
+**Queue wait:** the request is ready but no worker, no event-loop turn, or no free JDBC connection. The lock is not held by you yet. Metrics: pool acquire time, executor queue depth, event-loop lag (time-to-handle).
+
+**Lock wait:** you already hold a connection and are blocked on `accounts[A]` or an index page. Metrics: database `lock_wait`, p99 query time, WAL fsync. Extra application threads **increase arrivals at the same lock**.
+
+Mixing them produces the classic false fix: “threads are 100% busy, add more.” If they are busy in `LOCK WAIT`, more threads raise context switches and queue depth on the row. If they are busy in CRC on the event loop, add **workers**, not loop threads.
+
+Kafka: a consumer that calls a blocking sink on the **poll thread** stalls heartbeats and can trip `max.poll.interval.ms` ([Consumer groups and rebalancing](/learn/consumer-groups-and-rebalancing)). The poll loop is an event loop. Apply billed facts on a worker with a bound; keep poll running. Broker-side request threads versus network threads are [Kafka internals](/learn/kafka-internals)—same idea at the broker.
+
+<ExecutionTimeline
+  title="TokenX JDBC on a thread pool versus Ad Click NIO on a loop"
+  steps={[
+    { title: "Admit", detail: "Mesh accepts a transfer and a click batch. TokenX checks out an API thread and later a JDBC connection. The collector registers sockets on an event loop and does not check out a thread per click.", state: "Two models, two occupancy accounts. No ledger write yet. No billed fact yet.", failure: "Collector does JDBC-style blocking DNS on the loop thread; all SDKs stall together." },
+    { title: "Block or park", detail: "TokenX uniqueness insert plus debit runs on the JDBC pool. The API thread is parked until the driver returns. The collector writes with NIO; produce to the billed-fact log is async with a bounded buffer.", state: "Authoritative money is the committed ledger transaction. Billed facts are authoritative at the log high-watermark; in-flight NIO bytes are a loss window until that append.", failure: "ACK the debit before commit, or ACK clicks from memory because the loop must stay free." },
+    { title: "CPU offload", detail: "Signature verify and oversized debug JSON go to a worker pool sized near core count. The event loop only notices completion.", state: "CPU occupancy is the worker pool. Loop occupancy is callbacks.", failure: "Inlining a 2 MB parse on the loop; ingest p99 becomes the parse time for every peer." },
+    { title: "Contend", detail: "Account A serializes on one row lock. Extra TokenX threads wait in the database, not in useful parallel work. Clicks for many campaigns continue on NIO unless one callback blocks.", state: "Lock wait is not pool-queue wait. Amdahl caps the celebrity account.", failure: "Raising maxThreads to 2,000 to drain the lock queue; the primary WAL and row freeze." }
+  ]}
+/>
+
+</UnderTheHood>
+
+<MentalModel title="One cashier’s pen, a harbor of buoys, a side kitchen for chopping">
+
+Thread-per-request is **assigning a whole employee** to each customer, even while they wait for the vault. Fine for a few hundred waiters; ruinous when you hire 2,000 employees to stand in line for one pen (the account row).
+
+An event loop is a **harbor master with a radio**: thousands of buoys (sockets) and one voice. If the harbor master starts chopping vegetables (CPU) or walks into the vault and waits (JDBC), every ship sits idle. Chopping belongs in the **side kitchen** (worker pool). Vault work belongs to a **bounded** set of clerks (JDBC pool) who can actually hold a pen.
+
+Little’s Law counts **bodies in a named room**. Amdahl says extra clerks do not help when they must share one pen.
+
+Retain: **match threads to downstream occupancy, never block the I/O loop, put CPU on workers, and do not mistake lock wait for a need for more threads.**
+
+</MentalModel>
+
+<ArchitectureDiagram title="API threads, event loop, worker pool, and authoritative stores" chart={"flowchart LR\n  CLI[Clients] --> ADM[Admission]\n  ADM --> TP[Thread pool]\n  ADM --> EL[Event loop]\n  TP --> JDBC[JDBC pool]\n  JDBC --> LED[(Authoritative ledger)]\n  EL --> NIO[NIO sockets]\n  NIO --> FACT[(Billed fact log)]\n  EL --> WP[CPU worker pool]\n  WP --> CPU[Hash and parse]\n  JDBC -. pool timeout .-> ADM\n  EL -. blocked loop stall .-> CLI\n  TP -. lock wait .-> LED\n  NIO -. produce timeout .-> CLI"}>
+
+**Authoritative state:** TokenX ledger plus unique `(tenant, transfer_id)`, and the Ad Click billed-fact log until retention. **Derived state:** in-loop click buffers, dashboards, and CPU worker results that have not been appended. **Consistency boundary:** a debit is committed only in the JDBC transaction; a collector ACK is legal only after the NIO write is durable on the log—not when the event loop accepted the socket. Solid edges are the success path: admission to the matching executor, JDBC to the ledger, NIO to the fact log, loop to CPU workers. Dashed edges are pool acquire timeout (reject back to admission), event-loop stall from blocking or CPU on the loop, row lock wait (failure of parallel speedup), and produce timeout. Recovery is bound the JDBC and worker pools, fail closed on TokenX if the ledger pool is exhausted, keep the loop non-blocking, and retry clicks with stable ids after a produce timeout—not by growing `maxThreads` until the process dies.
+
+<ArchitectureWalkthrough
+  title="Which executor is allowed to touch which store"
+  stages={[
+    { name: "Admit", owner: "Mesh plus bounded executors", state: "Thread-pool permits versus event-loop registrations", boundary: "Admission cap is downstream occupancy, not offered QPS.", failure: "maxThreads set to Little's L with no JDBC bound.", recovery: "Size threads near safe connections; 429 when the pool is full." },
+    { name: "Money I/O", owner: "JDBC pool", state: "Connections held for uniqueness plus debit", boundary: "Blocking is legal here. This is not the Ad Click loop.", failure: "Calling JDBC from the collector event loop.", recovery: "Keep TokenX on the blocking pool; time out acquire; fail closed." },
+    { name: "Ingest I/O", owner: "Event loop plus NIO", state: "Sockets and Kafka produce buffers", boundary: "Loop must not block. Durability is still the fact log, not the buffer.", failure: "ACK from memory to protect the loop; blocking poll on billed consumers.", recovery: "ACK after append; offload apply; keep poll alive for membership." },
+    { name: "CPU", owner: "Worker pool", state: "Hash, parse, compression, crypto", boundary: "Pool size tracks cores, not connections or QPS.", failure: "Steal the I/O loop for a 2 MB parse.", recovery: "Bounded workers, reject or sample oversized debug payloads." }
+  ]}
+/>
+
+</ArchitectureDiagram>
+
+<RealExamples title="TokenX parks on JDBC; Ad Click collectors stay on NIO">
+
+**TokenX.** The transfer API is a blocking, thread-pooled service because the driver and the uniqueness store are blocking. Size the **JDBC pool** from λ and hold time, then size the **API threads** a bit above that so they are not all stuck off-CPU in business logic. Do not size threads from core count when W is 200 ms of mostly wait. The celebrity account still serializes: Amdahl, not Netty, is the limit. Crypto and report PDF generation go to workers so a download cannot take the last ledger thread. A locked query plan that holds the row 200 ms is an index problem before it is a concurrency-model problem.
+
+**Ad Click Aggregator.** Collectors use NIO (or equivalent) so 80,000 clicks/s do not become 80,000 threads. Produce to the billed-fact log with a bounded buffer; ACK the SDK after durability, even though that ACK is a callback rather than a parked servlet thread. CPU validation runs on a worker pool. Consumers: **poll** on a loop thread; **apply** billed facts on workers. If apply is slow, pause fetch and keep polling—do not block poll inside a JDBC sink. A viral campaign is a hot **partition** for consumers, not a reason to block the collector loop.
+
+<FailureScenario
+  title="Pick the concurrency failure"
+  prompt="TokenX lock wait is 150 ms p99. Collectors parse 2 MB debug blobs on the event loop. An engineer sets maxThreads=2,000 and 'makes JDBC async' by calling it from the loop."
+  choices={[
+    { label: "Raise maxThreads to 2,000 so Little's L of 400 is covered with headroom", impact: "Stacks and context switches explode. The 150 ms lock wait gets more waiters. The primary saturates. Tail latency rises.", recovery: "Bound threads near the JDBC pool. Shed. Isolate the hot row. Do not match L with OS threads." },
+    { label: "Run uniqueness JDBC on the collector event loop so one async style owns both products", impact: "One slow debit stalls billed ingest for every SDK on that loop. Money and clicks share a failure domain.", recovery: "Keep TokenX on a blocking pool. Keep collectors non-blocking. Separate processes and executors." },
+    { label: "Move 2 MB parse and CRC onto a core-sized worker pool; keep NIO on the loop; ACK after the fact log", impact: "Loop lag falls. Ingest p99 is no longer the parse of a neighbor. Workers saturate first, which is the right bulkhead.", recovery: "This is the intended split. Sample or reject oversized debug if workers burn." },
+    { label: "Replace the row lock with more event-loop threads so Amdahl serial fraction disappears", impact: "The database still serializes account A. Extra loop threads do not split a row. You added complexity and kept the convoy.", recovery: "Shard keys that do not need joint order; leave the lock; stop believing the loop removes serial sections." }
+  ]}
+/>
+
+</RealExamples>
+
+<InterviewTraps title="Concurrency slogans that fail at IC6">
+
+- **“Async is faster.”** Async is a **scheduling** model. A blocking 80 ms query still takes 80 ms; you only freed a loop thread you should not have blocked.
+- **“More threads use more cores.”** For wait-bound JDBC, extra threads increase memory and lock queues. Cores help CPU-bound workers.
+- **“Event-driven means we cannot stall.”** One blocking call or one heavy parse on the loop stalls everyone on that loop.
+- **“Little’s Law says we need 400 threads.”** It says 400 **in-flight requests**. Threads are one way to represent them, and a bad way if most of W is downstream wait.
+- **“We made JDBC non-blocking by awaiting it on Node.”** If the driver still occupies a thread from a tiny hidden pool, you moved the explosion. If it occupies the loop, you stalled ingest.
+- **“Lock wait and queue wait are the same latency.”** One is inside the database owner; the other is waiting to become the owner. Fixes differ.
+- **“Amdahl does not apply; we are distributed.”** A single account row is a serial section. Distribution does not split it.
+- **“Exactly-once because we have one event loop.”** A single thread is not a commit protocol. Retries and unique `(tenant, transfer_id)` still apply. One loop also does not make the billed-fact log linearizable.
+- **“Consumer parallelism is thread count.”** Parallelism is **partition count** times one owner; extra threads on one partition fight over the same log slice.
+
+</InterviewTraps>
+
+<Tradeoffs title="Stacks versus callbacks versus workers">
+
+- **Thread-per-request versus event loop:** threads are easier to reason about for JDBC and stack traces; they cost memory (~1 MiB stacks classically) and break when L is thousands of waits. Loops scale socket count and punish blocking.
+- **Hidden async thread pools versus explicit JDBC pools:** hidden pools look pretty in code and deadlock when the hidden size is 4 and QPS is 2,000.
+- **CPU on the loop versus a worker pool:** inlining is lower latency at tiny work; a 2 MB parse needs isolation more than it needs a microsecond of hop savings.
+- **Pool size versus core count:** I/O pools track downstream occupancy; CPU pools track cores. Swapping the two over-subscribes the wrong resource.
+- **Lock isolation versus sharding:** holding the row is correct for TokenX per-account order; it caps that key. Sharding other keys is how you get parallelism Amdahl will not give you on A.
+- **Blocking poll versus worker apply:** blocking apply on the poll thread simplifies the consumer and risks rebalance; extra hops add latency and preserve membership.
+
+Do not trade ledger durability or billed-fact ACK for a prettier async diagram. Trade debug parsing and dashboard threads first.
+
+</Tradeoffs>
+
+<KnowledgeCheck
+  question="TokenX runs 2,000 transfers/s with 200 ms end-to-end W (400 in flight). JDBC hold is 20 ms on 80% of calls. maxThreads is raised to 400 to match L. What occupancy was misread?"
+  options={[
+    "Little's Law is wrong for blocking servers, so 8 threads matching core count would have been enough",
+    "In-flight requests are 400, but JDBC occupancy is about 32 connections on the mean; 400 threads mostly wait on the same ledger locks and pool",
+    "You need 400 JDBC connections because each in-flight request always holds a connection for the full 200 ms",
+    "The billed-fact log should absorb the 400 waiters because Kafka is the TokenX money authority"
+  ]}
+  correct={1}
+  explanation="L = 400 is whole-request occupancy. Connection occupancy uses DB arrival rate and hold time: 2,000 × 0.80 × 0.020 = 32. Matching threads to 400 without bounding the pool explodes waiters into one serial row. Kafka is not the ledger."
+/>
+
+<KnowledgeCheck
+  question="An Ad Click collector event loop starts parsing 2 MB debug payloads inline, then calls a blocking JDBC-style sink 'awaited' on the same thread. What fails first?"
+  options={[
+    "Nothing: async/await makes blocking I/O and CPU safe on one loop by definition",
+    "Only CPU utilization; NIO sockets keep progressing because Kafka internals pin extra pollers automatically",
+    "The loop stalls: CPU parse plus blocking I/O delay every click on that loop, and ACK-before-log would still be a durability bug if used to keep the loop free",
+    "TokenX uniqueness, because collectors and the ledger must share one event loop for exactly-once"
+  ]}
+  correct={2}
+  explanation="The event-loop contract is non-blocking, short callbacks. CPU and JDBC belong on worker or JDBC pools. Async syntax does not change that. Uniqueness is a TokenX ledger concern, not a collector loop. Extra Kafka pollers are not a given and do not fix a blocked collector thread."
+/>
+
+<ScenarioCheck
+  scenario="TokenX p99 is lock wait on account A. Collectors need 80,000 clicks/s. A design sets Tomcat maxThreads=2,000, runs uniqueness SQL from a shared Node event loop 'so everything is async,' and hashes payloads on that loop. Consumer apply also blocks the Kafka poll thread on a slow billed sink."
+  question="Which concurrency design is defensible?"
+  options={[
+    { label: "Keep maxThreads=2,000 and the shared loop: Little's Law plus async will dissolve the serial row and the poll stall.", feedback: "Threads do not split a row lock. A shared loop couples money and ingest. Blocking poll risks rebalance." },
+    { label: "TokenX: bounded JDBC and API pools sized from connection hold time, fail closed on pool timeout. Collectors: NIO event loop, CPU on a core-sized worker pool, ACK after the fact log. Consumers: poll stays non-blocking; apply on workers. Do not expect Amdahl speedup on account A from more threads.", feedback: "Right executor per blocking kind, occupancy math, authoritative ACKs, serial section named." },
+    { label: "Move spendable balances into the event-loop memory map so JDBC disappears, and ACK clicks from the loop buffer to protect NIO.", feedback: "Process memory is not the ledger. Memory ACK is not the billed-fact log." },
+    { label: "Pin one OS thread per Kafka partition and one per TokenX account so ownership equals thread identity.", feedback: "Ownership is fencing plus commit, not thread identity. Failover and rebalance would split-brain that idea." }
+  ]}
+  correct={1}
+  explanation="Match the executor to blocking versus NIO versus CPU. Bound occupancy. Keep poll alive. Money and invoices stay on their stores. Extra threads do not repeal Amdahl on a locked row."
+/>
+
+<InterviewAnswer>
+
+“I pick a concurrency model from what blocks. TokenX is thread-pooled JDBC: Little’s Law at the connection boundary is lambda times hold time, about thirty-two busy connections at two thousand transfers per second and twenty milliseconds, not four hundred threads because end-to-end W is two hundred milliseconds. I bound the pool and fail closed rather than explode maxThreads into a row lock. Celebrity accounts are Amdahl serial sections—eight more APIs might give about two times, not eight. Ad Click collectors use an event loop and NIO so eighty thousand clicks are sockets, not threads. I never run JDBC or a two-megabyte parse on that loop; CPU goes to a worker pool sized like cores. Collector ACK still waits for the billed-fact log. Consumers keep poll on the loop and apply on workers so we do not trip max poll interval. Lock wait is not executor queue wait. Async is scheduling, not a shorter query and not exactly-once.”
+
+</InterviewAnswer>

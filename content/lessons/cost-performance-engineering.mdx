@@ -1,0 +1,202 @@
+---
+title: "Cost-Performance Engineering"
+description: "Price requests, storage tiers, egress, and reserved capacity without dropping TokenX WAL or billed facts to make a dashboard cheaper."
+module: 4
+moduleTitle: "Performance"
+order: 9
+duration: 38
+difficulty: "Intermediate"
+tags:
+  - cost
+  - utilization
+  - storage tiers
+  - egress
+  - reserved capacity
+objectives:
+  - Compare cost per request with the cost of missing an SLO using explicit units
+  - Choose reserved versus on-demand capacity and hot, warm, and cold storage tiers
+  - Show how replication and multi-region reads multiply storage and egress bills
+  - Apply cost knobs to derived retention first, never to TokenX WAL or billed facts
+---
+
+<BigPicture title="Cheap is a retention and packing choice, not a correctness choice">
+
+Cost-performance engineering asks **what you pay per operation**, **what you pay to keep headroom**, and **what an SLO miss costs the product**—then spends money on the authority that must not vanish.
+
+A request that is “free” in compute can be expensive in **storage**, **replication**, **egress**, or **incident minutes**. A cluster at 95% utilization looks cheap until queueing from [latency, throughput, and queues](/learn/latency-throughput-and-queues) burns the SLO. Headroom is the same spare you sized in [autoscaling and capacity planning](/learn/autoscaling-and-capacity-planning): you pay idle cores so the next burst fits **before** warm-up.
+
+**Do not** drop TokenX write-ahead log (WAL) bytes or Ad Click **billed facts** to save money. Cost knobs apply to **derived** retention first: dashboards, traces, warehouse copies, caches ([caching patterns and invalidation](/learn/caching-patterns-and-invalidation)), and cold analytics.
+
+Cross-lesson spine: object lifecycle and byte movement in [object storage and large files](/learn/object-storage-and-large-files); regional copies and read locality in [multi-region design](/learn/multi-region-design); rollups versus raw in [time-series and append-only storage](/learn/time-series-and-append-only-storage); copies you keep for restore in [backup, restore, and disaster recovery](/learn/backup-restore-and-disaster-recovery).
+
+</BigPicture>
+
+<UnderTheHood title="Unit cost, headroom, tiers, replication, then reserved capacity">
+
+### Cost per request versus cost of an SLO miss
+
+Pick a unit: **$ / million requests**, **$ / GB-month**, **$ / GB egress**, **IOPS-month** for the ledger disk. Then pick a miss unit: **$ / failed checkout**, **$ / minute of SLO burn**, **lost billed clicks you cannot invoice**.
+
+Planning assumptions (illustrative list prices, not a quote): compute $0.04 / vCPU-hour; object storage $0.023 / GB-month hot, $0.004 / GB-month cold; egress $0.09 / GB cross-region; provisioned ledger IOPS $0.065 / IOPS-month; TokenX 2,000 transfers/s; Ad Click 10,000 clicks/s average, 400 B facts, peak factor 8.
+
+<Calculation label="Unit cost versus miss cost (illustrative)">
+
+TokenX API: 2,000 req/s × 86,400 s/day = 1.728×10^8 req/day. Six 2-vCPU pods at $0.04 / vCPU-hour × 12 vCPU × 24 h ≈ **$11.5 / day** compute. Per million requests: $11.5 / 172.8 ≈ **$0.067 / million** for that pool only—before the ledger.
+
+Ledger IOPS: if each transfer does 3 I/O and you provision 10,000 IOPS for headroom, 10,000 × $0.065 ≈ **$650 / month** ≈ $21.7 / day. That dwarfs the API pool. Analytics warehouse scanning last month’s ledger copy at $5 / TB scanned × 20 TB illustrative = **$100 / query**. Do not “save” $21.7 / day of IOPS by skipping fsync on money.
+
+SLO miss: 50 failed checkouts/min × $2 contribution (illustrative) × 20 min incident = **$2,000**. That is $2,000 / $11.5 ≈ **174 days** of the API compute bill, or ~90 days of a **$21.7 / day** ledger IOPS bill. Headroom that prevents the incident is cheaper than the miss **if** the headroom is on the right resource.
+
+Ad Click storage: 10,000 /s × 400 B × 86,400 ≈ 346 GB/day raw. Replication factor 3 → **~1.04 TB/day** on brokers before compression. Thirty days ≈ 31 TB replicated. At $0.023 / GB-month, 31,000 GB × $0.023 ≈ **$713 / month** hot. Cold tier at $0.004 is **$124 / month** for the same bytes—after you **copied** them, which is allowed for derived rollups, not as an excuse to delete live billed facts still inside the finance window.
+
+</Calculation>
+
+<InteractiveCalculation mode="event-ingress" title="Average volume to peak ingress, then multiply by replication" />
+
+Replication multiplies **write bytes and stored bytes**. A factor of 3 is not 3× durability in the abstract; it is 3× disk and often 3× intra-AZ network for [Kafka internals](/learn/kafka-internals)-style logs. Compression can cut stored bytes; it does not cut the need for three copies of the **authoritative** log until retention.
+
+### Utilization versus headroom
+
+Utilization is a **cost** signal: idle reserved vCPU is money. It is a **dangerous SLO** signal: at high utilization, W in Little’s Law grows and p99 explodes. The capacity lesson’s rule still holds—scale homogeneous pools from **leading queues**, keep an AZ floor, and **provision** the ledger primary and partition count. Packing to 90% CPU to look efficient is how you buy a cheap graph and an expensive incident.
+
+**Reserved versus on-demand:** reserved (or savings-plan) capacity is cheaper **per hour** if you actually run the floor 24/7 (illustrative 30–40% off). On-demand is for **burst above the floor**. Putting the entire TokenX debit path on spot/preemptible VMs saves the reserved premium and spends **eviction**: a 30 s drain in the uniqueness pool is an availability event, not a coupon.
+
+### Storage hot, warm, cold
+
+- **Hot:** broker disks, ledger SSD, working set that serves interactive SLOs. Highest $ / GB, lowest latency.
+- **Warm:** object storage standard class for recent segments and exports ([object storage and large files](/learn/object-storage-and-large-files)).
+- **Cold / archive:** infrequent restore, minutes-to-hours to first byte. Fine for **derived** warehouse dumps and old dashboard rollups. Restore time is part of RTO in [backup, restore, and disaster recovery](/learn/backup-restore-and-disaster-recovery).
+
+Lifecycle **copies** then **deletes the source only when policy allows**. Billed facts stay hot or warm for the invoice-dispute window (illustrative 90–180 days). TokenX WAL/ledger backups follow the **RPO you named**, not the dashboard team’s S3 bill.
+
+### Egress and multi-region reads
+
+Bytes that leave an AZ or region are often **more expensive than storing them**. A UI in region B that reads the TokenX **ledger** in region A on every balance poll pays egress **per read**. A **derived cache** in B with a stale bound (from [multi-region design](/learn/multi-region-design)) pays egress on **miss and invalidation**, not on every poll. Spendable debits still go to the write region; you cannot cache your way into a second wallet.
+
+Ads: per-region billed logs avoid click-path egress. Cross-region dashboard rollups **should** move **aggregates**, not re-read every raw fact for a chart.
+
+<ExecutionTimeline
+  title="Where the money actually goes on a TokenX debit and an ad click"
+  steps={[
+    { title: "Admit", detail: "Stateless API or collector CPU is cheap per request. Reserved floor covers AZ loss; on-demand covers the 8× ad peak.", state: "Compute is derived capacity. Not the ledger.", failure: "Spot-evict the uniqueness pool to save 40% and fail closed on money anyway." },
+    { title: "Commit", detail: "TokenX pays provisioned IOPS and WAL disk. Ads pay replicated fact-log bytes. ACK after that commit.", state: "Authoritative bytes. Replication multiplies storage.", failure: "acks=0 or drop WAL snapshots because IOPS is the big line item." },
+    { title: "Project", detail: "CDC to warehouse, dashboard rollups, caches. Downsample, compress, tier to cold.", state: "Derived. Lag allowed. Rebuildable from WAL/facts.", failure: "Billing from a 1-minute downsampled chart; deleting facts to hit a storage KPI." },
+    { title: "Read afar", detail: "Region B UI hits a cache. Misses pull from A and pay egress. Debits still land in the write region.", state: "Cache is derived. Ledger remains single-writer.", failure: "Multi-master wallet ‘to save egress’ without a conflict rule." }
+  ]}
+/>
+
+</UnderTheHood>
+
+<MentalModel title="The vault stays climate-controlled; the lobby posters can yellow">
+
+A museum keeps the **deed** (TokenX ledger, billed-fact log) in a vault with redundant climate control (replication, reserved IOPS, hot disks). Lobby posters (dashboards, traces, warehouse cubes) can be reprinted from the deed. You do not sell the deed to cut the electric bill.
+
+Headroom is leaving a fire lane in the parking lot: empty asphalt looks wasteful until the fire truck arrives. Reserved capacity is a year-long lease on the fire lane. On-demand is renting extra cones on opening night. Egress is paying postage every time a visitor in another city asks you to **mail the original deed** instead of a photocopy.
+
+Retain: **price the unit, price the miss, pay for headroom on the bottleneck, replicate what you must, tier derived data first, and never delete the vault to make the posters cheaper.**
+
+</MentalModel>
+
+<ArchitectureDiagram title="Authoritative hot path, derived tiers, reserved floor, and forbidden deletes" chart={"flowchart LR\n  CLI[Clients] --> API[Stateless APIs]\n  API --> LED[(Authoritative ledger WAL)]\n  API --> FACT[(Billed fact log)]\n  FACT --> HOT[(Hot segments)]\n  HOT -. lifecycle async .-> WARM[(Warm object store)]\n  WARM -. lifecycle async .-> COLD[(Cold archive)]\n  LED -. CDC async .-> WH[(Analytics warehouse)]\n  WH --> DASH[Downsampled dashboards]\n  API --> CACHE[(Derived read cache)]\n  CACHE --> EG[Cross-region egress]\n  RSV[Reserved floor] --> API\n  OND[On-demand burst] --> API\n  FACT -. forbidden fact delete .-> DROP[Lost invoices]\n  LED -. forbidden WAL drop .-> DROP"}>
+
+**Authoritative state:** TokenX ledger plus WAL (and uniqueness rows) and the Ad Click billed-fact log until the **finance retention** window. **Derived state:** warehouse tables, downsampled dashboards, regional caches, traces, and cold analytics copies. **Consistency boundary:** money commits in the write-region ledger; billed clicks commit on the regional fact log; caches and warehouses lag. Solid edges are serve, reserved/on-demand provisioning of **pools**, and dashboard queries on derived data. Dashed edges are async lifecycle tiering, async CDC, and **forbidden** deletes of facts or WAL that would save storage while destroying audit. Recovery is rebuild dashboards from facts, restore WAL from backups with a named RPO, and pay egress on cache miss rather than on every remote spendable read.
+
+<ArchitectureWalkthrough
+  title="Which bill you are allowed to cut"
+  stages={[
+    { name: "Floor", owner: "Reserved pool plus provisioned authority", state: "Min APIs per AZ, ledger IOPS, partition disks", boundary: "Reserved is for always-on floor. On-demand is burst. Authorities are not spot.", failure: "Preemptible uniqueness store; 90% CPU as a savings KPI.", recovery: "Reserved floor from AZ math; headroom from queueing, not from a cost dashboard." },
+    { name: "Commit", owner: "WAL / billed-fact log", state: "Replicated hot bytes", boundary: "Replication multiplies $/GB. Compression is allowed. Deletion is not, inside retention.", failure: "Reduce RF on money to save disk; ACK before append.", recovery: "Keep RF and fsync policy; tier only after the finance window." },
+    { name: "Project", owner: "Warehouse, rollups, caches", state: "Derived, rebuildable", boundary: "Downsample, TTL, cold tier, cache hit rate.", failure: "Invoice from a rollup; write-behind debit to skip IOPS.", recovery: "Cut derived retention first; cache metadata not spendable balances." },
+    { name: "Place", owner: "Region and object lifecycle", state: "Local reads, exported aggregates", boundary: "Egress on cross-region bytes. Sovereignty may forbid leaving.", failure: "Chatty ledger reads from the far region; raw fact fan-out for a chart.", recovery: "Regional cache with a stale bound; ship rollups; keep click logs local." }
+  ]}
+/>
+
+</ArchitectureDiagram>
+
+<RealExamples title="TokenX pays IOPS; ads keep facts and cheapen dashboards">
+
+**TokenX.** The expensive line is usually **provisioned IOPS and WAL disk**, not the twelve API vCPUs. Offload **non-spendable** reads (history, statements) to replicas or object exports. Keep debit/credit on the primary. Warehouse cost is a **scan and storage** problem: partition by day, retain raw CDC for a named window, downsample balances-over-time for charts. Do not compact the ledger into “the latest balance only” to save S3—that destroys audit. Cache token metadata per [caching patterns and invalidation](/learn/caching-patterns-and-invalidation); do not cache spendable balances to dodge IOPS. Multi-region: read-your-writes in the write region; far-region UI uses a **labeled stale** cache so you pay egress on refresh, not on every poll ([multi-region design](/learn/multi-region-design)).
+
+**Ad Click Aggregator.** Keep **billed facts** for the dispute window even when that is the largest hot bill. Downsample **dashboards** (1-minute → 1-hour after 7 days, illustrative). Move sealed segments to warm object storage; cold-archive **derived** rollups. A viral campaign raises broker disk and network—provision that, as in the capacity lesson—do not delete the hot partition’s facts. Cross-region: aggregate locally, ship **window sums** for a global chart; finance still joins regional logs by `click_id`. Egress of full raw replay to a remote warehouse should be a **batch export**, not a live dashboard query.
+
+<FailureScenario
+  title="Inspect a cost cut that hits the wrong store"
+  prompt="Finance wants 40% lower storage. TokenX IOPS is the big bill. Ads have 31 TB of replicated facts. Pick the cut."
+  choices={[
+    { label: "Drop billed facts after 48 hours; keep 1-minute dashboard tables forever", impact: "Invoices cannot be proven. Dashboards are derived and cannot reconstruct click identity.", recovery: "Expire or downsample dashboards. Keep facts for the finance window; tier them warm/cold, do not delete early." },
+    { label: "Turn off TokenX WAL snapshots and drop RF from 3 to 1 on the ledger disk", impact: "RPO becomes ‘last crash.’ A single disk loss loses spendable history. Saved IOPS-month is smaller than one unrecoverable incident.", recovery: "Keep WAL and RF inside the RPO. Cut warehouse scan, not the vault." },
+    { label: "Serve every region-B balance poll from the region-A primary to ‘avoid cache inconsistency’", impact: "Egress $/GB dominates. Primary read IOPS climbs. You still do not get a second write region.", recovery: "Derived cache in B with a stale bound; debits stay in A." },
+    { label: "Downsample warehouse cubes, shorten trace retention, reserved-buy the API/collector floor, on-demand the 8× ads peak", impact: "Derived cost falls. Authoritative RF and fact retention stay. Compute matches the capacity policy.", recovery: "This is the intended knob set; verify finance retention and ledger RPO still hold." }
+  ]}
+/>
+
+</RealExamples>
+
+<InterviewTraps title="Cost slogans that fail at IC6">
+
+- **“Utilization is the SLO.”** High utilization is cheap until p99 and lock wait explode.
+- **“Replication is waste.”** Replication is the durability and availability multiplier you named. Waste is extra **derived** copies you forgot to expire.
+- **“Cold storage is as durable as hot for serving.”** Durability class ≠ time-to-first-byte. Archive can miss RTO.
+- **“Reserved is always cheaper.”** Reserved is cheaper if the floor runs. Burst on reserved you do not need is a stranded prepaid bill; burst on spot for the uniqueness store is an eviction.
+- **“Egress is rounding error.”** Chatty cross-region reads on the ledger are often the surprise line item.
+- **“Delete Kafka because S3 is cheaper.”** Then you deleted the billed-fact log and the replay source. Object storage can **hold sealed segments**, not replace ACK-time durability.
+- **“Exactly-once and lossless because we paid for RF=3.”** RF=3 is three copies until retention and disk policy. It is not infinite history and not effect-once without a unique sink.
+- **“Cache everything to save IOPS.”** Cached spendable balances are an integrity bug. Cache derived reads.
+
+</InterviewTraps>
+
+<Tradeoffs title="Where dollars actually trade against risk">
+
+- **Cost per request versus miss cost:** shrinking the API pool is visible and usually the wrong bottleneck; an SLO miss can dwarf that line.
+- **Utilization versus headroom:** idle reserved vCPU buys warm-up and AZ loss; 90% packing buys queues.
+- **Reserved versus on-demand versus spot:** floor vs burst vs eviction. Money paths keep reserved or on-demand, not spot.
+- **Hot versus warm versus cold:** $/GB falls as time-to-read rises. Apply to derived data inside policy; keep facts hot/warm for disputes.
+- **Replication versus single copy:** extra $/GB and egress versus RPO. Do not drop RF on the vault.
+- **Local compute versus remote read:** extra regional cache cost versus egress and sovereignty.
+
+Correctness of TokenX balances and billed-click identity is not a cost knob. Completeness and resolution of a dashboard is.
+
+</Tradeoffs>
+
+<KnowledgeCheck
+  question="Ad Click replicated facts cost about $713 / month hot (illustrative). Dashboards are 2 TB of 1-minute rollups. Finance disputes go back 120 days. Which cut is defensible?"
+  options={[
+    "Delete facts after 7 days because RF=3 already means lossless history forever",
+    "Keep facts for at least the 120-day dispute window; downsample or cold-tier dashboard rollups first",
+    "Move the live billed-fact ACK to cold archive so ingest $/GB matches posters",
+    "Drop replication to 1 on the fact log and keep dashboards at full resolution"
+  ]}
+  correct={1}
+  explanation="Cost knobs apply to derived retention first. Facts remain authoritative for the finance window. RF=3 is not infinite retention. Cold archive is the wrong ACK tier. Dashboards are rebuildable."
+/>
+
+<KnowledgeCheck
+  question="TokenX API compute is $0.067 / million requests (illustrative) but provisioned ledger IOPS is ~$650 / month. Region B polls balances from region A on every page view. What should you change first?"
+  options={[
+    "Halve ledger IOPS and fsync less often so the big bill matches the API unit cost",
+    "Put the uniqueness store on spot VMs; reserved capacity is wasted headroom",
+    "Keep debit IOPS and WAL; serve region B from a derived cache with a stale bound; pay egress on miss, not on every poll",
+    "Bill from the analytics warehouse instead of the ledger because scan cost is lower than IOPS"
+  ]}
+  correct={2}
+  explanation="The vault stays provisioned. Egress and remote reads are the wasteful multiplier. Spot eviction and warehouse balances are not spendable authority. Headroom on IOPS is an SLO purchase, not waste by default."
+/>
+
+<ScenarioCheck
+  scenario="A VP asks for 40% lower cloud spend next quarter. A proposal: RF=1 on TokenX WAL, delete billed facts after 48 hours, 95% CPU pack, all debit nodes on spot, live dashboards querying raw facts cross-region, warehouse as the new ledger because storage is $0.004 / GB-month."
+  question="What counter-proposal matches this lesson?"
+  options={[
+    { label: "Accept the proposal: cheap is the SLO, and cold storage is durable enough to be the ledger.", feedback: "Cheap is not correct. Archive latency and RF=1 miss RPO/RTO. Warehouse is derived." },
+    { label: "Keep WAL RF and billed-fact retention for the named RPO and dispute window. Cut derived: downsample dashboards, expire traces, tier sealed analytics, reserved-buy the AZ floor, on-demand the ads peak, cache non-spendable remote reads.", feedback: "You spend on the vault and the miss; you save on posters, scans, egress, and idle burst." },
+    { label: "Keep facts but compact TokenX to latest-balance-only in S3, and ACK clicks from memory so collector compute falls 40%.", feedback: "Latest-balance-only destroys audit. Memory ACK drops billed identity." },
+    { label: "Move spendable writes active/active in three regions so egress disappears, and call that reserved capacity.", feedback: "Active/active wallets need a conflict protocol. Extra write regions multiply cost and split-brain risk; they do not replace reserved floors." }
+  ]}
+  correct={1}
+  explanation="Cost-performance engineering prices units and misses, then cuts derived retention, packing waste, and chatty egress. It does not delete the TokenX WAL or billed facts to make a dashboard cheaper."
+/>
+
+<InterviewAnswer>
+
+“I price a unit—dollars per million requests, per GB-month, per GB egress, per provisioned IOPS—and I price an SLO miss in the same conversation, because a twenty-minute checkout outage can dwarf a month of API vCPUs. Utilization is a cost signal, not an SLO: I keep headroom on the real bottleneck, reserved for the AZ floor, on-demand for burst, and I do not put TokenX uniqueness on spot. Replication multiplies storage and network; I pay it on the ledger WAL and the billed-fact log. I save money on derived data: downsample dashboards, expire traces, cold-tier warehouse copies, cache non-spendable remote reads so egress is on miss. Hot, warm, and cold are latency classes, not a license to ACK money from archive. Cheap is not correct: I will not drop billed facts or the TokenX WAL to hit a storage KPI. If the warehouse and the ledger disagree, the ledger still wins.”
+
+</InterviewAnswer>

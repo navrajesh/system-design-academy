@@ -1,0 +1,235 @@
+---
+title: "Batching and Compression"
+description: "Amortize fsync and network bytes with linger and codecs, and name the first-byte tax, retry blast radius, and CPU you pay for each extra record."
+module: 4
+moduleTitle: "Performance"
+order: 4
+duration: 38
+difficulty: "Intermediate"
+tags:
+  - batching
+  - compression
+  - linger
+  - codecs
+  - retry amplification
+objectives:
+  - Size linger versus batch bytes against first-byte latency and retry blast radius
+  - Choose lz4, zstd, or gzip from CPU, ratio, and payload-size bounds
+  - Keep TokenX debit batches small and ACK Ad Click batches only after the billed-fact log
+  - Separate Kafka batch compression from HTTP gzip without claiming durability or exactly-once
+---
+
+<BigPicture title="Amortization buys throughput; it spends latency, CPU, and retry radius">
+
+A batch is a courier van: one fsync, one RPC, one codec frame for *N* records. Compression is packing the van tighter. Neither action creates a write-ahead log, and neither creates **exactly-once** effects. Batching **multiplies** a timeout into *N* retries. Compression **rearranges CPU versus bytes**; it does not fsync.
+
+[Write scaling](/learn/write-scaling) already placed batching next to key ownership and durable ACK. This lesson goes deeper on **linger versus size**, the **first-byte latency tax**, **codec choice**, and the **retry blast radius** when the van crashes. Queueing math for the rest of the path is [Latency, throughput, and queues](/learn/latency-throughput-and-queues). TCP, TLS, and HTTP framing live in [Networking for system design](/learn/networking-for-system-design). Large immutable blobs and multipart retry granularity live in [Object storage and large files](/learn/object-storage-and-large-files). Kafka produce `acks`, ISR, and producer idempotence live in [Kafka delivery and failure](/learn/kafka-delivery-and-failure).
+
+**Authoritative state:** TokenX ledger rows plus unique `(tenant, transfer_id)`; Ad Click **billed-fact log** until retention. **Derived state:** campaign windows, dashboards, HTTP caches, codec output sitting in a memory buffer. **Durability** begins when the named store commits under its ACK policy—not when gzip finishes. **Ordering** is still the partition or row owner, not the batch timer. **Availability** of a linger buffer is not an ACK.
+
+Planning assumptions (illustrative, not a measured cluster): TokenX transfer API **2,000 commits/s**, **800 B** encoded facts, linger **5 ms or 50 records**. Ad Click collector peak **80,000 clicks/s**, **400 B** billed facts, linger **20 ms or 500 records**.
+
+</BigPicture>
+
+<UnderTheHood title="Linger, first byte, retry radius, then codecs">
+
+### Linger versus size: two clocks, one van
+
+A producer (or collector) closes a batch when **either** clock fires:
+
+- **Size / count:** *N* records or *B* uncompressed bytes.
+- **Linger:** *T* milliseconds since the first record entered an empty batch.
+
+Fill time at a steady rate is `N / λ`. If fill time is shorter than linger, size wins and the first record waits about `N / λ`, not *T*. If arrivals are sparse, linger wins and the first record pays the full timer.
+
+<Calculation label="Linger versus size, first-byte tax">
+
+TokenX: fill time for a 50-record cap is 50 / 2,000 s⁻¹ = **25 ms**. A **5 ms** linger is shorter, so linger wins. Actual *N* ≈ λT = 2,000 × 0.005 = **10** records, and the first debit waits ≈ **5 ms** of extra hold—the **first-record hold** on the batch path—not 25 ms. Do not amortize *C* against the 50-record cap that never filled.
+
+Ad Click: fill time for a 500-record cap is 500 / 80,000 s⁻¹ = **6.25 ms** at peak. A **20 ms** linger is longer, so at peak the count cap wins and the first click waits ≈ 6.25 ms plus codec and RPC. In a **sparse** window the linger wins: the first click of a quiet campaign waits up to 20 ms in process memory **before** the produce.
+
+Amortization: if a produce + ISR ACK costs **C = 2 ms** of broker work independent of *N*, divide *C* by the *N* that actually ships. TokenX: 2 ms / 10 = **200 µs** per record. Ads at peak: 2 ms / 500 = **4 µs**. You bought that by holding the first record.
+
+</Calculation>
+
+Do not linger TokenX spendable debits for ads-scale *T*. The debit tail SLO is a latency budget; linger is a line item in that budget, same as TLS and lock wait.
+
+### Retry multiplies the batch
+
+One timed-out produce is not one retry. It is **every record in the open batch**. Blast radius = batch cardinality (or uncompressed bytes if you think in network).
+
+<Calculation label="Retry blast radius">
+
+Ad Click: one 500-click batch is 500 × 400 B = **200 KB** uncompressed. A 30 s SDK timeout that retries the whole buffer resends 500 identities. With stable `click_id` on the billed-fact log those are **at-least-once duplicates of identity**. Without ids, a derived 1-minute window can count 500 extra bills.
+
+TokenX: a 50-transfer batch that retries without `(tenant, transfer_id)` uniqueness is 50 possible double-debits. Producer idempotence (broker PID + sequence) can collapse **the same produce batch** inside a producer session; it does **not** collapse two business commands with different transfer ids. See [Kafka delivery and failure](/learn/kafka-delivery-and-failure).
+
+</Calculation>
+
+Batching is not exactly-once. Exactly-once is at best **effect-once inside a named atomic boundary** with a retained identity. Compression does not change that sentence.
+
+### Codecs: CPU versus bytes
+
+Name the required property first: **reduce network and disk bytes** under a **CPU and latency budget**. Codec names second.
+
+Planning ratios on repetitive JSON-like facts (illustrative, not a spec):
+
+| Codec | Typical ratio on 200 KB similar facts | CPU / latency character | Fit |
+| --- | --- | --- | --- |
+| **lz4** | ~2–2.5× | Lowest CPU, smallest p99 bump | Kafka produce path when brokers or collectors are CPU-bound |
+| **zstd** | ~3–4× at modest level | Tunable; often best bytes/CPU | Default for large Kafka batches of similar records |
+| **gzip** (deflate) | ~3× | Higher CPU, worse tail | HTTP `Content-Encoding` at a proxy; rarely the Kafka produce codec of choice |
+
+Kafka compresses **the record batch** (the message set), so similar consecutive facts share a dictionary and ratio **improves with batch size**. HTTP gzip usually compresses **one response body**. A 200 B JSON error body plus gzip header and deflate overhead can **grow**. Do not enable gzip on tiny payloads, already-compressed images, or zstd object parts.
+
+<Calculation label="CPU versus network on an Ad Click produce">
+
+Uncompressed peak: 80,000 × 400 B = **32 MB/s** leader payload before protocol headers.
+
+lz4 at 2.2× → ≈ **14.5 MB/s** on the wire, cheap collector CPU.
+
+zstd at 3.5× → ≈ **9.1 MB/s**, more collector cores.
+
+gzip at 3.0× → ≈ **10.7 MB/s**, often the worst p99 of the three on the produce path.
+
+If one collector core compresses at an illustrative **200 MB/s lz4** versus **40 MB/s gzip** input, gzip needs 32 / 40 = **0.8 core** just for codec at peak, while lz4 needs 32 / 200 = **0.16 core**. Replication factor 3 still multiplies **stored** bytes after the codec, not before it, once the broker stores the compressed batch.
+
+</Calculation>
+
+<ExecutionTimeline
+  title="One Ad Click batch from linger through codec, ACK, and retry"
+  steps={[
+    { title: "Linger", detail: "Clicks enter an in-memory batch until 500 records or 20 ms. The first click pays the first-byte tax.", state: "Buffer is derived. Not a billed fact. Crash here loses unlogged clicks.", failure: "ACK the SDK from this buffer: durability was never named." },
+    { title: "Compress", detail: "The producer codec frames the whole batch. Tiny leftover batches may skip compression if the frame would grow.", state: "Compressed bytes are still only in process memory.", failure: "CPU saturation here stalls linger close; arrivals queue in the collector, not in the log." },
+    { title: "Produce", detail: "Send the compressed batch. Wait for the log ACK policy from the delivery lesson (acks and min.insync.replicas).", state: "Authoritative only after the billed-fact log accepts the batch under that policy.", failure: "Timeout: retry the same click ids, not a newly generated batch of anonymous facts." },
+    { title: "ACK SDK", detail: "Collector returns success only after the durable append. Windows remain a later async projection.", state: "Billed facts are the invoice identity. Windows are derived.", failure: "Rebuild windows from facts. Compression ratio is irrelevant to replay correctness." }
+  ]}
+/>
+
+### Kafka batch+compression versus HTTP gzip
+
+**Kafka:** linger + `batch.size` + a codec on the **produce batch**. CPU is paid on the producer (or on the broker if the producer sends uncompressed and the broker re-compresses—usually a mistake you pay twice). Retry is **batch-scoped**. Durability is the log ACK, not the codec.
+
+**HTTP gzip:** typically a reverse-proxy or app `Content-Encoding` on **one response**. It helps large JSON lists and static text. It hurts TokenX 200-byte debit responses: extra CPU, extra first-byte delay, possible size increase. TLS already encrypts; gzip does not replace TLS and does not reduce TLS handshake count—see [Networking for system design](/learn/networking-for-system-design).
+
+**Object storage:** compress **large** immutable exports before or as part of multipart upload when CPU is cheaper than egress and storage. Do not gzip 2 KB metadata objects. Part size still sets retry granularity of the **part**, not of a Kafka batch ([Object storage and large files](/learn/object-storage-and-large-files)).
+
+<InteractiveCalculation mode="event-ingress" title="Peak click bytes before you pick a codec" />
+
+Use the envelope as uncompressed leader ingress. Then apply an **assumed** codec ratio and replication. It is not a broker count and not a durability proof.
+
+</UnderTheHood>
+
+<MentalModel title="Courier van, packing foam, numbered parcels">
+
+Picture a courier van (the batch). **Linger** is “wait for more parcels or leave at T.” The first parcel’s wait is the **first-byte tax**. **Compression** is packing foam: less truck space, more warehouse labor. **Retry** redrives the whole van. If parcels have no tracking numbers, the warehouse books them twice. Foam does not make the vault fireproof: **compression is not durability**. A full van is not a receipt: **batching is not exactly-once**.
+
+TokenX sends small vans so debit tails stay inside the SLO. Ad Click may linger longer and pack more parcels, but the collector still ACKs the SDK **only after** the vault log stamps the batch.
+
+Retain: **size linger against the first record, size N against retry radius, pick a codec from CPU versus bytes, skip tiny and precompressed payloads, ACK only the authoritative log, keep windows derived.**
+
+</MentalModel>
+
+<ArchitectureDiagram title="Linger buffers, codec CPU, durable logs, and batch retry" chart={"flowchart LR\n  CLI[Clients] --> API[TokenX API]\n  CLI --> COL[Ad collector]\n  API --> SML[Small linger]\n  COL --> LRG[Larger linger]\n  SML --> CPU[Codec CPU]\n  LRG --> CPU\n  CPU --> NET[Network batch]\n  NET --> LED[(Ledger plus unique id)]\n  NET --> FACT[(Billed fact log)]\n  FACT -. async windows .-> WIN[Derived windows]\n  NET -. timeout retry batch .-> CPU"}>
+
+**Authoritative state:** TokenX uniqueness plus ledger rows, and the Ad Click billed-fact log until retention. **Derived state:** linger buffers, compressed frames in memory, campaign windows. **Consistency boundary:** a debit is committed only when `(tenant, transfer_id)` and the balance mutation commit together; collector ACK is legal only after the fact-log append under the named `acks` / ISR policy. **Ordering** is the TokenX account owner or the Kafka partition key, not linger order across keys. Solid edges are admission, linger close, codec, and durable append. Dashed edges are **async** window projection and **timeout retry** of the whole compressed batch. Recovery is retry the same identities, rebuild windows from facts, and never treat gzip output as a WAL.
+
+<ArchitectureWalkthrough
+  title="Where amortization stops being free"
+  stages={[
+    { name: "Linger", owner: "API or collector buffer", state: "Uncommitted records in memory", boundary: "First-byte tax equals min(linger, fill time). Crash loses the buffer.", failure: "ACK from memory; TokenX linger longer than the debit tail budget.", recovery: "Keep TokenX linger small; ads linger only if ACK still waits for the log." },
+    { name: "Codec", owner: "Producer or HTTP proxy CPU", state: "Compressed frame, still not durable", boundary: "CPU versus bytes. Skip tiny and precompressed bodies.", failure: "gzip on 200 B JSON; double-compress at producer and broker.", recovery: "lz4 or zstd on large similar batches; disable HTTP gzip under a size floor." },
+    { name: "Commit", owner: "Ledger or billed-fact log", state: "Bytes the product will audit", boundary: "Durability is the store ACK policy, not the codec.", failure: "Treat compression replica copies as fsync; compact facts into a sum.", recovery: "Name acks and uniqueness; retain facts longer than windows." },
+    { name: "Retry", owner: "Client with stable ids", state: "At-least-once re-send of N records", boundary: "Blast radius equals batch cardinality.", failure: "New ids on retry; anonymous click batches.", recovery: "Same transfer_id or click_id; idempotent sink; producer idempotence only for the same produce batch." }
+  ]}
+/>
+
+</ArchitectureDiagram>
+
+<RealExamples title="TokenX small vans; Ad Click larger linger after log ACK">
+
+**TokenX.** Keep batches small so debit p99 can afford linger, codec, row lock, and commit. Illustrative budget: 5 ms linger, 50 records, lz4 or no compression on 800 B facts that may not share enough dictionary to beat CPU. Uniqueness `(tenant, transfer_id)` stays in the ledger transaction. Do not gzip every 200 B HTTP 200. Do not linger 20 ms because ads do. Write-behind of a debit remains forbidden—the linger buffer is the same class of memory as a write-behind cache until the ledger commits.
+
+**Ad Click Aggregator.** Collectors may linger **20 ms or 500 records**, compress with **zstd or lz4** because consecutive billed facts are similar JSON, then produce. **ACK the SDK after** the billed-fact log accepts the batch ([Kafka delivery and failure](/learn/kafka-delivery-and-failure)). Window sums stay derived. A viral campaign at 80,000 clicks/s fills the count cap in 6.25 ms; the linger timer is for sparse campaigns, not an excuse to ACK early. Object-storage raw-event segments can use a heavier codec because they are large, immutable, and retry by **part**, not by mixing HTTP gzip with Kafka batch settings.
+
+<FailureScenario
+  title="Pick the amortization failure and name the bound"
+  prompt="A TokenX debit path and an Ad Click collector share a platform team that ‘just enabled gzip and 500-record batches everywhere.’ Choose the failure."
+  choices={[
+    { label: "Linger TokenX 20 ms and gzip every 200 B debit response", impact: "First-byte tax eats the debit SLO; gzip may grow tiny bodies and burn API CPU. Memory ACK is still not the ledger.", recovery: "Cap TokenX linger at the tail budget; disable HTTP gzip under a size floor; ACK after ledger commit with (tenant, transfer_id)." },
+    { label: "ACK ads from the linger buffer, compress with zstd, retry without click ids", impact: "Crash loses unlogged facts or retry double-counts windows. zstd did not fsync.", recovery: "ACK after fact-log append. Retry stable click ids. Rebuild windows from facts." },
+    { label: "Producer uncompressed, broker gzip, client HTTP gzip on the same 200 KB batch", impact: "CPU paid twice or three times; p99 explodes; bytes may not drop enough to justify it.", recovery: "Compress once at the Kafka batch; skip HTTP gzip on already-compressed fetches." },
+    { label: "Treat a compressed RF=3 topic as exactly-once money movement", impact: "Replication and codecs are not a ledger uniqueness boundary. Ambiguous produce still retries N transfers.", recovery: "Fence transfers in the database. Producer idempotence only collapses the same produce batch." }
+  ]}
+/>
+
+</RealExamples>
+
+<InterviewTraps title="Batching slogans that fail at IC6">
+
+- **“Larger batches are always faster.”** They raise throughput and the first-byte tax and the retry radius. TokenX debit tails often lose.
+- **“gzip everything at the edge.”** Tiny JSON and already-compressed objects can grow or waste CPU. Name a size floor.
+- **“zstd is more durable than lz4.”** Codecs do not fsync. Durability is ACK policy and disk/ISR bounds.
+- **“Kafka compression is the same as HTTP gzip.”** Batch dictionary versus one HTTP body. Retry scopes differ.
+- **“Producer idempotence means exactly-once transfers.”** It deduplicates a produce batch inside a producer session, not two business ids, and not a ledger side effect.
+- **“Linger is free because users will not notice 20 ms.”** 20 ms is the entire budget of some debit SLOs once you add lock wait and TLS.
+- **“If we compress, we can ACK from memory.”** Compression does not create durability.
+- **“Batching gives exactly-once because we flush together.”** One failed ACK retries everyone in the van.
+
+</InterviewTraps>
+
+<Tradeoffs title="What you spend to amortize">
+
+- **Linger versus tail latency:** longer linger fills vans in sparse windows and delays the first record. TokenX spends this reluctantly; ads can spend more **if** ACK still waits for the log.
+- **Batch size versus retry blast radius:** large *N* amortizes fsync and helps codec ratio; a timeout resends *N* identities.
+- **lz4 versus zstd versus gzip:** CPU and p99 versus bytes on the wire and disk. gzip is often the HTTP tool, not the produce-path tool.
+- **Compress versus skip:** large similar batches win; sub-kilobyte and precompressed payloads lose.
+- **Kafka batch codec versus HTTP encoding:** one is a produce-path dictionary; the other is a per-response Content-Encoding. Combining them without a size check double-pays CPU.
+- **Sync ACK versus collector availability:** holding the SDK until log ACK fails closed; ACKing the linger buffer stays up and hides a loss window.
+
+Correctness of TokenX balances and billed-click identity is not a compression knob. Completeness of a dashboard is.
+
+</Tradeoffs>
+
+<KnowledgeCheck
+  question="An Ad Click collector times out a 500-click zstd produce before the SDK ACK. The team says compression made the retry cheap, so they resend without click ids. What bound did they miss?"
+  options={[
+    "zstd is lossless, so the broker will reject bitwise-identical retries automatically",
+    "Retry blast radius is 500 facts; without stable click ids a derived window can double-count, and the codec never created durability",
+    "HTTP gzip on the SDK ACK would have provided exactly-once because the status code was compressed",
+    "Linger 20 ms already fsynced the batch to the collector disk, so retry is a no-op"
+  ]}
+  correct={1}
+  explanation="A timed-out batch retries every record. Identities on the billed-fact log make at-least-once safe. Compression ratio and linger do not fsync and do not dedupe business events."
+/>
+
+<KnowledgeCheck
+  question="TokenX p99 debit SLO is 40 ms. A platform default sets linger 20 ms, batch 500, and gzip on every HTTP body including 200-byte 200 OKs. What is the defensible change?"
+  options={[
+    "Keep the defaults; gzip reduces TLS handshake count so the 20 ms comes back",
+    "Raise linger to 50 ms so gzip has a larger dictionary and the first debit waits in a fuller van",
+    "Cut TokenX linger to a few milliseconds and a small N, skip gzip under a size floor, and ACK only after (tenant, transfer_id) plus ledger commit",
+    "Move debits to Kafka acks=0 compressed zstd so linger is hidden behind async ACK"
+  ]}
+  correct={2}
+  explanation="Linger is a first-byte tax inside the SLO. Tiny gzip can grow bodies and burn CPU. acks=0 is availability, not durability. Small batches plus ledger uniqueness match the money path."
+/>
+
+<ScenarioCheck
+  scenario="Peak ads are 80,000 clicks/s at 400 B. Collectors linger 20 ms or 500 records, compress with lz4, and ACK after acks=all to the billed-fact log. A new service copies those knobs onto TokenX HTTP debits and also enables gzip at the ingress proxy for all JSON. One collector crash during linger loses 200 un-ACKed clicks; the SDK retries with the same click ids. A TokenX client retries a 500-record debit batch after a proxy timeout."
+  question="Which statement is consistent with this lesson?"
+  options={[
+    { label: "The lost 200 clicks prove lz4 is unsafe; switch ads to gzip so the linger buffer is durable.", feedback: "Codec choice does not persist the linger buffer. Those 200 were never ACKed; SDK retry with click ids is the designed recovery." },
+    { label: "Ads may keep large linger plus lz4 because ACK waits for the fact log and retries carry click ids; TokenX must not inherit 500-record gzipped batches that explode debit tail and retry radius.", feedback: "Same platform, different latency and correctness envelopes. Compression still is not a WAL." },
+    { label: "TokenX should ACK after gzip at the proxy because TLS plus gzip is ‘durable enough’ at RF=3 of the proxy fleet.", feedback: "Proxy replicas are not the ledger uniqueness boundary." },
+    { label: "Because ads already use lz4, HTTP gzip on TokenX is redundant and therefore free—leave both on.", feedback: "Redundant codecs are CPU, not free, and tiny debit bodies are the case where gzip hurts." }
+  ]}
+  correct={1}
+  explanation="Copying ads linger onto money violates the first-byte budget and multiplies debit retries. Ads linger is legal only because durable ACK and click ids bound the failure. Codecs never substitute for the ledger or the fact log."
+/>
+
+<InterviewAnswer>
+
+“I treat batching as amortization, not correctness. Linger and size are two clocks: the first record pays min(T, N/λ), which is a first-byte tax I put inside the SLO. TokenX keeps that tax small—a few milliseconds and tens of records—because debit tail and a 500-wide retry would be a blast radius on money. Ads can linger longer and compress lz4 or zstd because consecutive billed facts share a dictionary, but the collector still ACKs only after the billed-fact log under a named acks policy. Retry resends the whole batch, so every record needs a stable id; producer idempotence only collapses the same produce batch. gzip is an HTTP tool with a size floor—I will not gzip 200-byte debit responses or already-compressed objects. Compression does not fsync. Batching does not create exactly-once. Windows stay derived and rebuild from facts.”
+
+</InterviewAnswer>

@@ -1,0 +1,210 @@
+---
+title: "Tail-Latency Control"
+description: "Cut p99 with deadlines, real cancellation, hedged reads, and partial results without doubling TokenX money or billed-click facts."
+module: 4
+moduleTitle: "Performance"
+order: 6
+duration: 38
+difficulty: "Advanced"
+tags:
+  - tail latency
+  - deadlines
+  - cancellation
+  - hedged requests
+  - speculative execution
+objectives:
+  - Separate mean latency from p99 when a request is the max of N fan-out calls
+  - Propagate deadlines so cancellation stops work instead of leaving orphaned queries
+  - Hedge or speculate only with a shared idempotency key and a named duplicate-load budget
+  - Serve partial or replica-hedged reads with an explicit staleness bound, never as spendable money
+---
+
+<BigPicture title="Users feel the slowest sibling, not the average">
+
+Mean latency is a planning number. Users and SLOs live in the **tail**: p95, p99, p99.9. A parent request that **fans out** to *N* backends waits on the **max of N**, not the mean of N. One slow shard, lock wait, GC pause, or overloaded replica becomes the whole page.
+
+[Latency, throughput, and queues](/learn/latency-throughput-and-queues) already showed that utilization and unbounded queues **create** tails. This lesson is how you **cut** them: end-to-end **deadlines**, **cancellation that actually stops work**, **hedged / speculative** requests with a duplicate-load budget, and **partial results** with a named freshness bound.
+
+Request fan-out here is “one user call becomes N RPCs.” Social **write fan-out** (copy a post into inboxes) is a different amplification tax in [Fan-out architectures](/learn/fan-out-architectures). Do not mix the two math envelopes.
+
+Authoritative TokenX money is the ledger plus unique `(tenant, transfer_id)`. Authoritative Ad Click invoices are billed facts on the durable log. Dashboards, replica reads, and “8 of 10 shards returned” are **derived or partial**. Hedging a debit without the same identity is a double-spend path. Hedging a dashboard read with stated replica lag is a latency path.
+
+</BigPicture>
+
+<UnderTheHood title="Max of N, then stop work, then maybe send a second copy">
+
+### p99 versus mean, then the max-of-N trap
+
+Illustrative (not a measured cluster): TokenX balance page fans out to 8 account shards; each shard mean service 12 ms, p50 10 ms, p99 80 ms, independent given no shared lock. Ad Click operator dashboard fans out to 20 campaign partitions; each p99 100 ms.
+
+The **mean** of eight 12 ms shards is still ~12 ms of service. The **parent** waits until the last shard returns (plus merge). If tails are independent, the chance the parent sees at least one child at or beyond that child’s p99 is `1 - 0.99^N`.
+
+<Calculation label="Parent tail is not the child mean">
+
+Eight shards: `1 - 0.99^8` ≈ 7.7% of parent requests include at least one p99 child. Twenty partitions: `1 - 0.99^20` ≈ 18%.
+
+To keep the **parent** at p99 of the child distribution, each child must hit a higher percentile: `0.99 = F^N` so `F = 0.99^(1/N)`. For N = 8, F ≈ 0.9987 (about child p99.87). Shipping “our p99 is 80 ms” as the page SLO when the page is max-of-8 is a lie.
+
+Hedge budget (same envelope): if you wait until child p95 = 40 ms then issue a second copy, extra offered load ≈ 5% (the mass slower than 40 ms), not 2×. Immediate hedge on every call is 2× load into [load-balancing](/learn/load-balancing-deep-dive) pools and the ledger.
+
+</Calculation>
+
+Shared failure (one hot lock, one GC, one AZ) **correlates** tails. Independence is the optimistic bound. A celebrity TokenX account that serializes on one row makes all “fan-out” siblings wait on the **same** cashier; hedging that row just doubles lock waiters.
+
+### Deadlines are a budget; the server does not share them by default
+
+A **client deadline** (for example 200 ms remaining) is a clock on the caller. HTTP/gRPC timeouts often only **abandon the socket**. The handler, the database session, and the Kafka produce can keep running. That is **orphaned work**: capacity spent after the user already got 504.
+
+A real deadline **propagates**: remaining time in a header or gRPC deadline, `statement_timeout` / query cancel on the ledger, worker abort, and refuse to start a sibling RPC whose worst-case service already exceeds the leftover budget. [Load-balancing deep dive](/learn/load-balancing-deep-dive) drain timeouts are the same idea at deploy time: do not RST in-flight money, and do not let abandoned work occupy the pool forever.
+
+<ExecutionTimeline
+  title="Deadline, cancel, hedge, then ACK"
+  steps={[
+    { title: "Budget", detail: "The client and mesh start a 200 ms deadline on GET /portfolio. The API will not start a shard RPC if leftover time is below a 15 ms floor.", state: "No ledger mutation. Fan-out is still unissued.", failure: "A 30 s server timeout with a 200 ms client timeout guarantees orphans." },
+    { title: "Fan-out", detail: "Eight shard reads run in parallel. Parent latency is max of the eight plus merge. Six return in 12 ms; shard 7 is at 90 ms.", state: "Derived balances only. Spendable money is not this read.", failure: "Waiting for all eight with no deadline converts one lock wait into a page timeout." },
+    { title: "Cancel or hedge", detail: "At 40 ms the API issues a hedged read of shard 7 to a replica, carrying the same request id. When either returns, it cancels the other via the DB protocol—not by dropping the client socket.", state: "Replica answer is bounded-stale. Authoritative debit path is unused.", failure: "Socket close without query cancel leaves both queries running; two TokenX POSTs without transfer_id both debit." },
+    { title: "Partial", detail: "If shard 8 still misses the deadline, the page returns 7/8 holdings, labels the missing shard, and does not invent a zero balance.", state: "Partial derived view. Not a TokenX commit.", failure: "Treating a missing shard as balance 0 understates liability; treating it as success of a debit forges money." }
+  ]}
+/>
+
+**Cancellation that stops work** uses the data-plane cancel: gRPC `CANCEL`, Postgres `pg_cancel_backend` / `statement_timeout`, HTTP/2 RST_STREAM **and** handler abort, Kafka consumer stop-fetch for that request. **Orphaned queries** are what you get from only closing the inbound connection. They still hold locks, pool slots, and CPU. Queueing cost is the latency lesson: extra in-flight L = (orphan rate) × remaining service time.
+
+Assumptions: 2,000 TokenX API req/s; 10% miss a 200 ms deadline; those handlers continue 1.5 s. Extra concurrency ≈ 200/s × 1.5 s = **300** orphaned in-flight calls—on top of the healthy load. Cancellation that actually stops work returns that 300 to the pool.
+
+Retries after a timeout are **UNKNOWN** in [Retries, dead letters, and replay](/learn/retries-dead-letters-and-replay): the first attempt may have committed. Hedging is a **concurrent** second attempt, not a later retry, and it has the same uniqueness rule.
+
+### Hedged and speculative copies need one identity
+
+- **Hedged request:** after a delay (or immediately, at 2× cost), send the **same** logical operation to a second replica, AZ, or handler. First success wins; **cancel the loser**.
+- **Speculative execution:** start the second copy before you have evidence the first is slow (always-on hedge, or prefetch of a likely next key). Duplicate load is the default, not the tail tax.
+
+Both multiply **offered** QPS into the tail you were trying to cut. They are legal when the effect is **read-only** or **idempotent on a caller-owned key**. They are not a substitute for [Idempotency and deduplication](/learn/idempotency-and-deduplication).
+
+**Request hedging versus idempotency:** a hedge is two in-flight attempts of one user operation. Both **must** carry the same idempotency key. For TokenX that key is `(tenant, transfer_id)` inserted in the same ledger transaction as the debit. If the hedge mints a new UUID, you have two transfers, not one faster transfer. Idempotent producer session ids on Kafka do **not** cover two HTTP POSTs with different `transfer_id`s.
+
+**TokenX debit: hedge must not double-spend.** You may hedge a **read** of a replica with [replication and failover](/learn/replication-and-failover) lag named (for example “applied LSN ≥ token, else primary”). You may **not** hedge `POST /debits` unless both copies share `transfer_id` **and** uniqueness is inserted in the **same ledger transaction** as the debit. Two racing inserts without a unique constraint can both debit. Fail closed if the uniqueness store is down—same money rule as [Graceful degradation](/learn/graceful-degradation).
+
+**Ad Click:** you **may** hedge a **read** of a derived dashboard against a lagging replica and label staleness (for example “windows as of ≤ 15 s replica apply lag”). You **must not** double-append billed facts: a hedged collector POST without a stable `click_id` becomes two invoiceable rows. Hedge the read path; identity-fence the write path.
+
+### Partial results are a contract, not a timeout
+
+Returning 7 of 8 shards, a sampled campaign chart, or a replica that is 400 ms behind is allowed when the product **names** incompleteness. Returning HTTP 200 with a fabricated full portfolio, or ACK of a billed batch that only hit 3 of 5 collectors, is a silent contract change. Partial **reads** of derived views; never partial **commits** of money or billed identity.
+
+<InteractiveCalculation mode="little-law" title="Hedge amplification is extra in-flight work" />
+
+Little’s Law at the **shard pool** boundary: if you immediate-hedge 2,000 reads/s, the pool sees ~4,000 arrivals. At 80 ms hold on the slow copy, that is extra concurrency the latency lesson already warned you about. Prefer delayed hedges so only the tail duplicates.
+
+</UnderTheHood>
+
+<MentalModel title="A taxi dispatch with one trip number, not two meters">
+
+Picture a dispatcher who needs the **slowest** of eight taxis to arrive before the party can leave (max of N). The mean taxi time is a brochure number. A **deadline** is “leave without the last taxi at 200 ms.” **Cancellation** is radioing that last taxi to **stop driving**, not hanging up while it still burns fuel (orphaned query). A **hedge** is sending a second taxi for the late one, with the **same trip number** so the passenger is not billed twice. A **partial result** is departing with seven people and a sign that seat 8 is missing—not pretending the van was full, and not charging a second fare.
+
+Retain: **parents wait on max of N; clocks must cancel work; hedges share the identity; TokenX and billed facts fail closed on uniqueness; replica and partial answers are labeled derived.**
+
+</MentalModel>
+
+<ArchitectureDiagram title="Deadline, fan-out max of N, hedged replica, and cancel versus orphan" chart={"flowchart LR\n  CLI[Clients] --> DL[Deadline admission]\n  DL --> API[API coordinator]\n  API --> FAN[Fan-out max of N]\n  FAN --> S1[Shard primary]\n  FAN --> S2[Shard primary 2]\n  FAN --> SN[Shard primary N]\n  S1 --> MERGE[Derived page merge]\n  MERGE --> CLI\n  API -->|debit| LED[(Authoritative ledger plus transfer id)]\n  API --> HEDGE[Hedged replica read]\n  HEDGE --> REPL[(Replica derived copy)]\n  DL -. reject 504 .-> CLI\n  API -. cancel stops work .-> FAN\n  FAN -. orphaned query .-> S1\n  HEDGE -. wrongful write hedge .-> LED\n  REPL -. stale partial .-> CLI"}>
+
+**Authoritative state:** TokenX ledger plus unique `(tenant, transfer_id)`; Ad Click **billed-fact log** (not this diagram’s replica). **Derived state:** replica copies, dashboard windows, partial shard merges. **Consistency boundary:** a debit commits only in the ledger transaction with the uniqueness row; a hedged debit is two attempts of **one** `transfer_id`, not two ids. Replica reads are outside that boundary and inherit lag from [Replication and failover](/learn/replication-and-failover). Solid edges are admitted **read** fan-out, derived merge, and a **separate labeled debit** into the ledger. Shard primaries do not land portfolio reads on the uniqueness store. Dashed edges are 504 reject, cancel/orphan, a wrongful write-hedge into the authority, and stale partial replies. Recovery: cancel the loser, retry UNKNOWN writes with the **same** key, rebuild dashboards from the fact log, never reconstruct spendable balances from a hedged replica.
+
+<ArchitectureWalkthrough
+  title="Where tail-latency tools are allowed to touch authority"
+  stages={[
+    { name: "Deadline", owner: "Client plus mesh plus handler", state: "Remaining time budget", boundary: "Admission and start/skip of RPCs. Does not commit money.", failure: "Server timeout >> client timeout; work continues after 504.", recovery: "Propagate deadline; statement_timeout; refuse RPCs that cannot finish in leftover time." },
+    { name: "Fan-out", owner: "API coordinator", state: "N in-flight shard RPCs; parent = max of N", boundary: "Read merge is derived. Per-shard locks stay on each primary.", failure: "Treating mean shard time as the page SLO; unbounded wait for all N.", recovery: "Budget per sibling; partial result with missing-shard labels; see the social fan-out lesson for write copies, not this wait." },
+    { name: "Cancel", owner: "RPC and database cancel path", state: "In-flight query tokens", boundary: "Cancel must reach the executor holding locks, not only the inbound socket.", failure: "RST the client and leave the ledger query running (orphan).", recovery: "pg_cancel / gRPC CANCEL / abort the worker; count orphans as a saturation metric." },
+    { name: "Hedge", owner: "Second replica or handler", state: "Duplicate in-flight copy with the same request id / transfer_id", boundary: "Reads: stated staleness. Writes: unique row in the same ledger transaction as the debit.", failure: "New UUID on the hedge; billed append without click_id; immediate 2× hedge into a hot row.", recovery: "Same key, cancel loser, delay hedge to p95, never hedge unkeyed money or unkeyed billed facts." }
+  ]}
+/>
+
+</ArchitectureDiagram>
+
+<RealExamples title="TokenX hedges reads, never unkeyed debits; ads hedge dashboards, not naked facts">
+
+**TokenX.** Portfolio and token-metadata reads may fan out across shards and hedge a slow primary with a replica after ~p95. Label lag (“replica applied position 240 ms behind leader”). A **debit** uses one `transfer_id` from the client. If the mesh retries or a hedge fires on `POST /debits`, both bodies carry that id; the unique row makes the second attempt a replay of the stored result, not a second spend. If uniqueness is unavailable, **fail closed**—do not hedge to a cache “success.” Speculative execution of the next likely debit is forbidden: that would start money movement the user did not confirm. Cross-AZ hedges add RTT (often 1–2 ms same region, tens of ms cross-region) **and** a second lock waiter on celebrity accounts.
+
+**Ad Click Aggregator.** Operator dashboards may hedge a read of a derived window table on a replica and show “partial: 18/20 partitions, ≤ 15 s stale.” Collectors must **not** hedge an unkeyed POST of billed facts: two appends are two invoices unless `click_id` (or an equivalent unique constraint on the fact log / sink) fences them. Debug click payloads can be sampled or dropped under overload; billed identity cannot. Speculative prefetch of the next dashboard range is a **read** cost; speculative double-produce of a click batch is a billing incident.
+
+<FailureScenario
+  title="Pick the tail-latency control and name the identity"
+  prompt="p99 of a 12-shard TokenX portfolio is 900 ms while mean is 40 ms. An engineer wants faster money and faster ads."
+  choices={[
+    { label: "Immediate hedge every POST /debits to two regions with new UUIDs", impact: "Offered debit QPS doubles. Without one transfer_id, both regions can commit. Double-spend.", recovery: "Do not hedge unkeyed money. One transfer_id, uniqueness in the ledger transaction, fail closed if the fence is down." },
+    { label: "Deadline 200 ms, cancel shard queries, partial portfolio, delayed hedge of the slow read replica", impact: "Parents stop waiting on max-of-12. Orphans fall. Replica answer is stale by apply lag. No debit is implied.", recovery: "Keep uniqueness off this path. Measure cancel success rate, not only client 504 rate." },
+    { label: "Hedge collector POST of billed clicks with no click_id so ingest p99 drops", impact: "At-least-once becomes two facts. Derived windows double-count; finance cannot prove a single click.", recovery: "Stable click ids; ACK after durable append; hedge only dashboard reads." },
+    { label: "Raise every timeout to 30 s so tails have time to finish", impact: "Orphaned and live work occupy pools. Little’s Law turns a slow shard into a process-wide queue. Retries amplify.", recovery: "Short deadlines, real cancel, bound queues as in the latency lesson—not longer patience." }
+  ]}
+/>
+
+</RealExamples>
+
+<InterviewTraps title="Tail slogans that fail at IC6">
+
+- **“Our mean is 12 ms so the page is fast.”** The page is max of N. Quote parent percentiles, or the math of `1 - 0.99^N`.
+- **“We set a client timeout, so the server stopped.”** Timeouts abandon callers. Cancellation stops queries. Count orphans.
+- **“Hedged requests are free latency.”** They are extra QPS. Immediate hedges are ~2×. Delayed hedges tax only the tail.
+- **“Hedge the debit to the other AZ for availability.”** Without the same `transfer_id` this is dual-write. With it, you still need uniqueness and cancel-the-loser so you do not double lock-wait.
+- **“Exactly-once because we hedged.”** Hedging **increases** duplicate attempts. Effect-once is the idempotency boundary, not the hedge.
+- **“Partial 200 with zeros for missing shards.”** That understates balances or overstates empty campaigns. Name incompleteness.
+- **“Replica hedge is linearizable.”** It is a lagging copy unless you waited for the commit position on that timeline ([Replication and failover](/learn/replication-and-failover)).
+- **“Speculative debit of the likely next transfer.”** Speculative **reads** can be cheap. Speculative **money** is an unauthorized mutation.
+- **“Fan-out of notifications is the same as request fan-out.”** Inbox copies are write amplification. Max-of-N is wait amplification. Different lessons.
+
+</InterviewTraps>
+
+<Tradeoffs title="What you spend to shrink the tail">
+
+- **Deadline tightness versus completeness:** short budgets cut orphans and p99; more callers see 504 or partial pages. Money still fail-closes rather than returning a guessed debit.
+- **Cancel depth versus implementation cost:** socket-only cancel is cheap and leaves lock holders; protocol cancel needs statement timeouts and worker abort but returns capacity.
+- **Delayed hedge versus always-on speculate:** delay ≈ p95 buys little extra load; speculate buys p50 improvement at ~2× cost and can **create** a new tail on the dependency.
+- **Replica hedge versus primary-only:** replica is faster when the primary is the outlier, and stale by apply lag. Primary-only is current and inherits the primary’s tail.
+- **Partial results versus all-or-nothing:** partial keeps the UI useful and can hide a missing liability if you do not label it. All-or-nothing is honest and concentrates failures on the slowest shard.
+- **Cross-AZ hedge versus single-AZ:** extra RTT and correlated-failure reduction; still not a durability ACK.
+
+Correctness of TokenX uniqueness and billed `click_id` is not a tail-latency knob. Freshness of a dashboard is.
+
+</Tradeoffs>
+
+<KnowledgeCheck
+  question="A TokenX portfolio fans out to 20 independent shards. Each shard’s p99 is 80 ms. About what fraction of parent requests include at least one shard at or beyond that p99, and what should the SLO quote?"
+  options={[
+    "Nearly 0%, because the mean of 20 shards is still ~mean; quote mean as the page SLO",
+    "About 18% (1 − 0.99^20); quote parent p99, which is worse than child p99 unless you also cancel, hedge, or return partial results",
+    "Exactly 1%, because p99 already means 1% of pages are slow",
+    "100%, because fan-out always waits on every child’s p99.9"
+  ]}
+  correct={1}
+  explanation="Parent wait is max of N. Under independence, P(at least one child ≥ its p99) = 1 − 0.99^N ≈ 18% for N = 20. The page SLO is a parent percentile, not the child mean or the child’s p99 copied onto the page."
+/>
+
+<KnowledgeCheck
+  question="A client gives up at 200 ms. The TokenX handler’s SQL continues for 1.5 s. A second POST /debits is hedged immediately with a new UUID. What failed?"
+  options={[
+    "Nothing: the timeout is cancellation, and a new UUID makes the hedge safer",
+    "Only the timeout: SQL continuing is expected; new UUIDs are required so hedges do not collide",
+    "The timeout was not a cancel (orphaned query), and the hedge skipped uniqueness by minting a second transfer_id, which can double-spend",
+    "Hedging is illegal for all TokenX traffic, including replica reads of metadata"
+  ]}
+  correct={2}
+  explanation="Deadlines must propagate into query cancel or you pay orphan concurrency. Hedged mutations must reuse transfer_id so the unique ledger row collapses two attempts into one effect. Replica reads of non-spendable data may still hedge with a lag label."
+/>
+
+<ScenarioCheck
+  scenario="Ad Click p99 for the operator dashboard is 1.2 s because one of 20 partition reads is slow. A proposal: (1) hedge the dashboard read to a replica after 50 ms; (2) also hedge the collector’s billed-fact POST to two brokers with no click_id so ingest p99 drops; (3) if a partition misses the deadline, fill it with zero clicks so the chart looks complete."
+  question="Which change set matches tail-latency control without breaking billing?"
+  options={[
+    { label: "Ship all three: zeros keep charts smooth, and two produces mean the click is durable twice for safety.", feedback: "Unkeyed double-append bills twice. Zeros forge a complete window. Durability is the log plus click_id, not two naked produces." },
+    { label: "Hedge the derived dashboard read with a stated replica-lag bound. Do not hedge unkeyed billed POSTs. Return partial windows labeled missing, or wait on the fact log’s identities—not zeros.", feedback: "Reads of derived state may hedge and be partial. Billed facts need stable ids and a single durable append path." },
+    { label: "Disable deadlines so every partition can finish, and treat the replica hedge as linearizable with the billed log.", feedback: "Longer waits grow orphans. Replica dashboard state is not the billed-fact log." },
+    { label: "Hedge billed POSTs but reuse a random batch UUID per collector restart, and keep zero-fill so finance never sees gaps.", feedback: "A UUID that changes on restart is a new identity. Zero-fill still lies about missing partitions." }
+  ]}
+  correct={1}
+  explanation="Tail tools on derived reads are hedges, deadlines, cancels, and labeled partials. Tail tools on billed writes are identity plus one durable authority—not speculative duplicate appends or fabricated zeros."
+/>
+
+<InterviewAnswer>
+
+“I quote parent percentiles, not child means. A page that fans out to N shards waits on the max of N: with independent tails, 1 minus 0.99 to the N is the chance you hitchhike on someone’s p99—about 18% at N equals 20—so the SLO is the parent’s p99, and I budget leftover time per sibling. Deadlines propagate into real cancellation: gRPC cancel, statement_timeout, worker abort. Closing the client socket alone leaves orphaned queries; at 200 missed deadlines per second times 1.5 seconds leftover you are carrying 300 extra in-flight calls. Hedged and speculative copies cut that tail only with a duplicate-load budget—delay to p95 is about 5% extra QPS; immediate hedge is 2×—and both copies share the idempotency key. TokenX POST /debits uses one transfer_id in the same transaction as the uniqueness row; a hedge that mints a new UUID can double-spend, and if uniqueness is down I fail closed. Ads may hedge a dashboard replica with a lag label; they may not double-append billed facts without click_id. Partial results name the missing shard; they never invent a zero balance or a successful debit. Retries of timeouts stay UNKNOWN on the same key. I do not call any of this exactly-once or linearizable replica reads.”
+
+</InterviewAnswer>

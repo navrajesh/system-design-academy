@@ -1,0 +1,217 @@
+---
+title: "Profiling and Observability"
+description: "Use RED and USE, traces, logs, and profiles to find regressions without treating telemetry as durability, linearizability, or billed identity."
+module: 4
+moduleTitle: "Performance"
+order: 8
+duration: 38
+difficulty: "Intermediate"
+tags:
+  - observability
+  - tracing
+  - profiling
+  - cardinality
+  - RED
+  - USE
+objectives:
+  - Separate RED request signals from USE resource signals and from profiles
+  - Bound sampling, exemplars, and cardinality so p99 and debug stay honest
+  - Keep traces and metrics derived; never substitute them for the TokenX ledger or billed-fact log
+  - Detect performance regressions with units without claiming telemetry is linearizable
+---
+
+<BigPicture title="Telemetry is a derived view of a running system">
+
+Observability answers **why this request, disk, or core is slow or wrong**. It does not create durability. A trace ID in a header is not an idempotency key unless you stored it in the uniqueness table. A dashboard that plots “exactly the billed clicks” is still a **derived** time series until finance can replay identities from the fact log.
+
+Four signals, four jobs:
+
+- **Metrics:** cheap, aggregated, high-frequency. Good for [performance budgets and SLOs](/learn/performance-budgets-and-slos) and for queueing from [latency, throughput, and queues](/learn/latency-throughput-and-queues).
+- **Traces:** a sampled graph of spans across services. Good for fan-out and p99 **exemplars**. Not a linearizable history of money.
+- **Logs:** high-cardinality narrative. Put **debug** attributes here, not as metric labels. Put **billed identity** in the append-only fact log, not only in a log line that expires in 14 days.
+- **Profiles:** stack samples over time (continuous profiling). Good for CPU, allocation, and lock wait **inside one process**. Not a substitute for RED on the API or USE on the disk.
+
+Cross-lesson spine: time-series cardinality and retention live in [time-series and append-only storage](/learn/time-series-and-append-only-storage); Kafka page-cache and lag are [Kafka internals](/learn/kafka-internals); chaos and recovery drills are [disaster scenarios](/learn/disaster-scenarios); proving a consistency claim is [consistency testing](/learn/consistency-testing). This lesson is how you **instrument** those boundaries without lying with averages.
+
+</BigPicture>
+
+<UnderTheHood title="RED versus USE, four telemetry types, then the failure modes">
+
+### RED for requests, USE for resources
+
+**RED** (rate, errors, duration) is for **work the user asked for**: TokenX `POST /transfers`, Ad Click collector ingest, a consumer’s apply loop treated as a request.
+
+- **Rate:** offered and completed operations per second (name which).
+- **Errors:** failed operations per second, by **cause class** (4xx fence, 5xx dependency, timeout), not by every `campaign_id`.
+- **Duration:** histogram of latency with percentiles. p50 is not the SLO; p99 and an **exemplar** are.
+
+**USE** (utilization, saturation, errors) is for **resources that do the work**: CPU, disk, NIC, connection pool, Kafka partition, ledger row lock.
+
+- **Utilization:** busy time / capacity (CPU 70%, disk 40% write, pool 26/50 busy).
+- **Saturation:** queue length or wait: run-queue, disk wait, pool waiters, consumer lag, lock wait.
+- **Errors:** hardware and resource faults (disk EIO, NIC drops), distinct from RED application errors.
+
+A TokenX API at RED rate 2,000 /s, error 0.1%, duration p99 180 ms can still be dying: USE on the uniqueness pool is 95% utilized with 40 waiters. CPU RED looks fine; the resource is saturated. That is the same lesson as pool math in [latency, throughput, and queues](/learn/latency-throughput-and-queues), measured instead of guessed.
+
+### Traces, metrics, logs, profiles
+
+A **metric** is an aggregated number with a small label set. A **trace** is a tree of timed spans sharing a `trace_id`. A **log** is an event with arbitrary fields. A **profile** is a statistical stack (CPU, wall, alloc, lock) over a window.
+
+Use them together: RED metrics trip the burn; an **exemplar** attaches a `trace_id` that actually landed in the p99 bucket; the trace shows the span that waited on the ledger; the profile on that host shows the mutex or JSON codec; the log (or fact log) holds the `transfer_id` / `click_id` you can audit.
+
+<Callout type="warning" title="Tracing is not linearizability">
+
+A trace is a **best-effort, sampled, clock-skewed** recording of spans. Clock skew of tens of milliseconds between hosts is normal. Missing spans are normal under sampling. Span order in a UI is not a proof that debit A happened-before debit B in the ledger. Linearizability and session guarantees are properties of the **store and the protocol**, proven with [consistency testing](/learn/consistency-testing), not with a waterfall chart.
+
+</Callout>
+
+### Exemplars, sampling bias, cardinality
+
+**Head sampling** (keep 1% of traces at the edge) **under-represents the tail**. The p99 you bill an SLO on is exactly the 1% you are most likely to drop. Prefer **tail sampling** (keep errors and slow traces) plus a small head sample for baseline, or attach **exemplars**: when a histogram bucket increments, keep one trace id for that bucket.
+
+**Cardinality explosion:** each unique combination of metric labels is a time series. `http_requests_total{path, code}` is fine. `http_requests_total{campaign_id}` with 200,000 campaigns is 200,000 series **per scrape dimension**, and it will take down the TSDB long before it helps billing. Put `campaign_id` in a **log** or in the **billed-fact log**. Debug identity is high-cardinality by nature; billed identity is **authoritative append-only**, not a Prometheus label.
+
+Planning assumptions (illustrative, not a measured cluster): TokenX 2,000 transfers/s; Ad Click 80,000 clicks/s peak; scrape interval 15 s; 4 RED series per RPC; 200,000 active campaigns.
+
+<Calculation label="Cardinality versus sampled traces (illustrative)">
+
+Ad Click RED without campaign: 12 RPCs × 4 series × 3 pods = 144 series. Cheap.
+
+With `campaign_id` label, keep the same pod factor: 200,000 campaigns × 12 RPCs × 4 series × 3 pods = **28.8 million** series. At a 15 s scrape that is 28.8×10^6 / 15 ≈ **1.92 million samples/s** of **useless** identity. The billed-fact log at 80,000 × 400 B = 32 MB/s peak is the correct identity store.
+
+Head-sample 1% of 2,000 TokenX transfers/s → 20 traces/s exported. About 1% of transfers are slower than p99, so ~20 /s sit in the tail; expected **complete tail traces** kept ≈ 20 × 0.01 = **0.2 /s** (~12 per minute)—sparse and biased, not “often zero.” Histogram **exemplars** can still attach a `trace_id` to the p99 bucket even when full traces are missing. Head sampling drops exported traces; it does not delete the histogram. Tail sampling that keeps duration ≥ p99 keeps those ~20 /s complete traces.
+
+Trace ID as fence: 2,000 retries/s with only `trace_id` and no `(tenant, transfer_id)` unique row double-applies on retry. Observability did not store the fence.
+
+</Calculation>
+
+<InteractiveCalculation mode="little-law" title="In-flight requests versus what a 1% head sample will see" />
+
+Little’s Law still bounds how many requests exist to observe. At 2,000 /s and 200 ms, L ≈ 400 in flight. A 1% sample sees about 4 of those 400 at any instant—and is biased to the fast ones if sampling happens at admission rather than at completion.
+
+<ExecutionTimeline
+  title="A p99 TokenX debit and a viral campaign, observed honestly"
+  steps={[
+    { title: "RED trip", detail: "Transfer duration p99 crosses 300 ms. Rate is flat; errors are still 0.2%. The SLO burn is latency, not 5xx.", state: "RED duration histogram is derived. Ledger rows are authoritative.", failure: "Paging only on error rate misses the lock-wait tail." },
+    { title: "Exemplar", detail: "The p99 bucket carries trace T-77. The span shows 240 ms on uniqueness insert, 12 ms on balance update.", state: "Trace is a sampled recording. Unique (tenant, transfer_id) is the fence.", failure: "Using T-77 as the idempotency key: a retried debit with a new trace double-spends." },
+    { title: "USE plus profile", detail: "Uniqueness pool utilization 92%, waiters 30. Continuous profile shows time in row lock, not in JSON.", state: "USE saturation is the resource. Profile is statistical stacks on one box.", failure: "Scaling APIs from CPU 35% while the pool is the bottleneck." },
+    { title: "Ads cardinality", detail: "Someone adds campaign_id to RED. TSDB write latency explodes. Collectors still ACK after the fact log.", state: "Billed facts remain in the log. Metrics are derived and now on fire.", failure: "Dropping the fact log ‘because metrics already have campaign_id’ destroys invoices." }
+  ]}
+/>
+
+</UnderTheHood>
+
+<MentalModel title="The black box is not the bank vault">
+
+A flight recorder (traces, profiles, RED/USE) explains why the plane shook. The **bank vault ledger** is still the paper that says who owns the cash. CCTV with a timestamp (a log line, a span) is useful in court only if you also have the **numbered receipt** stored in the uniqueness table or the billed-fact log.
+
+Head sampling is a security camera that turns off during the robbery because “1% of minutes is enough.” Cardinality is labeling every grain of rice so the pantry inventory system dies. Continuous profiling is a stethoscope on one engine; it does not replace airspeed (RED) or fuel-tank gauges (USE).
+
+Retain: **RED for work, USE for resources, profiles for stacks, exemplars for the tail, logs for high-cardinality debug, fact logs and unique rows for identity—and never confuse a trace with a commit.**
+
+</MentalModel>
+
+<ArchitectureDiagram title="Derived telemetry beside ledger and billed-fact authority" chart={"flowchart LR\n  CLI[Clients] --> API[Transfer and collector APIs]\n  API --> FENCE[Uniqueness fence]\n  FENCE --> LED[(Authoritative ledger)]\n  API --> FACT[(Billed fact log)]\n  API --> RED[RED metrics]\n  API --> USE[USE host metrics]\n  API --> TR[Trace spans]\n  TR --> EX[p99 exemplars]\n  RED --> TS[(Metrics TSDB)]\n  USE --> TS\n  API --> PROF[Continuous profiler]\n  PROF --> TS\n  FACT -. async debug export .-> LOG[High-card debug log]\n  TS -. campaign_id label blowup .-> CARD[Cardinality crash]\n  TR -. head sampling drop .-> BIAS[Missing tail]\n  FENCE -. reject unstored trace id .-> CLI"}>
+
+**Authoritative state:** TokenX uniqueness `(tenant, transfer_id)` plus ledger rows, and the Ad Click **billed-fact log** until retention ([time-series and append-only storage](/learn/time-series-and-append-only-storage), [Kafka internals](/learn/kafka-internals)). **Derived state:** RED/USE metrics, traces, profiles, dashboards, and debug logs. **Consistency boundary:** a debit is committed only when the unique insert and mutation commit; collector ACK is legal only after billed facts are on the durable log. Telemetry is **at-least-once or sampled** and may lag or drop. Solid edges are the sync admit/commit path and metric/trace/profile scrape. Dashed edges are async debug export, cardinality failure, head-sampling bias (the tail never recorded), and reject of a retry that presented only a trace id. Recovery is rebuild dashboards from facts, keep exemplars for p99, and store the **product** idempotency key—not the trace—in the unique table.
+
+<ArchitectureWalkthrough
+  title="What each signal is allowed to claim"
+  stages={[
+    { name: "Commit", owner: "Ledger plus uniqueness, or billed-fact log", state: "Bytes the product will audit", boundary: "Sync ACK means this store has the record under its durability policy.", failure: "Treat a 200 plus a trace as proof of commit after a crash.", recovery: "Retry the stored (tenant, transfer_id) or click id; traces are optional context." },
+    { name: "RED/USE", owner: "Metrics pipeline / TSDB", state: "Aggregates with bounded labels", boundary: "Good for SLO burn and saturation. Not identity.", failure: "campaign_id as a metric label; paging only on CPU.", recovery: "Low-cardinality RED/USE; put identity in logs or the fact log." },
+    { name: "Trace", owner: "Tracing backend", state: "Sampled span trees plus exemplars", boundary: "Explains one request’s wait. Not linearizable order.", failure: "Head sample 1% and wonder where p99 went; use trace_id as a fence.", recovery: "Tail sample errors and slow traces; attach exemplars; keep the unique row." },
+    { name: "Profile", owner: "Continuous profiler", state: "Statistical stacks per process", boundary: "CPU, alloc, lock inside one box. Not cross-service truth.", failure: "Optimize JSON because the profile is hot while the pool is the wait.", recovery: "Join profile with USE saturation and the exemplar span." }
+  ]}
+/>
+
+</ArchitectureDiagram>
+
+<RealExamples title="TokenX traces a transfer; Ad Click refuses campaign_id labels">
+
+**TokenX.** Propagate `trace_id` on the transfer API for support and p99 exemplars. The **fence** remains `(tenant, transfer_id)` in the same ledger transaction as the debit. A support engineer opens trace T-77 to see 240 ms lock wait; finance still reconstructs the transfer from the ledger, not from Jaeger. Outbox/CDC to analytics is asynchronous; a missing analytics span does not unwind money. If you need to prove isolation or ordering, you write a [consistency testing](/learn/consistency-testing) harness against the store, not a screenshot of a waterfall. Disaster drills in [disaster scenarios](/learn/disaster-scenarios) should assert **ledger recovery**, then confirm that traces for the outage window are **best-effort** (retention 7–30 days illustrative)—the vault outlives the recorder.
+
+**Ad Click Aggregator.** Collectors export RED: ingest rate, error class, batch duration. Brokers and disks get USE: disk utilization, replica fetch saturation, ISR shrink as an **error** on the resource. Continuous profiling on the aggregator finds a hot JSON path. **Do not** put `campaign_id` on the ingest counter. Viral campaign debug uses a **log** sample or a query against the billed-fact log. Windowed dashboard series are derived rollups ([time-series and append-only storage](/learn/time-series-and-append-only-storage)). If metrics and the fact log disagree, the **fact log wins** for invoices; metrics are wrong or lagged.
+
+<FailureScenario
+  title="Pick the observability failure and name the bound"
+  prompt="p99 checkout is on fire, a viral campaign is live, and someone wants cheaper telemetry. Stay inside durability and sampling honesty."
+  choices={[
+    { label: "Head-sample 0.1% of all traces at the load balancer to save the tracing bill", impact: "The p99 bucket is almost never recorded. You optimize p50 from the sample and the SLO keeps burning.", recovery: "Keep errors and slow traces; attach exemplars to histogram buckets; budget a small head sample for baseline." },
+    { label: "Add campaign_id and user_id labels to RED so ‘metrics are the source of truth’", impact: "TSDB cardinality explodes. Invoices still need click ids. You may page on a dead metrics pipeline during the viral spike.", recovery: "Bounded labels on metrics. High-cardinality debug in logs. Billed identity in the fact log." },
+    { label: "Use the incoming trace_id as TokenX idempotency so retries are ‘exactly once’", impact: "A client retry often creates a new trace. Two traces, one user intent, two debits if the unique table is empty.", recovery: "Store (tenant, transfer_id). Trace is correlation, not a fence. Exactly-once is at best effect-once inside that commit." },
+    { label: "Delete billed facts after 24 h because dashboards and traces already show the clicks", impact: "Disputes cannot replay identity. Traces expire. Dashboards are derived and sampled.", recovery: "Retain facts for the finance horizon. Downsample dashboards. Keep traces shorter." }
+  ]}
+/>
+
+</RealExamples>
+
+<InterviewTraps title="Observability slogans that fail at IC6">
+
+- **“We have tracing, so we are linearizable.”** Tracing does not order commits. Clocks skew. Spans drop.
+- **“Metrics are lossless identity.”** Aggregates lose keys. Labels at campaign cardinality melt the TSDB.
+- **“p99 is fine; average latency is 12 ms.”** The tail is the SLO. Head sampling hides it.
+- **“USE is the same as RED.”** RED is work; USE is the engine. CPU 35% with a saturated pool is a USE finding.
+- **“Continuous profiling replaces APM.”** Profiles lack cross-service context and request identity.
+- **“The trace ID is our idempotency key.”** Only if it is stored in the unique table—and you should store the **product** id, because traces churn on retry.
+- **“Logs are the billed-click log.”** Application logs are retention- and sampling-limited debug. Finance needs the append-only fact log.
+- **“Observability gives durability.”** A span in memory is not an fsync. Crash the collector and the un-ACKed batch is gone regardless of OpenTelemetry.
+- **“Exactly-once delivery because we trace every produce.”** Delivery is at-least-once plus an idempotent sink. The trace is not the sink.
+
+</InterviewTraps>
+
+<Tradeoffs title="What you spend to see the tail without lying">
+
+- **Head versus tail sampling:** head is cheap and biased; tail keeps the SLO cases and costs more backend ingest.
+- **Exemplars versus full traces:** exemplars are a few ids per bucket; full traces explain one request end to end but need a budget.
+- **Metric labels versus logs versus fact log:** labels must stay low-cardinality; logs hold debug keys; facts hold invoice identity and cost storage.
+- **RED versus USE versus profiles:** you need all three at different layers; one graph cannot replace the others.
+- **Telemetry retention versus ledger/fact retention:** traces (illustrative 7–30 days) are cheaper to drop than WAL or billed facts.
+- **Scrape interval versus cost and lag:** 15 s is operationally common; 1 s multiplies TSDB write and still is not a commit log.
+
+Correctness of TokenX balances and billed-click identity is not a telemetry knob. Completeness of a debug view is.
+
+</Tradeoffs>
+
+<KnowledgeCheck
+  question="TokenX p99 is 400 ms. You head-sample 1% of traces at admission. Error rate is 0.1%. What did you lose?"
+  options={[
+    "Nothing: 1% of 2,000 /s is 20 traces/s, which is more than enough to reconstruct the ledger",
+    "The tail that defines p99 is under-sampled, so complete traces for the SLO burn are often missing; the ledger is unaffected either way",
+    "Linearizability of debits, because unsampled requests are not ordered",
+    "USE saturation metrics, which can only be computed from traces"
+  ]}
+  correct={1}
+  explanation="Head sampling at admission is biased toward fast requests and under-represents p99. Traces never were the ledger. USE comes from resource metrics. Linearizability is a store property, not a sampling property."
+/>
+
+<KnowledgeCheck
+  question="An engineer adds campaign_id to the Ad Click ingest counter so finance can ‘sum Prometheus for invoices.’ Collectors still ACK after the fact log. What should you do?"
+  options={[
+    "Keep the label: metrics plus ACK-after-log is exactly-once billing",
+    "Remove campaign_id from metric labels; bill from the fact log; use logs or the log itself for high-cardinality debug",
+    "Drop the fact log after 24 hours because the new time series are the authority",
+    "Replace RED with continuous profiling so cardinality is no longer an issue"
+  ]}
+  correct={1}
+  explanation="Campaign identity in a metric label explodes cardinality and still is not an invoiceable fact. The billed-fact log remains authoritative. Profiles do not carry click ids."
+/>
+
+<ScenarioCheck
+  scenario="A candidate says: TokenX retries with a new OpenTelemetry trace each time, uses that trace_id as the unique key, head-samples 0.1%, and treats Jaeger as proof two debits were serializable. Ad Click exports campaign_id and user_id on every RED counter, keeps traces 90 days, and deletes billed facts after 48 hours ‘because observability already has the clicks.’"
+  question="What design is defensible?"
+  options={[
+    { label: "Ship it: traces plus metrics are a second ledger and a cheaper warehouse.", feedback: "Telemetry is derived, sampled, and not a uniqueness boundary. Deleting facts destroys invoices." },
+    { label: "Fence TokenX on (tenant, transfer_id) stored with the debit. Keep traces as correlation with tail sampling and p99 exemplars. Bound metric labels. Retain billed facts for finance; downsample dashboards and expire traces sooner.", feedback: "Authority stays in the unique table and fact log. Observability explains the tail without pretending to be durable identity." },
+    { label: "Use the trace as the fence only when sampling is 100%, which gives linearizability and exactly-once.", feedback: "100% tracing is still not linearizability, still not a substitute for a unique constraint, and retries may still mint new traces." },
+    { label: "Move billed identity into USE disk metrics, because utilization cannot explode cardinality.", feedback: "USE has no click ids. Disk utilization is a resource signal, not an invoice." }
+  ]}
+  correct={1}
+  explanation="Observability does not create durability. A trace ID is not an idempotency key unless you stored it—and you should store the product id. Cardinality belongs in logs and fact logs, not metric labels."
+/>
+
+<InterviewAnswer>
+
+“I split signals: RED for user work—rate, errors, duration histograms—and USE for resources—utilization, saturation, errors on CPU, pools, disks, partitions. Profiles tell me which stacks burn CPU or hold locks on one box. Traces explain one request; they are sampled and clock-skewed, so I do not call them linearizable and I do not use a trace id as a TokenX fence. The fence is (tenant, transfer_id) in the uniqueness table with the debit. For p99 I attach exemplars and I tail-sample errors and slow traces, because a 1% head sample hides the SLO. High-cardinality fields like campaign_id go in logs or the billed-fact log, never as metric labels, or the TSDB dies and still cannot invoice. Ads: ACK after the fact log; dashboards are derived. Observability is a derived view. It does not fsync money, it does not replace consistency tests, and if traces and the ledger disagree, the ledger wins.”
+
+</InterviewAnswer>
