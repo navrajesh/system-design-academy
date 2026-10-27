@@ -157,7 +157,7 @@ The **active and sealed log segments** are the authoritative partition bytes unt
 
 </RealExamples>
 
-<InterviewTraps title="Internals slogans that fail at IC6">
+<InterviewTraps title="Internals slogans that fail in staff+ interviews">
 
 1. **“Followers are synchronously mirrored, so LEO equals HW.”** Replica fetch is pull and can lag. Consumers are gated on the high-watermark.
 2. **“In-sync means fsynced.”** ISR is a fetch-lag roster plus operator flush policy. Page cache is an operational durability assumption.

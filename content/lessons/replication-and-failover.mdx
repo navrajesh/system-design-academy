@@ -123,7 +123,7 @@ The leader is the write authority only while its current epoch is valid and curr
 6. **“Send it to the leader for freshness.”** A deposed or partitioned leader can serve an old prefix unless the read proves current authority and apply.
 7. **“Replication is our backup.”** Replication propagates logical corruption and deletion. Tested, isolated recovery points are still necessary.
 
-A strong IC6 answer includes the ambiguity window: after a leader dies, clients retry with stable idempotency keys while operators reconcile commits near the last durable position.
+A strong staff+ answer includes the ambiguity window: after a leader dies, clients retry with stable idempotency keys while operators reconcile commits near the last durable position.
 
 </InterviewTraps>
 

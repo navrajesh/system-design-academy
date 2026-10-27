@@ -127,7 +127,7 @@ Retain: **one named authority per phase, outbox or CDC as the dual-write owner, 
 
 </RealExamples>
 
-<InterviewTraps title="Migration slogans that fail at IC6">
+<InterviewTraps title="Migration slogans that fail in staff+ interviews">
 
 - **“Dual writes keep both stores in sync.”** Not without an owner. Two commits can split. Name outbox/CDC or fail closed and reconcile.
 - **“Shadow traffic means we already cut over.”** Shadow compares. Serving or ACKing from the candidate promotes it without a gate.

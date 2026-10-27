@@ -1,10 +1,10 @@
 # Phase 2 — Architecture Reference Library
 
-**Status:** Phase 2A in progress on `feat/phase-2a-technology-landscape`. This slice is Storage & Data only. It does **not** complete all seven landscapes, TokenX overlay, or the remaining named failures.
+**Status:** Phase 2A is merged to local `main`. Phase 2B (remaining six landscapes, extra matrices, named failures, staff+ interview phrasing in the learner UI) is in progress on `feat/phase-2b-technology-landscapes`. It is **not** merged. Curriculum remains **64/64**. Library state must not be written to `sda:completed-lessons:v1`.
 
-Phase 2A ships `/reference` hub, layered explorer, PostgreSQL / Redis / DynamoDB deep dives, two storage matrices, Module 1 summary cards, and a database-failover walkthrough. Curriculum remains **64/64**. Library state must not be written to `sda:completed-lessons:v1`.
+Phase 2A shipped `/reference` hub, layered explorer, PostgreSQL / Redis / DynamoDB deep dives, two storage matrices, Module 1 summary cards, and a database-failover walkthrough. Phase 2B adds the other six module landscapes and additional walkthroughs on the same explorer.
 
-This document remains the authoritative full-product plan. Acceptance criteria below for the **full** library are still future work.
+This document remains the authoritative full-product plan. TokenX overlay polish and later pattern-catalog follow-ons can still land after Phase 2B product review.
 
 This document is the authoritative Phase 2 architecture plan. It preserves the original Architecture Reference Library and scopes a first feature inside it: **Technology Landscape & Architecture Reference**.
 
@@ -29,7 +29,7 @@ Later library entries (pattern catalog, failure-mode index, interview diagram pa
 
 A navigable map of production technologies, where they sit in a full-stack system, which properties they provide, and which existing lessons teach the underlying mechanisms.
 
-Intended learner outcome: an IC6 candidate can point at a hop in a request path, name the technology class, state the consistency/durability/ordering/failure assumptions, and defend an alternative without inventing a new lesson.
+Intended learner outcome: a staff+ candidate can point at a hop in a request path, name the technology class, state the consistency/durability/ordering/failure assumptions, and defend an alternative without inventing a new lesson.
 
 ### Non-goals for this feature
 
@@ -113,7 +113,7 @@ Library pages reuse existing interactions where they already change reasoning:
 - `ExecutionTimeline` — sequencing, timeouts, and epoch/fencing
 - `FailureScenario` — timeout vs 429 vs UNKNOWN, split brain, region loss
 - `InteractiveCalculation` — rates, replication bytes, queueing, cost per operation
-- `ScenarioCheck` — IC6 distractors (optional on reference pages; mandatory only on curriculum lessons)
+- `ScenarioCheck` — interview distractors (optional on reference pages; mandatory only on curriculum lessons)
 
 Suggested walkthroughs for the first implementation:
 
@@ -123,7 +123,7 @@ Suggested walkthroughs for the first implementation:
 4. **Ad Click aggregator:** ingest, dedupe, window, hot key, replay
 5. **Overload:** queue bound, shed, retry amplification, bulkhead isolation
 
-### 5. IC6 technology selection and tradeoff guides
+### 5. Interview technology selection and tradeoff guides
 
 Short decision guides (not full lessons) that answer “which class, under which assumption?” Each guide must include:
 
@@ -203,7 +203,7 @@ Do not start this sequence until Phase 1 remaining modules (5 and 7) are complet
 3. **Canonical full-stack diagram** — authoritative vs derived, async edges, one failure/recovery path. Independent technical review before additional landscapes.
 4. **Module landscapes 1, 2, 3, 4, 6** — hardened modules first, exclusive file ownership per landscape, coordinator-owned index.
 5. **Request and failure walkthroughs** — read, write, TokenX, Ad Click, overload. Reuse existing interaction components.
-6. **Comparison matrices and IC6 selection guides** — property-first tables; TokenX overlay last among content so ledger terminals stay consistent with Module 1/6 audit findings.
+6. **Comparison matrices and interview selection guides** — property-first tables; TokenX overlay last among content so ledger terminals stay consistent with Module 1/6 audit findings.
 7. **Module 5 and 7 landscapes** — fill as those lessons harden; planned-slug handling until then.
 8. **Shell integration** — dashboard/reference entry, search inclusion for library text, no change to lesson slugs or `sda:completed-lessons:v1` unless a migration is included. Progress for library pages is optional and must not overwrite lesson completion keys.
 9. **Validation and browser QA** — full `npm test`, lint, typecheck, `validate:content`, production build, plus keyboard and mobile checks of maps, matrices, and walkthroughs.
@@ -220,7 +220,7 @@ The feature is complete only when all of the following hold:
 - Seven module landscapes exist (Module 5/7 may mark planned lessons without fabricating content).
 - At least one comparison matrix per of: storage engines, cache/replica/read-path, log vs consensus write path.
 - Interactive read-path, write-path, and at least one failure walkthrough ship with accessible controls.
-- IC6 selection guides state assumptions and link to hardened lessons by slug.
+- interview selection guides state assumptions and link to hardened lessons by slug.
 - TokenX overlay preserves exclusive transfer terminals and does not auto-replay UNKNOWN request-only outcomes.
 - New library components are reused by more than one page or are documented as single-purpose with a removal plan.
 - Content remains repository-owned MDX (or equivalent Git content); no user-authored MDX evaluation; no database or auth requirement.

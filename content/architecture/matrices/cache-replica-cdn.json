@@ -2,6 +2,7 @@
   "id": "cache-replica-cdn",
   "title": "Redis cache vs DB read replica vs CDN caching",
   "description": "Three derived-read options. None of them is the TokenX ledger. Freshness, key, and failure behavior decide which hop is legal.",
+  "landscape": "storage",
   "relatedSlugs": ["caching-patterns-and-invalidation", "replication-and-failover", "cdns-and-edge-architecture"],
   "columns": [
     { "id": "workload", "label": "Workload" },

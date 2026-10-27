@@ -1,0 +1,95 @@
+{
+  "id": "kafka-consumer-lag",
+  "title": "Kafka consumer lag",
+  "description": "Walk lag from a healthy group through detection, in-flight dual owners, and catch-up. A lagging consumer is not a candidate to promote as leader of money. This path is not a silent cutover of the ledger.",
+  "relatedSlugs": ["consumer-groups-and-rebalancing", "kafka-delivery-and-failure", "kafka-internals", "retries-dead-letters-and-replay", "graceful-degradation"],
+  "assumptions": [
+    "Kafka planning default: RF=3, acks=all, min.insync.replicas=2, producer idempotence, ISR-only leader election, finite retention. HW is the exclusive ISR read gate; LEO can sit ahead of HW.",
+    "TokenX HTTP ACK is the ledger commit plus outbox in the same database transaction. Group tokenx-derived consumes the outbox topic for notify/analytics with unique event_id at the sink, then commits offsets. Those sinks are derived. They must not become a second writer of spendable balances. TokenX money is the ledger, not the log.",
+    "Ad Click billed ingest is a separate fail-open path: collectors keep accepting unique click_id appends if the billed log is healthy; derived analytics consumers may lag.",
+    "Illustrative partition: produce 8,000 records/s at 400 B; applied offset 2,400,000 behind HW. Catch-up needs leftover consume rate. Observability is derived.",
+    "At-least-once consumption. Dual-owner windows during rebalance are expected. Sinks are idempotent. DLQ has an owner. Kafka transactions, if used, cover produce-plus-offset in that producer session only. Rebalance does not preserve in-flight processing."
+  ],
+  "steps": [
+    {
+      "id": "normal",
+      "title": "Healthy group near the watermark",
+      "timeline": "t0: generation N members heartbeat and poll. Produce 8,000 records/s. Applied lag is seconds of records, not hours. HW trails leader LEO by the ISR catch-up gap. TokenX HTTP ACKs after the ledger commit; analytics produce is outbox/async.",
+      "inFlight": "Small batches fetched, applied, then offset-committed. No revoked partitions. Producer idempotence sequences retries of the same produce batch.",
+      "consistency": "Partition append order. Consumers fetch offsets strictly below HW. Event-time on payloads can still go backward; windows are job policy, not broker order.",
+      "durability": "Acknowledged produces sit on the ISR under acks=all and minISR=2. Group offsets are progress, not ledger bytes. Ledger rows are durable on the primary's own fsync policy.",
+      "userVisible": "p99 is produce+ISR plus sink apply. Dashboards track lag but users of TokenX see ledger latency, not consumer lag.",
+      "recovery": "Not in this step. Keep HW, applied offset, heartbeat, and poll-interval metrics as detection inputs."
+    },
+    {
+      "id": "detection",
+      "title": "Lag climbs on a named partition",
+      "timeline": "t1: applied lag on partition 3 grows at about the produce rate. 2,400,000 records behind HW is 300 s of age if produce stopped—and produce has not stopped. Heartbeats from settlement-2 may still arrive.",
+      "inFlight": "The owner may be stuck in a long ledger call (poll interval at risk) or genuinely slow. A dead static member would stop heartbeats and hold the assignment until session.timeout.ms.",
+      "consistency": "There is still one assigned owner for fetch. The sink may already be ahead of the committed offset if apply succeeded and the offset commit did not.",
+      "durability": "Log records remain on the ISR until retention. Lag does not delete them. It also does not create ledger rows.",
+      "userVisible": "TokenX settlement notifications delay. Ad Click operator dashboards show delay. Billed ingest can still 2xx if the collector path is healthy (fail-open ingest).",
+      "recovery": "Page on partition lag versus HW, not on member count. Distinguish stuck poll, dead static member, sink lock, and produce spike. Do not declare broker leadership change from consumer lag alone."
+    },
+    {
+      "id": "in-flight",
+      "title": "Fetched, uncommitted, maybe dual-owned",
+      "timeline": "t1–t2: if max.poll.interval.ms fires or an eager rebalance starts, the coordinator issues a new generation. The successor fetches from the last committed offset while the predecessor may still finish a sink write.",
+      "inFlight": "Three classes: (1) fetched, not applied; (2) applied in the sink, offset not committed; (3) both owners applying the same keys during the revoke overlap.",
+      "consistency": "Exclusive fetch assignment is not a mutex on the ledger. Two processes can touch the same transfer_id until uniqueness fences them. Append order is still per partition; it is not event-time.",
+      "durability": "Class (2) is already money (or a billed click) if the sink transaction committed. Class (1) will replay. Offsets above HW were never consumer-visible.",
+      "userVisible": "Duplicate side effects if the sink lacks a unique key. With uniqueness, retries look like no-ops or 409-as-success.",
+      "recovery": "Stop fetching on revoke. Commit offsets only after durable sink success. Keep the unique event_id. Do not skip TokenX records to drain lag."
+    },
+    {
+      "id": "promotion",
+      "title": "Cannot promote a lagging consumer as leader of money",
+      "timeline": "t2: operators want a 'leader' for the stuck partition. The group may assign a successor. That is fetch ownership for generation N+1, not election of a TokenX writer.",
+      "inFlight": "The successor starts at the committed offset. It does not inherit in-flight HTTP calls. A lagging member still applying must be fenced by sink uniqueness or a stored generation, not by hope.",
+      "consistency": "The ledger remains the money authority. Kafka HW/LEO describe the log prefix, not spendable balances. Assigning a caught-up consumer does not make TokenX reads linearizable. Unclean broker election (non-ISR) is a different, forbidden promotion on the log itself.",
+      "durability": "Consumer catch-up cannot mint WAL the ISR never had. It also cannot erase a ledger row that already committed. KIP-101 truncates diverged brokers, not consumers.",
+      "userVisible": "Assigning a new member does not hide UNKNOWN in-flight settlements. Users may still see delayed notifications.",
+      "recovery": "Refuse to treat the consumer as a ledger primary. Fence dual owners at the sink. If the broker leader is the actual problem, elect an ISR member and keep unclean.leader.election.enable=false."
+    },
+    {
+      "id": "client-retry",
+      "title": "Client and consumer retries",
+      "timeline": "t3: TokenX clients retry the original transfer_id after backoff. Consumers redeliver uncommitted offsets. Mesh/app retries must not mint a new id.",
+      "inFlight": "If the sink has the unique key, the retry is a no-op returning the stored result. If it does not, the retry commits the authoritative row. Producer timeouts on the outbox relay are UNKNOWN produces, not a second command.",
+      "consistency": "Read-your-writes for money goes to the ledger. A lagging analytics consumer must not be used to authorize a debit.",
+      "durability": "Retry is durable only when the sink acknowledges. Kafka offset commit after that is group progress. Retention still bounds replay.",
+      "userVisible": "User may see success on retry, a second timeout, or a delayed receipt. Duplicate emails possible; duplicate spend is not if uniqueness held.",
+      "recovery": "Idempotent sink plus the same business id. Proven 429/503 may retry inside a cap. Timeout is lookup-or-same-id, never a new settlement command. Poison goes to an owned DLQ."
+    },
+    {
+      "id": "consistency",
+      "title": "What still matches after lag",
+      "timeline": "t3–t4: dashboards and stream windows sit behind HW. The ledger does not. Event-time windows on a lagging job close late or wait on the job watermark, which is not replica HW.",
+      "inFlight": "Changelog restore for stateful tasks is assignment-to-ready cost (example: 4 GB at 80 MB/s ≈ 50 s). Serving from empty local state is a derived lie.",
+      "consistency": "At-least-once plus unique keys. Session monotonicity on a derived dashboard is not promised. TokenX conservation was never in the consumer.",
+      "durability": "Rebuilding a state store from a changelog does not restore log segments retention already deleted. It does not restore money.",
+      "userVisible": "Stale campaign totals, late notifications, missing 'settled' badges that the ledger already has.",
+      "recovery": "Label derived views delayed. Fail-closed TokenX reads of spendable balance go to the ledger. Fail-open ads ingest continues; do not pause billed POST because an analytics group lagged."
+    },
+    {
+      "id": "recovery",
+      "title": "Drain lag with leftover rate",
+      "timeline": "t4–t5: if apply is 12,000 records/s against 8,000 produce, headroom is 4,000/s and 2,400,000 records take 600 s (10 min), ignoring rebalance pauses. If apply equals produce, lag never drains.",
+      "inFlight": "Catch-up load hits the sink. Sharing the TokenX ledger pool with analytics apply can stall money; bulkhead them.",
+      "consistency": "Replay from the last committed offset. Duplicates no-op on the unique key. Do not LWW balances from a stream aggregate.",
+      "durability": "Replay only while retention still has the bytes. Compacted topics have already dropped intermediates. DLQ replay is a second at-least-once procedure with an owner.",
+      "userVisible": "Degraded notification SLO until catch-up. TokenX debit API should not shed because an analytics partition is behind.",
+      "recovery": "Raise leftover consume rate (faster sink, more partitions with an explicit remapping, or pause non-critical produce). Cooperative rebalance reduces pause time; it does not retract in-flight writes. Extra consumers above partition count sit idle."
+    },
+    {
+      "id": "user-visible",
+      "title": "What users should be told",
+      "timeline": "Whole incident: detection (often tens of seconds of lag SLO) plus catch-up (minutes in the 10 min example) plus any rebalance/restore. Not a single RTT. RPO for money is the ledger's, not the consumer's applied offset.",
+      "inFlight": "Some settlements already committed in the ledger with delayed notify. Some UNKNOWN HTTP calls still need idempotent lookup. Ads clicks may have been billed while dashboards lagged.",
+      "consistency": "After recovery, TokenX authority is still the ledger. Disputes are UNKNOWN until the uniqueness row is read there. Derived dashboards catch up to HW, then still trail event-time policy.",
+      "durability": "If retention expired during a multi-day lag, those log bytes are gone. That is not proof the ledger lost money, and not a license to invent clicks.",
+      "userVisible": "Status: notifications delayed; analytics delayed; TokenX writes fail-closed if the ledger is the sick hop. Do not tell customers that catching up a consumer hid all loss or moved money.",
+      "recovery": "Reconcile UNKNOWN with the uniqueness table. DLQ replay under an owner. Compensation is a business transaction, not a consumer 'promotion'."
+    }
+  ]
+}

@@ -73,6 +73,7 @@ export type ArchitectureCatalog = {
   deepDives: { id: string; title: string; href: string; landscape: string }[];
   explorerHref: string;
   failureHref: string;
+  failures?: { id: string; href: string }[];
   requiredRelatedSlugs: string[];
 };
 
@@ -104,6 +105,7 @@ export type TechnologyMatrixData = {
   id: string;
   title: string;
   description: string;
+  landscape?: string;
   relatedSlugs: string[];
   columns: { id: MatrixColumnId; label: string }[];
   rows: { id: string; product: string; cells: Record<MatrixColumnId, string> }[];
@@ -129,6 +131,8 @@ export type DatabaseFailoverWalkthrough = {
   assumptions: string[];
   steps: FailoverStep[];
 };
+
+export type FailureWalkthrough = DatabaseFailoverWalkthrough;
 
 export type TechnologySummary = {
   id: string;

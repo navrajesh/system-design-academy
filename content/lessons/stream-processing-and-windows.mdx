@@ -40,7 +40,7 @@ Local **state stores** and compacted **changelog** topics are derived. They spee
 - **Ingestion time** is when the platform durably accepted the record. With `LogAppendTime`, that is approximately broker append time. With `CreateTime`, it is the producer wall clock copied into the broker timestamp—still not a sorted event-time log.
 - **Processing time** is the job’s wall clock when it happens to run. Pause the workers and processing-time windows stall; event-time windows do not, because assignment uses the payload.
 
-A consumer that reads offsets `n`, `n+1`, `n+2` sees append order. Event-time values on those records can go backward. Window assignment uses event time. Replay, lag, and changelog restore use offsets. Dedup uses `click_id` (or `transfer_id`). Mixing those identities is the usual IC6 failure.
+A consumer that reads offsets `n`, `n+1`, `n+2` sees append order. Event-time values on those records can go backward. Window assignment uses event time. Replay, lag, and changelog restore use offsets. Dedup uses `click_id` (or `transfer_id`). Mixing those identities is the usual staff+ failure.
 
 ### Window types and name alignment
 
@@ -154,7 +154,7 @@ The **source topic log** is authoritative for records until time or size retenti
 
 </RealExamples>
 
-<InterviewTraps title="Window slogans that fail at IC6">
+<InterviewTraps title="Window slogans that fail in staff+ interviews">
 
 1. **“Kafka sorts by event time.”** It appends. Event time can run backward while offsets increase. See the [ordering lesson](/learn/ordering-and-event-keys).
 2. **“The watermark is the broker high-watermark.”** HW is ISR-covered offsets. A stream watermark is job event-time policy.

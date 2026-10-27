@@ -1,0 +1,56 @@
+---
+kind: landscape
+id: kafka-fault-tolerance
+title: "Kafka & Fault Tolerance landscape"
+description: "Where Module 3 log products sit on a production path, which state they own, and which lessons teach delivery, internals, consumers, retries, windows, and degradation."
+landscape: kafka-fault-tolerance
+relatedSlugs:
+  - kafka-delivery-and-failure
+  - kafka-internals
+  - consumer-groups-and-rebalancing
+  - retries-dead-letters-and-replay
+  - stream-processing-and-windows
+  - graceful-degradation
+---
+
+This landscape is a **catalog of log and recovery classes**, not a 65th lesson. Kafka is the default partitioned log after a primary commit. Pulsar-class segmented logs, Kinesis-class managed shards, and a database outbox with **no** log product are alternatives on the matrix below. RabbitMQ-class queues and SQS-class visibility timeouts are **different durability models**: competing-consumer queues, not offset-addressed replay logs.
+
+Authoritative vs derived:
+
+- **Authoritative for TokenX money:** the ledger plus uniqueness of `(tenant, transfer_id)`. The Kafka topic is **not** the money.
+- **Authoritative for billed Ad Click facts:** the billed-fact log after a unique `click_id` append. Ingest may **fail-open** when derived analytics produce lags; TokenX **fail-closes** when the ledger cannot prove a debit.
+- **Authoritative for log records until retention:** the partition log under the named envelope (RF, acks, ISR, election, retention).
+- **Derived:** consumer-group offsets, stream state stores and compacted changelogs, DLQ copies, dashboards, notification outboxes, observability.
+
+Synchronous edges wait (produce acknowledgement, sink commit). Asynchronous edges (outbox relay, consumers, telemetry) return before the sink commits. Broker leadership change, consumer lag, and DLQ replay are named protocols. None of them is a silent cutover of the ledger.
+
+### Durability envelope and internals
+
+Planning default for a Kafka-class fact log: **RF=3**, **`acks=all`** (wait for every replica **currently in the ISR**, not every configured replica), **`min.insync.replicas=2`**, producer idempotence, **ISR-only leader election**. That envelope survives **one in-sync broker loss**. It does not survive correlated ISR disk/power loss, `acks=1`, unclean election, or history older than retention.
+
+**Log-end offset (LEO)** is how far a replica has written locally. **High-watermark (HW)** is the exclusive prefix every **current ISR** member has; consumers fetch offsets **strictly below** HW. On clean failover the controller elects an ISR member that **keeps its log**. Diverged former leaders truncate a suffix using **leader-epoch end offsets (KIP-101)**, not a blind rewind to the old HW. Unclean election of a non-ISR replica can drop offsets producers already treated as acknowledged.
+
+A partition preserves **broker append order**. That is **not** event-time order and not causal order unless a single producer serializes on that key and waits for acknowledgements. Stream windows, watermarks, and lateness are **job policy** on the consumer, not broker features. Do not confuse the replica HW with an event-time watermark.
+
+### Outbox, DLQ, sinks
+
+Cross-store work uses an **outbox in the same database transaction as the business row**, then an async produce. Dual-write (commit money, then `produce`) can lose either side on a crash. Consumer offsets are **group progress**, not proof the sink committed. Apply first, then commit offsets. Sinks must be **idempotent** (`event_id` / `click_id` / `transfer_id` in the same local transaction) or fenced with a generation.
+
+A **dead-letter topic is another log**, not a trash can. It needs original topic/partition/offset, exception class, an **owner**, and an age SLO. Replay is at-least-once while retention still holds the bytes. TokenX must not auto-replay an UNKNOWN settlement into the ledger; reconcile against uniqueness. Ad Click may DLQ a malformed click by `click_id` without stalling other campaigns; a campaign-config stream cannot skip a required event.
+
+RabbitMQ (durable queue + persistent message + publisher confirms, or Raft quorum queues) **acks then forgets** unless you added a stream. SQS **visibility timeout** hides a message; standard SQS is unordered at-least-once; FIFO dedup is a **queue-window** boundary (commonly five minutes for identical ids), not TokenX conservation. Neither is Kafka ISR + HW.
+
+### What fails independently
+
+Broker disk, partition leader, controller/metadata, consumer heartbeat, `max.poll.interval.ms`, sink database, and mesh retries fail on **different clocks**. Consumer lag is HW (or LEO) minus **applied** offset, with leftover consume rate as the only catch-up fuel. You **cannot promote a lagging consumer as leader of money**. See the [consumer lag walkthrough](/reference/failures/kafka-consumer-lag).
+
+TokenX **fail-closed:** reject the debit if the ledger, uniqueness store, or produce-of-settlement-command cannot be proven. Ad Click **fail-open ingest:** keep accepting billed clicks; sample or skip derived analytics produce when that cluster is unhealthy. Completeness of the dashboard loses; uniqueness of `click_id` on the billed log does not.
+
+<MermaidDiagram
+  title="Ledger authority, Kafka log envelope, derived offsets and DLQ"
+  chart={"flowchart LR\n  APP[App] -->|same TX| LED[(Ledger money)]\n  LED -->|outbox async| P[Idempotent producer]\n  P -->|acks=all minISR=2| L[Partition leader]\n  L -->|ISR fetch| F[Followers]\n  L --> LOG[(Log until retention)]\n  LOG -->|append order| C[Consumer group]\n  C -->|idempotent apply| SINK[(Sink)]\n  C --> DLQ[(Owned DLQ)]\n  C -.-> OFF[(Offsets derived)]"}
+/>
+
+Start with the [layered explorer](/reference/architecture), the Kafka vs Pulsar-class vs Kinesis-class vs outbox matrix on this page, and the [consumer lag walkthrough](/reference/failures/kafka-consumer-lag).
+
+Mechanism lessons: <LessonCrossLink slug="kafka-delivery-and-failure" />, <LessonCrossLink slug="kafka-internals" />, <LessonCrossLink slug="consumer-groups-and-rebalancing" />, <LessonCrossLink slug="retries-dead-letters-and-replay" />, <LessonCrossLink slug="stream-processing-and-windows" />, <LessonCrossLink slug="graceful-degradation" />. Outbox in the same commit: <LessonCrossLink slug="transactions-across-boundaries" />.

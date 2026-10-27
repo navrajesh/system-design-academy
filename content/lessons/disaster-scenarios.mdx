@@ -154,7 +154,7 @@ The source partition log is authoritative for record bytes until retention or co
 
 </RealExamples>
 
-<InterviewTraps title="DR slogans that fail at IC6">
+<InterviewTraps title="DR slogans that fail in staff+ interviews">
 
 1. **“acks=all minISR=2 RF=3 means we cannot lose acknowledged data.”** It means you survive one in-sync broker, not whole-ISR correlation, not retention, not delete-topic.
 2. **“We restored KRaft, so the messages are back.”** Metadata is not the fact log.

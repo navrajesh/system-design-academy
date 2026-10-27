@@ -1,0 +1,98 @@
+{
+  "id": "overload",
+  "title": "Overload, queues, and retry amplification",
+  "description": "Walk a latency collapse into admission control. Queues convert load to delay. Unbounded retries are the second outage.",
+  "relatedSlugs": [
+    "backpressure-and-overload",
+    "rate-limiting",
+    "tail-latency-control",
+    "graceful-degradation"
+  ],
+  "assumptions": [
+    "Primary and app have finite concurrency. Excess wait is a queue, even if you did not name it.",
+    "429 with Retry-After is a proven signal. Timeout is UNKNOWN.",
+    "TokenX fail closed under overload; ads may sample."
+  ],
+  "steps": [
+    {
+      "id": "normal",
+      "title": "Healthy concurrency",
+      "timeline": "t0: utilization 60–70%. Queue wait small vs service time.",
+      "inFlight": "Bounded pool. Timeouts >> expected service.",
+      "consistency": "Unchanged.",
+      "durability": "Unchanged.",
+      "userVisible": "SLO green.",
+      "recovery": "Watch utilization, queue depth, and timeout rate separately."
+    },
+    {
+      "id": "detection",
+      "title": "Detect overload",
+      "timeline": "t1: arrival rate exceeds service rate. Queue depth grows. p99 crosses SLO.",
+      "inFlight": "Pool checkout wait dominates.",
+      "consistency": "Overload does not change isolation level — it changes completion.",
+      "durability": "In-flight commits still on the primary path if they get a connection.",
+      "userVisible": "Slow pages, then timeouts.",
+      "recovery": "Do not only add replicas without admission — that can amplify writes."
+    },
+    {
+      "id": "in-flight",
+      "title": "In-flight timeout",
+      "timeline": "t1–t2: callers hit timeout while work continues on the server.",
+      "inFlight": "Server may still commit. Client sees UNKNOWN.",
+      "consistency": "Retries without keys double-apply.",
+      "durability": "Same as any UNKNOWN write.",
+      "userVisible": "Errors plus duplicate side effects if retried blindly.",
+      "recovery": "Cancel where you can; still treat as UNKNOWN."
+    },
+    {
+      "id": "promotion",
+      "title": "Admission, not promotion",
+      "timeline": "t2: shed load. 429 or drop. Do not promote a replica to ‘absorb writes.’",
+      "inFlight": "Rejected requests never reached the uniqueness store.",
+      "consistency": "Shed reads may be OK if derived. Shed TokenX writes is fail closed — correct.",
+      "durability": "No commit for 429.",
+      "userVisible": "Retry-After. Ads may degrade windows.",
+      "recovery": "Bulkheads: isolate the hot endpoint."
+    },
+    {
+      "id": "client-retry",
+      "title": "Retry amplification",
+      "timeline": "t2–t3: clients retry immediately. Effective arrival rate multiplies.",
+      "inFlight": "Each logical user action becomes N server attempts.",
+      "consistency": "Idempotency still required.",
+      "durability": "Unchanged.",
+      "userVisible": "Outage deepens. 429 storm.",
+      "recovery": "Honor Retry-After, jitter, cap attempts, hedging only for safe reads."
+    },
+    {
+      "id": "consistency",
+      "title": "Degradation policy",
+      "timeline": "t3: choose what remains correct.",
+      "inFlight": "Read-only mode, cached catalogs, drop ads windows, keep ledger closed.",
+      "consistency": "Stale catalog is allowed only if named. Stale balances are not TokenX settlement.",
+      "durability": "Ledger refuses rather than guess.",
+      "userVisible": "Partial product: browse yes, pay no — if that is the policy.",
+      "recovery": "Feature flags over ‘best effort money.’"
+    },
+    {
+      "id": "recovery",
+      "title": "Drain queues",
+      "timeline": "t4: arrival drops or capacity rises. Drain depth / extra-capacity with units.",
+      "inFlight": "Oldest waiters complete or time out.",
+      "consistency": "Replay only idempotent work.",
+      "durability": "No catch-up magic for timed-out UNKNOWN writes except keyed retry.",
+      "userVisible": "Latency returns from the front of the queue first if unfair; name scheduling.",
+      "recovery": "Autoscale is slow relative to retry storms — admission first."
+    },
+    {
+      "id": "user-visible",
+      "title": "User-visible outcome",
+      "timeline": "End: SLO burn, some 429, some UNKNOWN, no silent double charge if keys existed.",
+      "inFlight": "Support queue for UNKNOWN money.",
+      "consistency": "Policy held or you have an incident.",
+      "durability": "Primary intact unless you also hit disk/CPU death.",
+      "userVisible": "Honest errors beat wrong 200s.",
+      "recovery": "Load test the retry policy, not only the happy QPS."
+    }
+  ]
+}

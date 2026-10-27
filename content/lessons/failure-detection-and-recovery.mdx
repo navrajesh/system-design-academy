@@ -162,7 +162,7 @@ A **partition leader** for the settlement topic dying is a different death: ISR 
 
 </RealExamples>
 
-<InterviewTraps title="Detection slogans that fail at IC6">
+<InterviewTraps title="Detection slogans that fail in staff+ interviews">
 
 - **“The node is dead; the heartbeat timed out.”** You have suspicion. Ask about pause budgets, network blips, and what the zombie can still touch.
 - **“Lease expiry immediately excludes the old holder.”** Expiry reassigns at the lock or coordinator. The resource excludes a stale token only after it has durably observed a higher epoch. Cross-link [locks](/learn/distributed-locks-and-leases).

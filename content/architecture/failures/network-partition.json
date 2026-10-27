@@ -1,0 +1,95 @@
+{
+  "id": "network-partition",
+  "title": "Network partition",
+  "description": "Walk a 2-of-3 replica cut from detection through fencing and retries. TokenX rejects writes on the isolated minority. Do not last-writer-wins spendable balances. This path is not a silent cutover.",
+  "relatedSlugs": ["cap-and-consistency-models", "consensus-and-leader-election", "dns-and-service-discovery", "tcp-quic-and-connection-lifecycle", "graceful-degradation"],
+  "assumptions": [
+    "TokenX spendable balances sit on a three-replica leader-based store. Majority is 2-of-3: the leader plus either follower. CAP here is an operation-level choice during a partition, not a product logo that permanently picked two letters.",
+    "TokenX debit requires a fenced leader and quorum commit. Isolated minority rejects writes. Last-writer-wins is not a legal merge for balances. Portfolio reads may return labeled stale data if product policy allows.",
+    "Ad Click billed ingest fail-opens only while the billed-fact log is reachable for unique click_id append. Dashboards on the isolated side are derived and stale.",
+    "DNS, mesh, and TCP fail independently of the ledger. Cached DNS can still send clients to the minority for the TTL. TLS 0-RTT is not used for debits.",
+    "Clients retry writes only with the original transfer_id. Timeouts are UNKNOWN, not rollback. Observability is derived."
+  ],
+  "steps": [
+    {
+      "id": "normal",
+      "title": "Healthy 2-of-3 majority",
+      "timeline": "t0: epoch-52 leader. Debits complete after a 2-of-3 commit (leader plus either follower). DNS answers and mesh endpoints point at the writer set. TCP pools are warm.",
+      "inFlight": "In-flight debits wait on quorum ack and client round trip. Notify/SSE/WS frames are async after outbox.",
+      "consistency": "Quorum-committed log is TokenX authority. Replica/portfolio views may lag and must not authorize spend. Linearizable reads need current-authority proof, not 'this hostname used to be leader.'",
+      "durability": "A debit the leader acknowledged waited for 2-of-3. Waiting for all three copies is a stricter choice, not the majority rule.",
+      "userVisible": "p99 is RTT plus quorum. No partition UX.",
+      "recovery": "Not in this step. Keep lease/epoch, replica ack, and DNS TTL on a dashboard."
+    },
+    {
+      "id": "detection",
+      "title": "The cut is visible on heartbeats, not on DNS",
+      "timeline": "t1: leader loses contact with follower B (or B loses the leader). Heartbeats fail after the configured interval (often seconds). DNS still returns both addresses until TTLs expire. Mesh outlier ejection is a separate clock.",
+      "inFlight": "Clients routed to the minority hit timeouts or errors. Majority-side clients may still commit. TCP RSTs are not ledger rollback.",
+      "consistency": "Two views of the world exist. Only a side that can form 2-of-3 may accept TokenX writes. A 1/1/1 split has no majority.",
+      "durability": "Unacknowledged in-flight quorum writes are unknown. Already-acked 2-of-3 commits exist on the majority.",
+      "userVisible": "Errors, spinner timeouts, HTTP 504/UNKNOWN on the sick path. Not a clean merge.",
+      "recovery": "Do not promote on a single probe. Require lease/epoch expiry. Treat DNS as a stale hint. Do not declare the minority a second primary because it still answers pings."
+    },
+    {
+      "id": "in-flight",
+      "title": "In-flight commit impact",
+      "timeline": "t1–t2: statements that were waiting on the isolated replica's ack, or that were in the TCP response path, have no client-visible outcome.",
+      "inFlight": "Three classes: (1) never reached quorum, (2) quorum flushed, client not told, (3) client told OK on the majority while other clients timed out on the minority.",
+      "consistency": "Clients now disagree. Session state on the app is not a source of truth. The minority must not apply class (1) locally and call it a debit.",
+      "durability": "Class (2) is durable on the majority and missing from the isolated replica until catch-up. Class (3) is already money on the majority.",
+      "userVisible": "Retries without transfer_id double-apply if the majority has the row, or fork identity if the client mints a new id.",
+      "recovery": "Treat timeout as UNKNOWN. Look up (tenant, transfer_id) on a majority member. Do not auto-replay unsigned request logs. Do not LWW two balance numbers."
+    },
+    {
+      "id": "promotion",
+      "title": "Fence the minority; do not elect a second money leader",
+      "timeline": "t2: the majority keeps or elects a leader with a new epoch if needed. The isolated replica is fenced: old epoch writes are rejected even if that process still believes it is leader.",
+      "inFlight": "Old-epoch produce/SQL from the minority must fail. Unfenced dual writers are split-brain. A lagging replica is not a TokenX primary. Neither is a lagging Kafka consumer.",
+      "consistency": "After fencing, the majority timeline is TokenX authority. Last-writer-wins of isolated updates into spendable balances is forbidden. CRDT/LWW may exist for user preferences, not for money.",
+      "durability": "Bytes only on the isolated disk and never quorum-committed are not money. Do not copy them forward as committed.",
+      "userVisible": "A window of errors while routers, mesh, and DNS still send some clients to the fenced side. Connection reset, not a seamless swap.",
+      "recovery": "Increment epoch. Routers must require it. Reject minority writes. Do not merge balances. Ads dashboards on the minority stay labeled stale."
+    },
+    {
+      "id": "client-retry",
+      "title": "Client retries toward majority",
+      "timeline": "t3: app retries with the same transfer_id after backoff. Discovery/mesh should fail-closed for TokenX if no healthy quorum endpoint exists.",
+      "inFlight": "If the original debit is on the majority, uniqueness hits and returns the stored receipt. If it is not, the retry commits on the majority. Minority 5xx is not proof of rollback.",
+      "consistency": "Read-your-writes tokens must include epoch. A retry that lands on the isolated replica must not be treated as success.",
+      "durability": "The retry is durable only when the current majority acknowledges under the quorum policy.",
+      "userVisible": "User may see success on retry, a second timeout, or a reject while still partitioned from majority.",
+      "recovery": "Same idempotency key. Cap retries. Mesh must not retry unkeyed POSTs. Ad Click retries keep click_id; fail-open ingest is allowed only to a reachable billed log."
+    },
+    {
+      "id": "consistency",
+      "title": "Per-operation policy while split",
+      "timeline": "t3–t4: majority continues TokenX writes. Isolated side may serve labeled portfolio reads. Caches and CDN POPs on the isolated side still hold pre-cut values.",
+      "inFlight": "Cache-aside hits can return balances the majority already spent, or miss rows it just committed.",
+      "consistency": "CAP during the partition: TokenX debit chooses reject-without-majority (no isolated availability of writes). A labeled portfolio read may choose availability of stale data. That is two operation policies, not 'the product is AP' and not a claim that every read is linearizable.",
+      "durability": "Caches, search, and SSE dashboards are derived. Rebuilding them does not create quorum bytes.",
+      "userVisible": "Stale portfolio, missing receipts on the isolated app, or delayed ads dashboards. Spend from a stale cache is an incident.",
+      "recovery": "Route authorization only through quorum-backed balance state. Invalidate or version-bump cache keys after heal. Do not LWW TokenX balances from the minority."
+    },
+    {
+      "id": "recovery",
+      "title": "Heal the link and catch up",
+      "timeline": "t4–t5: partition heals. Isolated follower catches up on the committed log. Uncommitted divergent entries never become authoritative. DNS/VIP still send stragglers for TTL seconds.",
+      "inFlight": "Catch-up generates replication load. Routing TokenX writes to a catching replica that is not in the majority is unsafe.",
+      "consistency": "Until the third copy is in the ISR/quorum set again, a second fault is a worse outage. 2-of-3 still holds; you are one failure from no majority.",
+      "durability": "RPO for TokenX is last quorum-committed debit. Isolated uncommitted attempts remain UNKNOWN until uniqueness is read on the majority.",
+      "userVisible": "Degraded p99 while replication and caches catch up. Some clients still fail until DNS expires.",
+      "recovery": "Rejoin with epoch fencing. Shorten DNS TTL only as a budget, not as a lock. Replay outbox from committed majority rows. Do not copy minority memory."
+    },
+    {
+      "id": "user-visible",
+      "title": "What users should be told",
+      "timeline": "Whole incident RTO: detection delay + fence + DNS/mesh drain is typically seconds to minutes, not a single RTT. RPO is last 2-of-3 commit, separate from an ACK a minority never had the right to send.",
+      "inFlight": "Some users saw success on the majority, some saw error on the minority, some saw retry success. Support must not promise all three match, and must not promise a merged balance.",
+      "consistency": "After recovery, the ledger is the majority's quorum-committed log. Disputes are UNKNOWN until the uniqueness row is read there.",
+      "durability": "If a client got OK from a process that was already fenced, that ACK was a lie; the honest answer is reject/UNKNOWN, not a silently merged number.",
+      "userVisible": "Status page: TokenX writes unavailable or erroring on one path; no silent balance merge; ads dashboards delayed if they sat on the cut. Do not tell customers the partition hid all loss.",
+      "recovery": "Reconcile UNKNOWN with the uniqueness table and customer receipts. Compensation is a business transaction. Never last-writer-wins spendable balances."
+    }
+  ]
+}

@@ -18,6 +18,7 @@ export type {
   ArchitectureCatalog,
   ArchitectureGraph,
   DatabaseFailoverWalkthrough,
+  FailureWalkthrough,
   FailoverStep,
   GraphEdge,
   GraphLayer,

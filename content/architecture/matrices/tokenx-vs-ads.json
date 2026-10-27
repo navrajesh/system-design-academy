@@ -1,0 +1,75 @@
+{
+  "id": "tokenx-vs-ads",
+  "title": "TokenX ledger vs Ad Click Aggregator",
+  "description": "Fail-closed money versus fail-open high-volume ingest. Do not steal isolation the other way.",
+  "landscape": "composition",
+  "relatedSlugs": [
+    "design-tokenx",
+    "design-an-ad-click-aggregator",
+    "transactions-across-boundaries",
+    "graceful-degradation"
+  ],
+  "columns": [
+    {
+      "id": "workload",
+      "label": "Workload"
+    },
+    {
+      "id": "consistency",
+      "label": "Consistency"
+    },
+    {
+      "id": "latency",
+      "label": "Latency"
+    },
+    {
+      "id": "scaling",
+      "label": "Scaling"
+    },
+    {
+      "id": "failure",
+      "label": "Failure"
+    },
+    {
+      "id": "costOps",
+      "label": "Cost / ops"
+    },
+    {
+      "id": "whenNot",
+      "label": "When not"
+    }
+  ],
+  "rows": [
+    {
+      "id": "tokenx",
+      "product": "TokenX transfer",
+      "cells": {
+        "workload": "Reserve / credit / finalize with exclusive terminals and idempotency keys.",
+        "consistency": "Ledger uniqueness. Cache balances are derived and may lag.",
+        "latency": "Primary round trip. Hedged writes are dangerous without keys.",
+        "scaling": "Partition by account with a named hotspot story. Not a firehose.",
+        "failure": "UNKNOWN timeout: retry same key. Do not infer rollback. Fail closed.",
+        "costOps": "Reconciliation, fencing, audit log. Expensive and required.",
+        "whenNot": "Using Redis as the ledger or ads-style windowed counts for settlement."
+      }
+    },
+    {
+      "id": "ads",
+      "product": "Ad Click Aggregator",
+      "cells": {
+        "workload": "High ingest, dedupe on click_id, windows, derived leaderboards.",
+        "consistency": "At-least-once plus idempotent sink. Windows use event time, not offset order.",
+        "latency": "Queueing delay is allowed. Dashboards are near-real-time, not the invoice.",
+        "scaling": "Partition by click or campaign. Hot keys need isolation.",
+        "failure": "Fail open: shed, sample, or delay windows. DLQ for poison. Not money isolation.",
+        "costOps": "Lag, watermark delay, replay cost.",
+        "whenNot": "Stealing TokenX fail-closed terminals for clicks, or treating a dashboard as billed revenue."
+      }
+    }
+  ],
+  "assumptions": [
+    "TokenX is a curriculum ledger example, not a public chain requirement.",
+    "Ads can lose a window under named overload; money cannot.",
+    "Kafka copies of either product are derived unless the uniqueness store is the log."
+  ]
+}

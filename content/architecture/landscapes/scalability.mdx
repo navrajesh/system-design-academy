@@ -1,0 +1,26 @@
+---
+kind: landscape
+id: scalability
+title: "Scalability landscape"
+description: "Where load balancing, gateways, replicas, partitions, and autoscaling sit on a production path, and which hops actually multiply writes."
+landscape: scalability
+relatedSlugs:
+  - load-balancing-deep-dive
+  - scaling-read-heavy-services
+  - write-scaling
+  - autoscaling-and-capacity-planning
+  - fan-out-architectures
+---
+
+This landscape is a **catalog of scale hops**, not a 65th lesson. The explorer already shows ingress, compute, cache, and primary. Module 2 names which of those hops are **synchronous**, which are **optional**, and which **amplify writes**.
+
+Authoritative vs derived:
+
+- **Authoritative:** the chosen primary (PostgreSQL default, DynamoDB alternative) and any uniquely constrained write path (TokenX ledger terminals).
+- **Derived:** L4/L7 balancer membership, Kubernetes replica counts, Redis, read replicas, CDN, fan-out timelines, autoscaler metrics.
+
+Synchronous edges: client → DNS → balancer → gateway → app → primary (or cache on a read hit). Asynchronous edges: replica apply, outbox, Kafka, autoscaler decisions. Autoscaling does not fence a writer and does not repair split-brain.
+
+Start with the [layered explorer](/reference/architecture), the [LB vs gateway vs Kubernetes](/reference/landscapes/scalability) matrix on this page, and the [overload walkthrough](/reference/failures/overload).
+
+Mechanism lessons: <LessonCrossLink slug="load-balancing-deep-dive" />, <LessonCrossLink slug="scaling-read-heavy-services" />, <LessonCrossLink slug="write-scaling" />, <LessonCrossLink slug="autoscaling-and-capacity-planning" />, <LessonCrossLink slug="fan-out-architectures" />.

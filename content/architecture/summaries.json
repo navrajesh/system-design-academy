@@ -11,7 +11,10 @@
     "failure": "Primary death needs fencing. GTID/binlog position is a timeline; dual writers corrupt replicas.",
     "whenToChoose": "SQL + transactions when the organization already operates MySQL well, or you need a specific MySQL ecosystem feature.",
     "whenNot": "When you needed Dynamo-style item scale or Cassandra multi-master ingest. Failover slogans without fencing still split-brain.",
-    "relatedSlugs": ["relational-vs-nosql-selection", "replication-and-failover"]
+    "relatedSlugs": [
+      "relational-vs-nosql-selection",
+      "replication-and-failover"
+    ]
   },
   {
     "id": "mongodb",
@@ -25,7 +28,10 @@
     "failure": "Replica-set election in seconds. Rollback of w:1 writes is possible. Shard cluster failures are independent per shard.",
     "whenToChoose": "Document model that matches how you read, with replica-set majority writes for durable OLTP.",
     "whenNot": "Multi-document transactions as a default across shards, or treating the cluster as a cache. Not a drop-in for SQL constraints.",
-    "relatedSlugs": ["relational-vs-nosql-selection", "data-modeling-from-access-patterns"]
+    "relatedSlugs": [
+      "relational-vs-nosql-selection",
+      "data-modeling-from-access-patterns"
+    ]
   },
   {
     "id": "cassandra",
@@ -39,7 +45,10 @@
     "failure": "Node loss expected. ALL becomes unavailable. Wrong gc_grace can resurrect deletes.",
     "whenToChoose": "When write availability and pre-modeled query tables beat ad-hoc SQL, and you will staff repair.",
     "whenNot": "TokenX-style constrained multi-row ledgers, small teams, or 'just use QUORUM' as a correctness slogan.",
-    "relatedSlugs": ["relational-vs-nosql-selection", "cap-and-consistency-models"]
+    "relatedSlugs": [
+      "relational-vs-nosql-selection",
+      "cap-and-consistency-models"
+    ]
   },
   {
     "id": "opensearch",
@@ -53,7 +62,10 @@
     "failure": "Yellow/red clusters, split-brain if discovery is wrong, mapping explosions, ingest backlog.",
     "whenToChoose": "Search and log analytics beside a real primary. Reindex is an allowed recovery.",
     "whenNot": "Spendable balances, unique allocation, or any authority that cannot be rebuilt. Never treat _id hits as the ledger.",
-    "relatedSlugs": ["time-series-and-append-only-storage", "caching-patterns-and-invalidation"]
+    "relatedSlugs": [
+      "time-series-and-append-only-storage",
+      "caching-patterns-and-invalidation"
+    ]
   },
   {
     "id": "s3",
@@ -67,6 +79,77 @@
     "failure": "Slow PUT, incomplete multipart, Glacier restore delay, or permission/KMS outages.",
     "whenToChoose": "Large binary objects and backup archives. Pair with a DB for the catalog and authz.",
     "whenNot": "Low-latency item mutations, compare-and-swap ledgers, or listing-as-query. Object storage is not PostgreSQL.",
-    "relatedSlugs": ["object-storage-and-large-files", "backup-restore-and-disaster-recovery"]
+    "relatedSlugs": [
+      "object-storage-and-large-files",
+      "backup-restore-and-disaster-recovery"
+    ]
+  },
+  {
+    "id": "envoy",
+    "title": "Envoy / L7 proxy",
+    "product": "Envoy",
+    "landscape": "scalability",
+    "workload": "L7 proxy for HTTP/gRPC, retries, outlier detection, and mesh data plane.",
+    "consistency": "Retry and timeout policies can duplicate writes. Membership is derived from xDS.",
+    "durability": "Not a store.",
+    "latency": "Extra hop; connection pooling reduces handshake tails.",
+    "failure": "Sidecar/process death blackholes the listener. Retry storms under 5xx.",
+    "whenToChoose": "When you need consistent L7 policy beside app code.",
+    "whenNot": "Auto-retry of non-idempotent TokenX POSTs, or treating the proxy as a ledger.",
+    "relatedSlugs": [
+      "load-balancing-deep-dive",
+      "service-mesh-and-proxies"
+    ]
+  },
+  {
+    "id": "kafka-product",
+    "title": "Apache Kafka",
+    "product": "Kafka",
+    "landscape": "kafka-fault-tolerance",
+    "workload": "Partitioned durable log for pub/sub and replay.",
+    "consistency": "Per-partition order. No global order. ISR defines who may be elected.",
+    "durability": "acks=all + minISR is the produce story you must name. Retention bounds replay.",
+    "latency": "Produce p99 depends on ISR and disk. Consume lag is a different SLO.",
+    "failure": "Controller, disk, ISR shrink, consumer rebalance. Not an instantaneous, lossless cutover.",
+    "whenToChoose": "When replay and fan-out from a log beat ad-hoc queues.",
+    "whenNot": "As a TokenX uniqueness store without a sink constraint, or as a request-response database.",
+    "relatedSlugs": [
+      "kafka-internals",
+      "kafka-delivery-and-failure"
+    ]
+  },
+  {
+    "id": "cloudfront",
+    "title": "CDN (CloudFront-class)",
+    "product": "CloudFront",
+    "landscape": "performance",
+    "workload": "Derived GET cache at the edge. TLS termination optional.",
+    "consistency": "TTL / versioned objects. Invalidation is best-effort fan-out, not a transaction.",
+    "durability": "Rebuildable from origin.",
+    "latency": "Hit TTFB low tens of ms globally; miss is origin + extra hop.",
+    "failure": "Stale-if-error is a product choice. Origin death with empty edge is still an outage for uncached objects.",
+    "whenToChoose": "Cacheable public reads. Versioned assets.",
+    "whenNot": "Private per-user balances, POSTs, or as the source of truth.",
+    "relatedSlugs": [
+      "cdns-and-edge-architecture",
+      "caching-patterns-and-invalidation"
+    ]
+  },
+  {
+    "id": "etcd",
+    "title": "etcd / Raft lease service",
+    "product": "etcd",
+    "landscape": "consistency",
+    "workload": "Small linearizable KV, elections, Kubernetes membership.",
+    "consistency": "Linearizable reads through the protocol you enable. Leases expire.",
+    "durability": "Majority of the Raft group. Keep the dataset small.",
+    "latency": "Majority RTT. Cross-region majority is expensive.",
+    "failure": "Leader election. Split votes. Using it as an application database overloads the cluster.",
+    "whenToChoose": "Fencing tokens, config, membership.",
+    "whenNot": "Click firehose, user content, or TokenX balances at payment QPS.",
+    "relatedSlugs": [
+      "consensus-and-leader-election",
+      "distributed-locks-and-leases"
+    ]
   }
 ]

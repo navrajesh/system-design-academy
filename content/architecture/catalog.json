@@ -1,7 +1,7 @@
 {
-  "phase": "2a",
+  "phase": "2b",
   "title": "Architecture Reference",
-  "description": "Phase 2A ships the Storage & Data landscape, a layered explorer, three deep dives, two matrices, and a database-failover walkthrough. Other module landscapes are not implemented yet.",
+  "description": "Technology landscapes for production systems: products, matrices, explorer hops, and named failure walkthroughs. This is not a 65th curriculum lesson.",
   "urlPrefix": "/reference",
   "landscapes": [
     {
@@ -16,49 +16,49 @@
       "id": "scalability",
       "module": 2,
       "title": "Scalability",
-      "status": "later",
-      "href": null,
-      "description": "Phase B+. Load balancers, cache tiers, and write scaling products."
+      "status": "available",
+      "href": "/reference/landscapes/scalability",
+      "description": "Load balancers, gateways, Kubernetes, autoscaling, and write/read amplification."
     },
     {
       "id": "kafka-fault-tolerance",
       "module": 3,
       "title": "Kafka & Fault Tolerance",
-      "status": "later",
-      "href": null,
-      "description": "Phase B+. Partitioned logs and consumer recovery."
+      "status": "available",
+      "href": "/reference/landscapes/kafka-fault-tolerance",
+      "description": "Partitioned logs, consumers, retries, DLQs, and recovery assumptions."
     },
     {
       "id": "performance",
       "module": 4,
       "title": "Performance",
-      "status": "later",
-      "href": null,
-      "description": "Phase B+. Runtimes, queues, tails, and admission control."
+      "status": "available",
+      "href": "/reference/landscapes/performance",
+      "description": "CDN and cache hops, tails, admission, and profiling as derived telemetry."
     },
     {
       "id": "networking",
       "module": 5,
       "title": "Networking",
-      "status": "later",
-      "href": null,
-      "description": "Phase B+. DNS, protocols, CDN, mesh, and rate limiters."
+      "status": "available",
+      "href": "/reference/landscapes/networking",
+      "description": "DNS, TLS, HTTP/gRPC, proxies, connections, and partition behavior."
     },
     {
       "id": "consistency",
       "module": 6,
       "title": "CAP & Consistency",
-      "status": "later",
-      "href": null,
-      "description": "Phase B+. Quorum, consensus, CRDTs, and leases."
+      "status": "available",
+      "href": "/reference/landscapes/consistency",
+      "description": "Quorum, consensus, leases, and what a product can actually claim."
     },
     {
       "id": "composition",
       "module": 7,
       "title": "Architecture & Interviews",
-      "status": "later",
-      "href": null,
-      "description": "Phase B+. How mock-interview systems assemble the products above."
+      "status": "available",
+      "href": "/reference/landscapes/composition",
+      "description": "How mock-interview systems assemble these products without new prompts."
     }
   ],
   "deepDives": [
@@ -83,6 +83,14 @@
   ],
   "explorerHref": "/reference/architecture",
   "failureHref": "/reference/failures/database-failover",
+  "failures": [
+    { "id": "database-failover", "href": "/reference/failures/database-failover" },
+    { "id": "cache-outage", "href": "/reference/failures/cache-outage" },
+    { "id": "kafka-consumer-lag", "href": "/reference/failures/kafka-consumer-lag" },
+    { "id": "network-partition", "href": "/reference/failures/network-partition" },
+    { "id": "overload", "href": "/reference/failures/overload" },
+    { "id": "multi-region-failure", "href": "/reference/failures/multi-region-failure" }
+  ],
   "requiredRelatedSlugs": [
     "relational-vs-nosql-selection",
     "indexes-and-query-execution",

@@ -144,7 +144,7 @@ Retain: **L4 forwards connections, L7 may retry HTTP, health must not empty a fl
 
 </RealExamples>
 
-<InterviewTraps title="Balancer slogans that fail at IC6">
+<InterviewTraps title="Balancer slogans that fail in staff+ interviews">
 
 - **“The load balancer is highly available, so failovers are safe.”** The VIP remaining reachable is not fencing, not replica promotion, and not a committed debit. Name the drain timeout, the health bound, and the ledger.
 - **“Health check hits /health, so the instance can take traffic.”** `/health` often means the process accepted TCP. The ledger can be dead. Conversely, probing the shared DB from every instance can zero the pool.

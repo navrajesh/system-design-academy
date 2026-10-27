@@ -132,7 +132,7 @@ Tenant A and tenant B may both use key `123`. The same tenant may use key `K` fo
 5. **“OFFSET is fine because pages are small.”** The engine often scans and discards earlier rows. Use a unique, immutable keyset cursor and define snapshot semantics.
 6. **“Build the index in production now.”** Discuss lock behavior, I/O headroom, replica lag, cancellation, invalid-index cleanup, and rollback.
 
-A defensible IC6 answer connects an index to a named query and validates it with observed plans under production-like distributions.
+A defensible staff+ answer connects an index to a named query and validates it with observed plans under production-like distributions.
 
 </InterviewTraps>
 

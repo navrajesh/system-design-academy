@@ -139,7 +139,7 @@ Retain: **parents wait on max of N; clocks must cancel work; hedges share the id
 
 </RealExamples>
 
-<InterviewTraps title="Tail slogans that fail at IC6">
+<InterviewTraps title="Tail slogans that fail in staff+ interviews">
 
 - **“Our mean is 12 ms so the page is fast.”** The page is max of N. Quote parent percentiles, or the math of `1 - 0.99^N`.
 - **“We set a client timeout, so the server stopped.”** Timeouts abandon callers. Cancellation stops queries. Count orphans.

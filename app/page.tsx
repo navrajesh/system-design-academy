@@ -31,7 +31,7 @@ export default function DashboardPage() {
 
       <section className="grid grid-cols-3 gap-3 py-6 sm:gap-5">
         <div className="flex items-center gap-3 rounded-2xl border border-slate-200 bg-white p-4 sm:p-5"><Layers3 className="hidden h-5 w-5 text-cobalt sm:block" /><div><p className="text-xl font-semibold text-ink">{modules.length}</p><p className="text-xs text-slate-500">Core modules</p></div></div>
-        <div className="flex items-center gap-3 rounded-2xl border border-slate-200 bg-white p-4 sm:p-5"><Target className="hidden h-5 w-5 text-moss sm:block" /><div><p className="text-xl font-semibold text-ink">IC6</p><p className="text-xs text-slate-500">Interview depth</p></div></div>
+        <div className="flex items-center gap-3 rounded-2xl border border-slate-200 bg-white p-4 sm:p-5"><Target className="hidden h-5 w-5 text-moss sm:block" /><div><p className="text-xl font-semibold text-ink">Staff+</p><p className="text-xs text-slate-500">Interview depth</p></div></div>
         <div className="flex items-center gap-3 rounded-2xl border border-slate-200 bg-white p-4 sm:p-5"><Clock className="hidden h-5 w-5 text-amber sm:block" /><div><p className="text-xl font-semibold text-ink">{Math.round(totalMinutes / 60)}h</p><p className="text-xs text-slate-500">Seed curriculum</p></div></div>
       </section>
 

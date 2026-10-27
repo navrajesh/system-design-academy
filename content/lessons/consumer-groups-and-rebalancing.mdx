@@ -143,7 +143,7 @@ The partition log is authoritative for records until retention. The coordinator 
 
 </RealExamples>
 
-<InterviewTraps title="Ownership slogans that fail at IC6">
+<InterviewTraps title="Ownership slogans that fail in staff+ interviews">
 
 - **“The consumer group is a distributed lock.”** It is exclusive fetch assignment for one group and subscription. Other groups and the sink are outside that lock. Stale apply after revoke is expected.
 - **“Kafka exactly-once because we use a consumer group.”** Groups coordinate ownership and offsets. End-to-end effects need the sink protocol in the delivery lesson. Do not claim exactly-once processing.

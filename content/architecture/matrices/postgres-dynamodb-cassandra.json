@@ -2,6 +2,7 @@
   "id": "postgres-dynamodb-cassandra",
   "title": "PostgreSQL vs DynamoDB vs Cassandra",
   "description": "Pick an engine from access pattern and the consistency/durability you can actually name. This is not a popularity ranking.",
+  "landscape": "storage",
   "relatedSlugs": ["relational-vs-nosql-selection", "replication-and-failover", "cap-and-consistency-models"],
   "columns": [
     { "id": "workload", "label": "Workload" },

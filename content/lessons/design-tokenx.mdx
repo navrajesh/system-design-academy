@@ -133,7 +133,7 @@ The ledger owns spendable state. Kafka, charts, and any Web3 **indexer** are der
 
 </RealExamples>
 
-<InterviewTraps title="IC6 follow-ups">
+<InterviewTraps title="Staff+ follow-ups">
 
 - Where is conservation enforced during quorum loss?
 - Why is uniqueness tenant-scoped?
@@ -175,7 +175,7 @@ Wrong when regulators forbid one region, or measured commit capacity is exhauste
 
 <ScenarioCheck
   scenario="Ops restores a TokenX replica from application request logs because the ledger snapshot is a day old. They want to auto-replay every signed POST."
-  question="Which response is IC6-correct?"
+  question="Which response is staff+ correct?"
   options={[
     { label: "Refuse auto-replay of request-only outcomes; replay committed journals; fence writes; treat the rest as UNKNOWN until reconciled.", feedback: "Request logs are not proof of commit." },
     { label: "Replay every POST because idempotency keys make it exactly-once globally.", feedback: "Keys do not recreate missing commits, and uniqueness is tenant-scoped, not cosmic." },
