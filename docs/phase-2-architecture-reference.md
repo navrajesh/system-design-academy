@@ -229,7 +229,7 @@ The feature is complete only when all of the following hold:
 
 ## Out of scope until a later decision
 
-- Phase B+: remaining six landscapes, remaining named failures, TokenX overlay, library search chrome
+- After Phase 2B merge: TokenX explorer overlay, first-class interview selection-guide pages, remaining product polish (duplicate matrices, thin landscape independent-failure sections)
 - Rewriting existing lessons to embed matrices
 - Push, merge, or deploy
 - Applying or dropping `stash@{0}`

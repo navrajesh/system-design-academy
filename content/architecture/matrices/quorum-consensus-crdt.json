@@ -80,7 +80,7 @@
     }
   ],
   "assumptions": [
-    "Partition means some replicas cannot talk. You still pick 2 of 3: C, A, P.",
+    "A partition is a named cut: some replicas cannot talk. CAP is a per-operation policy (TokenX debit rejects without proven authority; labeled stale reads may continue), not a permanent two-letter sticker.",
     "LWW clocks need a named timestamp source; wall clocks skew.",
     "TokenX unique allocation is not an LWW merge."
   ]
