@@ -60,7 +60,7 @@ Modules 1 and 6 are complete in topic coverage and conform to the automated cont
 
 ## Outstanding technical audit findings
 
-The Modules 1 and 6 audit found **13 items**. High findings, Kafka, fencing/idempotency, and session read tokens (M4) are remediating on `fix/distributed-systems-audit`; **6 Medium and Low items remain**. Correctness defects and unstated protocol assumptions take priority over editorial improvements.
+The Modules 1 and 6 audit found **13 items**. High findings through Batch 4 (TrueTime and disaster-recovery replay) are remediating on `fix/distributed-systems-audit`; **4 Medium and Low items remain**. Correctness defects and unstated protocol assumptions take priority over editorial improvements.
 
 | Priority | Finding | Required remediation |
 | --- | --- | --- |
@@ -70,8 +70,8 @@ The Modules 1 and 6 audit found **13 items**. High findings, Kafka, fencing/idem
 | Medium (this branch) | A protected resource may accept a stale fencing token before observing the new epoch | Retain durable high-water token before work; expiry is not immediate exclusion; survive restart |
 | Medium (this branch) | Local atomic idempotency and recoverable `IN_PROGRESS` workflow idempotency are conflated | Separate one-commit SUCCEEDED from durable IN_PROGRESS with owner, epoch, and takeover |
 | Medium (this branch) | Read-position tokens omit shard/log identity and failover lineage | Token is `{shard, epoch/timeline, commit position}` with ancestry and current-authority checks |
-| Medium | TrueTime's 7 ms example does not define epsilon versus full interval width | Define the interval and calculate worst-case and overlapped commit wait separately |
-| Medium | Signed request logs are treated as sufficient evidence for post-restore replay | Replay only committed journals automatically; classify request-only outcomes as unknown |
+| Medium (this branch) | TrueTime's 7 ms example does not define epsilon versus full interval width | ε is half-width; wait until earliest > t (~2ε); overlap wait with replication |
+| Medium (this branch) | Signed request logs are treated as sufficient evidence for post-restore replay | Auto-replay committed journals only; request-only outcomes are UNKNOWN; fence before new writes |
 | Medium | The CAP quorum diagram visually implies all three replicas are required | Show leader plus either follower as a 2-of-3 quorum |
 | Low | An idempotency key is called globally unique despite tenant-scoped schema | Describe uniqueness within tenant and operation scope |
 | Low | B-tree height arithmetic uses an ambiguous definition of level | Define branching levels, leaf level, fanout assumptions, and fill factor |
@@ -80,7 +80,7 @@ The Modules 1 and 6 audit found **13 items**. High findings, Kafka, fencing/idem
 
 ## Next milestone
 
-1. Review High remediations through Batch 3 (session read tokens), then continue remaining Medium/Low batches.
+1. Review High remediations through Batch 4 (TrueTime and DR replay), then continue remaining Medium/Low batches.
 2. Re-run the complete validation suite and review the affected diagrams and exercises on desktop and mobile.
 3. Begin Module 3, **Kafka & Fault Tolerance**, with Kafka Internals, Consumer Groups and Rebalancing, and Ordering and Event Keys before progressing to stream processing and disaster scenarios.
 

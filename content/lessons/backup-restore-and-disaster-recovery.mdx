@@ -41,7 +41,7 @@ Copies should cross failure boundaries: another account or project, another regi
     { title: "Select a recovery point", detail: "Choose the newest verified snapshot plus contiguous WAL ending before corruption, consistent with the business RPO." },
     { title: "Restore in isolation", detail: "Provision known-compatible infrastructure, restore keys and data, replay logs, and prevent accidental external side effects." },
     { title: "Validate invariants", detail: "Check manifests, row counts, balanced ledgers, referential constraints, sample queries, and downstream positions." },
-    { title: "Promote and reconcile", detail: "Fence the old epoch, switch traffic gradually, resolve accepted-after-recovery-point requests, then rebuild derived stores." },
+    { title: "Promote and reconcile", detail: "Fence the old epoch before new writes. Automatically replay only committed journals. Classify signed-request-only evidence as UNKNOWN and reconcile by transfer ID.", failure: "Auto-applying request logs can mint a transfer that never committed or double-apply one that did." },
   ]}
 />
 
@@ -53,7 +53,11 @@ If WAL is generated at 15 MB/s, one day is about `15 × 86,400 = 1.296 TB`. With
 
 ### Dependencies and order
 
-Restore identity and encryption dependencies before encrypted data, but protect keys separately so one compromised account cannot destroy both. Restore authoritative databases before derived search, caches, and analytics. Consumers need known replay positions; otherwise they may repeat external effects or skip events. Re-enable scheduled jobs, webhooks, email, and payment calls only after idempotency and cutover epochs are verified.
+Restore identity and encryption dependencies before encrypted data, but protect keys separately so one compromised account cannot destroy both. Restore authoritative databases before derived search, caches, and analytics. Consumers need known replay positions; otherwise they may repeat external effects or skip events.
+
+Distinguish evidence. **Committed journals** (WAL, outbox rows that committed with the ledger, a surviving region's committed log) are the only automatic replay source. **Signed request logs** prove a client sent a command, not that the original region committed it. Request-only rows are **UNKNOWN**: query surviving idempotency records by stable transfer ID, or present them for manual reconciliation. Do not auto-apply request-only evidence after restore—that can double-apply a transfer already in the recovered ledger or invent a transfer that never committed.
+
+Fence the restored system (new epoch, reject old writers) **before** accepting new writes. Re-enable scheduled jobs, webhooks, email, and payment calls only after idempotency and cutover epochs are verified.
 
 Backups need automated integrity checks plus regular full exercises. A checksum proves bytes are intact, not that schemas migrate, keys work, the application starts, or balances reconcile.
 
@@ -70,10 +74,10 @@ Retain: tier objectives by data class, isolate copies, calculate restore physics
 <ArchitectureDiagram
   title="Recovery copies, trust boundary, and controlled cutover"
   description="Snapshots and continuous WAL leave the production account for an immutable vault. Restore occurs in isolation and becomes authoritative only after validation and fencing."
-  chart={"flowchart LR\n  PROD[(Primary ledger)] --> SNAP[Encrypted snapshots]\n  PROD --> WAL[Continuous WAL archive]\n  SNAP --> VAULT[(Cross-account immutable vault)]\n  WAL --> VAULT\n  KEYS[Separated key escrow] --> RESTORE[Isolated restore environment]\n  VAULT --> RESTORE\n  RESTORE --> VERIFY[Checksums and invariant validation]\n  VERIFY --> FENCE[Fence old epoch]\n  FENCE --> CUT[Controlled traffic cutover]\n  CUT --> REBUILD[Rebuild derived stores]\n  VAULT -. missing log segment .-> ALERT[Archive gap alert]\n  VERIFY -. validation fails .-> SELECT[Choose earlier recovery point]"}
+  chart={"flowchart LR\n  PROD[(Primary ledger)] --> SNAP[Encrypted snapshots]\n  PROD --> WAL[Committed WAL archive]\n  SNAP --> VAULT[(Cross-account immutable vault)]\n  WAL --> VAULT\n  REQ[Signed request logs] -. UNKNOWN not auto replay .-> RECON[Reconcile by transfer ID]\n  KEYS[Separated key escrow] --> RESTORE[Isolated restore environment]\n  VAULT --> RESTORE\n  RESTORE --> VERIFY[Checksums and invariant validation]\n  VERIFY --> FENCE[Fence old epoch]\n  FENCE --> CUT[Controlled traffic cutover]\n  CUT --> REBUILD[Rebuild derived stores]\n  RECON --> CUT\n  VAULT -. missing log segment .-> ALERT[Archive gap alert]"}
 >
 
-Production remains authoritative until an incident fence stops unsafe writes. The vault is a recovery source, not a serving replica. The restored environment has no outbound side effects while logs replay. Validation is the consistency boundary for promotion; failure returns to recovery-point selection instead of forcing corrupt state live.
+Production remains authoritative until an incident fence stops unsafe writes. The vault holds **committed** snapshots and WAL; it is a recovery source, not a serving replica. Signed request logs are a separate UNKNOWN stream: they do not auto-replay. The restored environment has no outbound side effects while committed journals replay. Validation plus a new fencing epoch is the consistency boundary for promotion.
 
 </ArchitectureDiagram>
 
@@ -82,14 +86,14 @@ Production remains authoritative until an incident fence stops unsafe writes. Th
   stages={[
     { name: "Production", owner: "Primary data platform", state: "Snapshots, WAL, manifests, and archive position", boundary: "Continuous protected recovery point.", failure: "An archive segment is late or corrupt.", recovery: "Alert within the RPO window and resend before source retention expires." },
     { name: "Vault", owner: "Separate recovery account", state: "Immutable encrypted copies", boundary: "Independent credentials and retention lock.", failure: "Key or manifest is unavailable.", recovery: "Use tested escrow and redundant manifests from another failure domain." },
-    { name: "Restore environment", owner: "Disaster-recovery team", state: "Isolated replay position", boundary: "No outbound business side effects.", failure: "Schema, engine, or invariant validation fails.", recovery: "Select an earlier recovery point or repair the tested restore tooling." },
-    { name: "Promotion", owner: "Incident commander", state: "New authority epoch and traffic percentage", boundary: "Validation plus fenced cutover.", failure: "Old writers or ambiguous requests reappear.", recovery: "Reject stale epochs and reconcile requests around the recovery point." },
+    { name: "Restore environment", owner: "Disaster-recovery team", state: "Isolated replay of committed journals", boundary: "No outbound business side effects; request logs are not this stream.", failure: "Schema, engine, or invariant validation fails, or operators replay signed requests as new transfers.", recovery: "Select an earlier recovery point; classify request-only rows as UNKNOWN." },
+    { name: "Promotion", owner: "Incident commander", state: "New authority epoch and traffic percentage", boundary: "Fence before new writes.", failure: "Old writers or UNKNOWN requests reappear.", recovery: "Reject stale epochs; reconcile UNKNOWN rows by stable transfer ID and idempotency records." },
   ]}
 />
 
 <RealExamples>
 
-**TokenX point-in-time restore.** An operator runs an erroneous bulk update at 14:03. Restore the latest prior snapshot, replay WAL to just before the transaction, verify that debits equal credits per asset and idempotency records align, then reconcile legitimate transfers accepted after the recovery point from signed request logs or a surviving durable region. Do not silently discard them.
+**TokenX point-in-time restore.** An operator runs an erroneous bulk update at 14:03. Restore the latest prior snapshot, replay WAL to just before the transaction, and verify that debits equal credits per asset and idempotency records align. Automatically replay only **committed journals** (WAL, outbox rows that committed with the ledger, or a surviving durable region's committed log). Signed request logs prove a client sent a command, not that the original region committed it; classify those outcomes as **UNKNOWN**, then query surviving idempotency records by stable transfer ID or present them for manual reconciliation. Do not auto-apply request-only evidence after restore. Fence the restored epoch before new writes.
 
 **Ad Click Aggregator rebuild.** If aggregate state is lost, restore raw immutable segments and Kafka positions, then recompute versioned minute totals. Dashboard service can return a delayed status while recovery proceeds. Billing remains closed until replay reaches the declared watermark and reconciliation totals match manifests.
 
@@ -102,6 +106,7 @@ Production remains authoritative until an incident fence stops unsafe writes. Th
     { label: "Key unavailable", impact: "The bytes are intact but unusable, so effective RTO is unbounded.", recovery: "Exercise separated key escrow, permissions, and versions from the disaster account." },
     { label: "WAL gap", impact: "The snapshot restores, but point-in-time replay stops before the target.", recovery: "Alert on contiguous archive positions and restore a redundant segment or choose an earlier safe point." },
     { label: "Application mismatch", impact: "Data restores but current code or migrations cannot open the recovered schema.", recovery: "Archive compatible artifacts and exercise full application smoke tests, not only storage checksums." },
+    { label: "Signed request, uncommitted transfer", impact: "Auto-replaying the request mints a transfer the original region never committed, or double-applies one that later appears in WAL.", recovery: "Leave the row UNKNOWN until an idempotency record or committed journal confirms it; fence before new writes." },
   ]}
 />
 
@@ -115,6 +120,7 @@ Production remains authoritative until an incident fence stops unsafe writes. Th
 4. **“Checksums validate recovery.”** They validate bytes, not application invariants, schema compatibility, credentials, or external effects.
 5. **“Switch DNS to the backup.”** First fence old writers and establish a higher epoch; DNS caches do not prevent split brain.
 6. **“Restore everything together.”** Prioritize authoritative tiers and degrade derived features so the critical path is smaller.
+7. **“Replay signed request logs to reconstruct accepted transfers.”** Auto-replay only committed journals. Request-only evidence is UNKNOWN until an idempotency record or surviving committed log confirms it.
 
 An IC6 response produces an evidence-based runbook and names the human decision points, not merely a storage feature list.
 
@@ -131,10 +137,29 @@ An IC6 response produces an evidence-based runbook and names the human decision 
 </Tradeoffs>
 
 <KnowledgeCheck
-  question="Ignoring overhead, what is the minimum time to transfer 20 TB at a sustained 500 MB/s using decimal units?"
-  options={["About 1.1 hours", "About 4 hours", "About 11.1 hours", "About 40 hours"]}
-  correct={2}
-  explanation="20,000,000 MB divided by 500 MB/s is 40,000 seconds, approximately 11.1 hours. Real restore time is longer."
+  question="After a TokenX point-in-time restore, operators find signed client request logs for transfers around the recovery point, but the recovered ledger has no matching committed rows. What should automated recovery do?"
+  options={[
+    "Replay every signed request as a new transfer",
+    "Treat request-only evidence as UNKNOWN and reconcile against committed journals or surviving idempotency records",
+    "Delete the request logs because the restore is authoritative",
+    "Advance all consumer offsets to skip the gap"
+  ]}
+  correct={1}
+  explanation="Signed requests prove a command was sent, not that it committed. Auto-replay can mint value or double-apply; committed WAL and outbox are the automatic replay sources."
+/>
+
+<ScenarioCheck
+  title="Signed request, never committed"
+  scenario="A client retried transfer T with a stable idempotency key. The original region timed out. After regional loss, restore from snapshot plus WAL. T is absent from the recovered ledger, but a signed request log still contains T."
+  question="What preserves conservation?"
+  options={[
+    { label: "Automatically apply T from the signed request because the client intended it", feedback: "The original transaction may never have committed; applying it now mints money." },
+    { label: "Classify T as UNKNOWN, fence the restored epoch, then query surviving idempotency state or wait for operator reconciliation before any new write of T", feedback: "Request-only evidence is not a committed journal. Stable IDs let later evidence attach without creating a second transfer." },
+    { label: "Create a new transfer ID so restore cannot collide", feedback: "A new ID can apply the same user intent twice if the original later appears." },
+    { label: "Open writes immediately and let the client retry T as a fresh command", feedback: "Unfenced writes plus a later WAL fragment can double-apply." },
+  ]}
+  correct={1}
+  explanation="Auto-replay committed journals only. UNKNOWN request rows wait on idempotency or humans. Fence before accepting new writes."
 />
 
 <ScenarioCheck
@@ -154,6 +179,6 @@ An IC6 response produces an evidence-based runbook and names the human decision 
 
 “I classify data by business impact and assign measured RPO and RTO per tier. For authoritative state I combine compatible snapshots with continuous WAL in a cross-account immutable vault, separated key recovery, archive-gap alerts, and retention that includes privacy and legal obligations.
 
-I calculate the transfer and replay lower bounds; a 20 TB restore at 500 MB/s already exceeds 11 hours before validation, so a four-hour RTO requires warm or parallel recovery architecture. Restore happens without external side effects, then checksums, application tests, ledger invariants, fencing, and reconciliation gate cutover. Related lessons are [replication](/learn/replication-and-failover), [object storage](/learn/object-storage-and-large-files), and [transactions](/learn/transactions-across-boundaries).”
+I calculate the transfer and replay lower bounds; a 20 TB restore at 500 MB/s already exceeds 11 hours before validation, so a four-hour RTO requires warm or parallel recovery architecture. Restore happens without external side effects; checksums, application tests, ledger invariants, fencing before new writes, and reconciliation of UNKNOWN request-only outcomes gate cutover. Related lessons are [replication](/learn/replication-and-failover), [object storage](/learn/object-storage-and-large-files), and [transactions](/learn/transactions-across-boundaries).”
 
 </InterviewAnswer>
