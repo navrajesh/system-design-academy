@@ -1,0 +1,33 @@
+# Dependencies
+node_modules/
+
+# Next.js and generated build output
+.next/
+out/
+build/
+dist/
+coverage/
+.turbo/
+*.tsbuildinfo
+
+# Local hosting and deployment metadata
+.vercel/
+
+# Environment files and local secrets
+.env*
+!.env.example
+.secrets*
+secrets/
+api_keys.json
+api-keys.json
+credentials*.json
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Logs and editor/OS files
+*.log
+.DS_Store
+.idea/
+.vscode/

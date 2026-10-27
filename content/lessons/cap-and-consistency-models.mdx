@@ -1,0 +1,120 @@
+---
+title: "CAP & Practical Consistency"
+description: "Turn abstract consistency vocabulary into explicit behavior during concurrency and network partitions."
+module: 6
+moduleTitle: "CAP & Consistency"
+order: 1
+duration: 31
+difficulty: "Intermediate"
+tags:
+  - CAP theorem
+  - linearizability
+  - quorum
+objectives:
+  - "State CAP without the common two-of-three myth"
+  - "Match invariants to consistency models"
+  - "Reason about quorum assumptions"
+---
+
+<BigPicture title="CAP describes behavior during a partition">
+
+When nodes cannot communicate, each operation needs an explicit partition policy. A balance debit may reject or wait on a side that cannot prove quorum, while a cached portfolio read may remain available and return labeled stale data. Describing the whole product as “CP” or “AP” hides these operation-level decisions.
+
+It is not a permanent selection of two letters, and “consistency” in CAP means linearizable behavior—not database constraint validity.
+
+</BigPicture>
+
+<UnderTheHood title="Quorums intersect only under assumptions">
+
+With N replicas, a common rule is <code>W + R &gt; N</code>, so a read quorum overlaps the last write quorum. This does not automatically guarantee linearizability: sloppy quorums, concurrent versions, clock-based conflict resolution, and failed read repair can change behavior. A linearizable leader design also needs one active epoch, fencing against stale leaders, and a read protocol that proves the leader still holds authority.
+
+Leader-based systems route writes through one elected leader. During a partition, only a side that can establish a valid quorum may retain or elect a leader for coordinated writes. Other replicas reject those writes or serve explicitly stale reads. Even the quorum side can be unavailable briefly during election or when latency exceeds the operation deadline.
+
+The policy can differ by operation:
+
+- **TokenX debit:** require a fenced leader and quorum commit; reject when authority cannot be proven.
+- **Portfolio read:** return the newest locally known version with an “as of” timestamp if product policy permits staleness.
+- **User preference update:** accept concurrent versions and merge only if the field-level conflict rule is deterministic and user-safe.
+
+</UnderTheHood>
+
+<MentalModel title="Begin with the invariant, not CAP">
+
+Ask what must never happen. A username may be briefly unavailable rather than assigned twice. A social feed can show posts late. A TokenX wallet must not spend the same balance twice.
+
+Think of two bank branches after their phone line breaks. “Keep the bank available” is too vague: both branches may show yesterday's statement, but both must not authorize spending the same final $100. Decide separately what each operation may do while coordination is unavailable.
+
+Then define operation-level guarantees: read-your-writes, monotonic reads, causal order, bounded staleness, or linearizability.
+
+</MentalModel>
+
+<ArchitectureDiagram title="Operation-specific behavior during a partition" chart={"flowchart LR\n  C[TokenX client] --> R[Regional router]\n  R -->|debit: quorum required| L[Leader, epoch 52]\n  L -->|replicate log entry| R1[(Replica A)]\n  L -->|replicate log entry| R2[(Replica B)]\n  R1 -->|majority commit| L\n  R2 -->|majority commit| L\n  R -. network partition .- R3[(Isolated replica, epoch 51)]\n  R3 -->|stale portfolio read + as-of version| C\n  R3 -->|debit rejected: no authority| X[Retry or fail]\n  L -->|committed debit| C"}>
+
+The replicated log owns authoritative balance order. Epoch 52 fences the isolated epoch-51 replica from accepting debits. Product policy still permits that isolated replica to answer a portfolio query if the response exposes its version and staleness. Consistency and availability are chosen per operation, not per product logo.
+
+<ArchitectureWalkthrough
+  title="Follow authority through a TokenX partition"
+  stages={[
+    { name: "Normal operation", owner: "Epoch-52 leader", state: "Committed transfer log and balances", boundary: "Debits complete only after quorum commit.", failure: "Leader loses contact with a majority.", recovery: "Stop coordinated writes until a valid leader is established." },
+    { name: "Partition", owner: "Majority and isolated replica", state: "Divergent knowledge, not necessarily divergent committed state", boundary: "Only the quorum side may establish write authority.", failure: "The isolated replica still believes it is leader.", recovery: "Epoch fencing makes its writes reject at storage or downstream boundaries." },
+    { name: "Degraded reads", owner: "Product read policy", state: "Versioned, potentially stale portfolio view", boundary: "Staleness is allowed only for named read operations.", failure: "A stale response is used to authorize a debit.", recovery: "Route authorization exclusively through quorum-backed balance state." },
+    { name: "Repair", owner: "Replication protocol", state: "Follower catches up to committed log", boundary: "Uncommitted divergent entries never become authoritative.", failure: "Client retries an ambiguous debit with a new ID.", recovery: "Reuse the original idempotency key and query its committed result." }
+  ]}
+/>
+
+</ArchitectureDiagram>
+
+<RealExamples title="Feeds, inventory, and TokenX">
+
+A feed read can usually remain available under partition and reconcile later, while privacy-list updates may require stricter coordination. Checkout inventory often uses reservations to bound oversell while allowing catalog reads to remain available. TokenX transfer authorization requires strongly coordinated balance or reservation state, while portfolio charts can be eventually consistent.
+
+<FailureScenario
+  title="Select an operation during regional isolation"
+  prompt="One TokenX region can reach local replicas but not a quorum of the balance log."
+  choices={[
+    { label: "Authorize debit", impact: "The region cannot rule out a concurrent debit elsewhere, so accepting can violate the no-double-spend invariant.", recovery: "Reject or queue the request and resolve it with the same idempotency key after quorum authority returns." },
+    { label: "Show portfolio", impact: "The view may omit recent transfers but does not itself mutate the invariant.", recovery: "Return an as-of timestamp and refresh after replication catches up." },
+    { label: "Record analytics", impact: "Local events can be buffered with stable IDs and may arrive out of order later.", recovery: "Replay into idempotent analytics and correct affected windows." }
+  ]}
+/>
+
+</RealExamples>
+
+<InterviewTraps title="Consistency shortcuts to reject">
+
+- Saying a system “chooses AP” or “chooses CP” without naming the operation and partition behavior.
+- Assuming quorum arithmetic alone makes reads linearizable.
+- Using last-write-wins with unsynchronized wall clocks for financial state.
+- Demanding strong consistency for every derived view.
+- Forgetting client session guarantees after failover.
+
+</InterviewTraps>
+
+<Tradeoffs title="Coordination buys invariants with latency and availability">
+
+Linearizable operations require coordination and can become unavailable without a quorum or within a deadline. Eventual consistency keeps selected operations available but pushes conflict semantics into the application. Causal consistency preserves meaningful order with less coordination than total order, at extra metadata cost.
+
+Strong coordination is inappropriate for derived views whose value decays slowly and whose unavailability would hurt users more than bounded staleness. Eventual conflict resolution is inappropriate when two accepted operations can jointly violate a non-mergeable invariant such as uniqueness or conserved balance.
+
+</Tradeoffs>
+
+<KnowledgeCheck question="During a network partition, what should a replica without quorum do with a TokenX debit that requires a linearizable balance?" options={["Accept it and use wall-clock last-write-wins", "Reject or delay it because write authority cannot be proven", "Accept it if portfolio reads are allowed", "Create a new leader epoch locally"]} correct={1} explanation="The operation's no-double-spend invariant requires proven write authority. The same replica may still serve explicitly stale, non-authoritative reads under a different operation policy." />
+
+<ScenarioCheck
+  scenario="A three-replica inventory service uses W=2 and R=2. During a partition, the isolated replica accepts writes into a sloppy quorum on substitute nodes and resolves conflicts by timestamp."
+  question="Can W + R > N alone justify claiming linearizable inventory reads?"
+  options={[
+    { label: "No. The system must also define quorum membership, version ordering, concurrent-write handling, and how a read proves it observes the latest committed write.", feedback: "Intersection arithmetic is only one assumption; sloppy membership and timestamp resolution can violate a single-copy order." },
+    { label: "Yes. The arithmetic is a complete proof regardless of replica selection.", feedback: "W + R > N helps only when the actual read and write replica sets intersect under the stated protocol." },
+    { label: "Yes, because synchronized wall clocks totally order all writes.", feedback: "Wall clocks have uncertainty and do not by themselves establish causality or prevent stale leaders." },
+    { label: "No, because quorum systems can never be linearizable.", feedback: "Quorum-backed protocols can be linearizable when leadership, epochs, commit rules, and reads are correctly defined." }
+  ]}
+  correct={0}
+  explanation="A linearizability argument must cover membership, authority, commit order, and the read protocol—not just quorum arithmetic."
+/>
+
+<InterviewAnswer>
+
+“I avoid labeling an entire product CP or AP. CAP becomes relevant when replicas cannot communicate, so I classify operations by invariant. Token transfer authorization requires a fenced leader and quorum-backed, linearizable state; a side without authority rejects the debit. A portfolio read can remain available with an as-of version, and analytics can buffer and reconcile. I then state membership, commit, read, failover, conflict, and client-session behavior rather than relying on W + R arithmetic alone.”
+
+</InterviewAnswer>

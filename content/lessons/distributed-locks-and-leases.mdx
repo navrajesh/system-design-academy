@@ -1,0 +1,152 @@
+---
+title: "Distributed Locks and Leases"
+description: "Use leases and fencing tokens safely under pauses, partitions, clock uncertainty, renewal failure, and stale-holder recovery."
+module: 6
+moduleTitle: "CAP & Consistency"
+order: 6
+duration: 43
+difficulty: "Advanced"
+tags:
+  - distributed locks
+  - leases
+  - fencing tokens
+  - split brain
+objectives:
+  - Distinguish ownership hints from enforced mutual exclusion
+  - Trace lease acquisition, renewal, expiry, and stale-holder behavior
+  - Apply monotonically increasing fencing tokens at the resource boundary
+  - Decide when idempotency or partitioned ownership is safer than locking
+---
+
+<BigPicture title="A lock is safe only where stale holders are rejected">
+
+A distributed lock service can grant one owner at a time according to its own state. It cannot pause a process, retract a message already in flight, or force an external database to ignore an expired owner. Garbage-collection pauses, network partitions, scheduler suspension, and delayed packets can let an old holder continue after a lease expires.
+
+The usual defense is a fencing token: every successful acquisition receives a monotonically increasing epoch, and the protected resource rejects operations with a token lower than the highest it has accepted. Without enforcement at the resource, a lease is coordination advice—not proof of exclusive side effects.
+
+</BigPicture>
+
+<UnderTheHood title="Acquire, renew, fence, and stop">
+
+A lease is time-bounded ownership recorded by a linearizable authority. The client acquires resource `R`, owner identity, expiry, and token 42. It renews before expiry while still authorized. The client must stop work if renewal cannot be confirmed; it cannot extend the lease from its local clock alone.
+
+<ExecutionTimeline
+  title="A paused worker becomes stale"
+  steps={[
+    { title: "Acquire 42", detail: "Worker A obtains a 30-second lease and fencing token 42 from the lock authority.", state: "The resource has accepted no token above 42.", failure: "A may pause after acquisition without knowing time passed." },
+    { title: "Pause", detail: "A stops for 45 seconds during a runtime pause; its local task resumes with token 42.", state: "The lease expired at the authority.", failure: "A still believes it owns the work based on stale memory." },
+    { title: "Acquire 43", detail: "Worker B obtains the next lease and token 43, then writes to the protected store.", state: "The store records highest token 43.", failure: "Without token enforcement, A and B can both write." },
+    { title: "Reject stale A", detail: "A resumes and sends token 42; the store atomically compares and rejects it.", state: "Only epoch 43 can advance protected state.", failure: "If one side-effect destination ignores tokens, split brain remains there." },
+  ]}
+/>
+
+### Time assumptions
+
+Lease safety depends on the authority's time semantics and client behavior. A client may use a monotonic local clock to decide to stop early, subtracting clock-drift and network uncertainty from usable duration. It must never conclude that the server-side lease remains valid merely because its wall clock has not reached an expiry timestamp.
+
+For a 30-second lease, 10-second renewal interval, 2-second worst observed pause, and 1-second network budget, a client has substantial operating margin. But these are measured assumptions, not correctness proofs. A 40-second stop-the-world pause can exceed them; fencing still protects the resource after the pause.
+
+### Lock granularity and contention
+
+One global lock serializes unrelated work and becomes an availability bottleneck. Lock by stable resource ID, keep critical sections small, and avoid remote calls while holding database locks. If 500 jobs/s each hold a lock for 200 ms, Little's Law gives about 100 concurrent held locks across distinct keys. If all jobs use one key, capacity is at most five jobs/s regardless of worker count.
+
+Use atomic compare-and-set, uniqueness constraints, work queues with ownership epochs, or idempotent writes when they express the actual invariant more directly. A lock around “check then insert” is usually weaker than a database unique constraint on the insert.
+
+</UnderTheHood>
+
+<MentalModel title="A lease is a numbered hotel keycard">
+
+Checkout time does not physically remove an old keycard from a guest's pocket. The door protects the room by accepting only the newest encoded generation. The reservation desk grants leases; the door's generation check is fencing.
+
+Retain: leases expire, processes pause, messages arrive late, and only the protected resource can reject stale authority.
+
+</MentalModel>
+
+<ArchitectureDiagram
+  title="Lease authority and fenced resource"
+  chart={"flowchart LR\n  A[Worker A token 42] --> LOCK[(Linearizable lease service)]\n  B[Worker B] --> LOCK\n  LOCK --> T43[Lease token 43]\n  T43 --> B\n  B --> STORE[(Protected store max token 43)]\n  A -. delayed write token 42 .-> STORE\n  STORE -. reject stale epoch .-> A\n  B --> EFFECT[Idempotent external effect]\n  LOCK -. renewal unavailable .-> STOP[Client stops work]\n  STORE --> AUDIT[(Ownership audit log)]"}
+>
+
+The lease service owns current holder, expiry, and next token. The store owns enforcement by atomically comparing the request token with its maximum accepted token. External effects require the same fencing or stable idempotency record; protecting only the database while sending an unfenced payment still leaves a split-brain path.
+
+<ArchitectureWalkthrough
+  title="Trace authority to the side effect"
+  stages={[
+    { name: "Acquire", owner: "Lease consensus group", state: "Owner, expiry, token 43", boundary: "Linearizable conditional grant.", failure: "Authority has no quorum.", recovery: "Do not grant; clients stop or remain idle until quorum returns." },
+    { name: "Renew", owner: "Current worker", state: "Last confirmed lease version", boundary: "Renew before a conservative local deadline.", failure: "Pause or partition hides renewal outcome.", recovery: "Stop work and reacquire; never assume renewal succeeded." },
+    { name: "Write", owner: "Protected store", state: "Highest accepted fencing token", boundary: "Atomic token compare with mutation.", failure: "Old worker resumes.", recovery: "Reject its lower token before changing state." },
+    { name: "Side effect", owner: "Effect adapter", state: "Command ID and token", boundary: "Fenced or idempotent invocation.", failure: "Provider cannot compare tokens.", recovery: "Use one durable dispatcher and provider idempotency key, then reconcile unknown outcomes." },
+  ]}
+/>
+
+</ArchitectureDiagram>
+
+<RealExamples title="Locking only the actual shared resource">
+
+**TokenX settlement batch.** A scheduler lease chooses one active batch coordinator, but settlement rows use a unique batch ID and the database rejects stale fencing tokens. Provider submissions use an idempotency key because the provider may not understand the internal lease epoch.
+
+**Ad Click compaction.** Workers lease `(campaign, hour)` segments. Output is written under an immutable generation key, and a metadata compare-and-set publishes only the newest token. A stale worker may finish expensive computation, but cannot replace the current manifest.
+
+**When no lock is better.** Parallel consumers inserting the same transfer receipt should rely on a unique event ID plus an atomic upsert. This survives retries without depending on a lease being continuously held.
+
+<FailureScenario
+  title="Explore stale lock holders"
+  prompt="A worker cannot renew its lease but still has work in progress."
+  choices={[
+    { label: "Process pause", impact: "The worker resumes after expiry with obsolete in-memory ownership.", recovery: "Require a fencing token on every protected mutation and reject stale generations." },
+    { label: "Renewal timeout", impact: "The renewal may have succeeded or failed; the worker cannot know current ownership.", recovery: "Stop before the conservative deadline, query or reacquire, and make repeated work idempotent." },
+    { label: "Lock service partition", impact: "A minority cannot safely grant a new lease, reducing availability.", recovery: "Preserve safety by denying grants; restore quorum rather than creating an independent authority." },
+  ]}
+/>
+
+</RealExamples>
+
+<InterviewTraps title="Locks that do not protect the resource">
+
+1. **“The TTL prevents two owners.”** It permits reassignment; it does not stop a paused old process.
+2. **“Use NTP-synchronized clocks.”** Clock synchronization reduces error but does not eliminate pauses, message delay, or clock steps.
+3. **“The lock server says I own it.”** The mutation destination must enforce the token atomically.
+4. **“Renew after expiry if no one else acquired.”** The old epoch is over; reacquire a new token and revalidate work.
+5. **“Lock the whole tenant.”** Calculate contention and choose the smallest key that contains the invariant.
+6. **“A distributed lock makes a remote API atomic.”** Use provider idempotency and durable outcome reconciliation.
+7. **“Release in finally.”** Release is useful but cannot be required for safety because crashed clients never run it.
+
+</InterviewTraps>
+
+<Tradeoffs title="Mutual exclusion versus availability and simplicity">
+
+- Short leases recover quickly from crashes but renew often and are sensitive to pauses; long leases delay reassignment.
+- Fencing provides robust stale-holder protection but requires every protected resource to compare generations.
+- Coarse locks are simpler but destroy parallelism and expand failure blast radius.
+- Fine locks improve concurrency but increase acquisition volume, ordering complexity, and deadlock risk.
+- Idempotent or commutative operations often avoid locks entirely, but are inappropriate when the invariant truly requires one exclusive decision.
+
+</Tradeoffs>
+
+<KnowledgeCheck
+  question="Worker A's lease expires during a 45-second pause. Worker B acquires token 43. What makes A's later token-42 write safe to reject?"
+  options={["A's local wall clock", "The protected store's atomic highest-token check", "A best-effort release call", "A shorter DNS TTL"]}
+  correct={1}
+  explanation="The resource must remember the highest accepted fencing token and atomically reject lower epochs with the mutation."
+/>
+
+<ScenarioCheck
+  scenario="A settlement provider supports idempotency keys but cannot validate your fencing tokens. Two scheduler generations might attempt the same batch after a timeout."
+  question="Which boundary is most defensible?"
+  options={[
+    { label: "Trust the lease and send random provider request IDs", feedback: "A stale generation can create a second real settlement." },
+    { label: "Persist one batch command under fencing, then call the provider with the stable batch ID as idempotency key", feedback: "The database rejects stale dispatchers and the provider deduplicates the unavoidable retry window." },
+    { label: "Make the lease last 24 hours", feedback: "A longer TTL delays recovery and still cannot stop a stale process after reassignment." },
+    { label: "Retry only once", feedback: "Retry count does not resolve unknown outcomes or stale ownership." },
+  ]}
+  correct={1}
+  explanation="Authority is fenced at the durable command boundary, while the external provider's idempotency contract closes duplicate invocation risk."
+/>
+
+<InterviewAnswer>
+
+“A lease is not enough because an old holder can pause and resume after expiry. I acquire from a linearizable authority, stop work when renewal cannot be confirmed, and attach a monotonically increasing fencing token to every protected mutation. The resource atomically rejects tokens below its highest accepted generation.
+
+I size TTL and renewal from measured pause and network budgets, but fencing—not clocks—is the final safety boundary. I prefer constraints, compare-and-set, or idempotency when they express the invariant more directly. See [consensus and leader election](/learn/consensus-and-leader-election), [replication and failover](/learn/replication-and-failover), and [idempotency](/learn/idempotency-and-deduplication).”
+
+</InterviewAnswer>

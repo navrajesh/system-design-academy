@@ -1,0 +1,154 @@
+---
+title: "Consistency Testing"
+description: "Validate distributed guarantees with histories, invariants, fault injection, linearizability checking, and controlled recovery evidence."
+module: 6
+moduleTitle: "CAP & Consistency"
+order: 9
+duration: 47
+difficulty: "Advanced"
+tags:
+  - consistency testing
+  - linearizability checking
+  - fault injection
+  - Jepsen
+objectives:
+  - Capture operation histories with invocation and completion evidence
+  - Check linearizability and domain invariants without confusing them
+  - Design fault injection with valid controls and recovery verification
+  - Interpret unknown outcomes and minimize counterexamples
+---
+
+<BigPicture title="A guarantee is a falsifiable claim">
+
+Distributed correctness cannot be established by green health checks or a happy-path integration test. A useful test states a model, drives concurrent operations, records a complete enough history, injects realistic faults, and checks whether any legal execution explains the observations. It also verifies recovery after the fault stops.
+
+Linearizability checking asks whether completed operations can be placed at single points between invocation and response while respecting real-time order and the object's sequential specification. Domain invariant checking asks questions such as “did TokenX conserve value?” These are related but distinct: a system may violate linearizability without losing money, or conserve total money while double-charging one account.
+
+</BigPicture>
+
+<UnderTheHood title="Generate, record, perturb, check, recover">
+
+Define the object model before load. A register supports read and write; a set supports add, remove, and contains; a transfer model includes balances, idempotency, and conservation. Record unique operation ID, client, invocation time, completion time, input, output, error class, and server-observed version when available. Client clocks help bound real-time order but must not be treated as perfectly synchronized; a centralized harness clock or interval uncertainty improves evidence.
+
+<ExecutionTimeline
+  title="One consistency-test campaign"
+  steps={[
+    { title: "Baseline", detail: "Run the workload without faults, validate the checker and observability, and measure expected latency.", state: "The test harness itself has a known-good control.", failure: "A failing baseline often means a model or client bug, not distributed failure." },
+    { title: "Inject", detail: "Partition leader from followers, pause processes, skew clocks within and beyond policy, and drop acknowledgements on a scheduled timeline.", state: "Every nemesis action has timestamps and targeted nodes.", failure: "Uncontrolled overload can create ambiguous timeouts that obscure the intended fault." },
+    { title: "Check history", detail: "Classify successful, failed, and unknown operations; run a model checker and independent domain invariants.", state: "A counterexample links operations to the violated rule.", failure: "Treating every timeout as failed can invent or hide anomalies." },
+    { title: "Verify recovery", detail: "Heal faults, wait for a bounded convergence condition, inspect replicas, and run a final read/reconciliation phase.", state: "Safety and post-fault liveness evidence are retained.", failure: "Stopping at fault removal misses stuck prepared transactions or unrepaired replicas." },
+  ]}
+/>
+
+### Linearizability search
+
+The checker builds a partial order: if operation A completed before B began, A must precede B; overlapping operations may be ordered either way. It searches for a sequential history allowed by the model and matching observed outputs. Search can be expensive, so partition independent keys, keep histories bounded, and minimize failures to a small counterexample.
+
+An invocation with no response is **unknown**, not automatically failed. It may be linearized or omitted depending on whether the server could have committed. Later reads and idempotency lookup can constrain its outcome. Losing client history records can make an invalid execution appear legal, so the harness needs durable, append-only evidence.
+
+### Domain invariants and reconciliation
+
+For TokenX, initialize 10,000 accounts with 1,000 units each: total supply is 10 million units. After concurrent transfers, successful idempotent retries, leader changes, and partitions, verify total debits equal credits, no unauthorized negative available balance occurred, each key has one result, and account sequences contain no unexplained duplicates or gaps. A zero total alone is insufficient: one account could lose funds while another gains them wrongly.
+
+For ad clicks, inject duplicate delivery, late events, consumer rebalance, state loss, and replay. Compare aggregate versions with a deterministic batch computation from raw event IDs. Define accepted lateness and dedupe horizons so the oracle matches the product contract.
+
+Faults should resemble actual assumptions: bidirectional and asymmetric partitions, process kill and pause, disk-full or fsync errors, clock skew, stale DNS, and dependency delay. Avoid destructive production experiments unless scope, rollback, and safety controls are explicit.
+
+</UnderTheHood>
+
+<MentalModel title="A crash-test laboratory with a court transcript">
+
+The workload is the vehicle, injected faults are controlled collisions, and the history is a timestamped transcript. The checker does not ask whether the dashboard stayed green; it asks whether any allowed sequence can explain every recorded action and result.
+
+Retain: specify the model, preserve evidence, inject one understood fault family, check safety, then prove the system recovers.
+
+</MentalModel>
+
+<ArchitectureDiagram
+  title="Consistency-test control and evidence paths"
+  chart={"flowchart LR\n  GEN[Concurrent workload generator] --> SYS[System under test]\n  NEM[Fault controller] -. partition pause clock .-> SYS\n  GEN --> HIST[(Durable operation history)]\n  NEM --> HIST\n  SYS --> OBS[(Server versions and logs)]\n  OBS --> HIST\n  HIST --> LIN[Linearizability checker]\n  HIST --> INV[Domain invariant checker]\n  LIN --> REPORT[Minimal counterexample]\n  INV --> REPORT\n  NEM -. heal .-> REC[Recovery verification]\n  SYS --> REC\n  REC --> REPORT"}
+>
+
+The system under test owns application state; the harness owns an independent history and fault schedule. Checkers consume evidence but must not mutate the system. Recovery verification is a first-class phase. The history store must survive harness crashes, or missing operations can invalidate the analysis.
+
+<ArchitectureWalkthrough
+  title="Trace the testing evidence boundary"
+  stages={[
+    { name: "Model", owner: "Test designer", state: "Sequential specification and domain invariants", boundary: "Only promised behavior is checked.", failure: "Oracle encodes a stronger or weaker contract.", recovery: "Review against API semantics and validate with known-good and deliberately bad implementations." },
+    { name: "History", owner: "Durable harness", state: "Invocations, completions, unknowns, and fault schedule", boundary: "Append-only independent evidence.", failure: "Client crash loses operations.", recovery: "Persist before invocation and completion; correlate server IDs during analysis." },
+    { name: "Checker", owner: "Analysis pipeline", state: "Partial order and search state", boundary: "No mutation of tested state.", failure: "State-space explosion or false model assumption.", recovery: "Partition independent keys and minimize the counterexample without dropping required edges." },
+    { name: "Recovery", owner: "Reliability team", state: "Convergence and liveness criteria", boundary: "Faults removed under a deadline.", failure: "System remains stuck or divergent.", recovery: "Capture diagnostics before repair, then exercise documented restoration and recheck invariants." },
+  ]}
+/>
+
+</ArchitectureDiagram>
+
+<RealExamples title="Testing the guarantee users actually depend on">
+
+**TokenX transfer register.** Multiple clients transfer randomized amounts under stable keys while the harness kills leaders, delays acknowledgements, and partitions replicas. The checker combines strict-serializable account behavior with conservation, nonnegative authorization, one result per key, and replay-safe recovery.
+
+**Ad Click Aggregator.** Generate events with a known stable ID set and controlled event-time distribution. Inject duplicates, reorderings, late delivery, consumer rebalances, and checkpoint loss. Compare live and replayed aggregate versions to an offline oracle under the declared watermark and correction policy.
+
+**Lock service.** Pause a holder past expiry, grant a later token, then release the old write. The test succeeds only if the protected resource—not merely the lock service—rejects the stale token.
+
+<FailureScenario
+  title="Explore test-harness mistakes"
+  prompt="A test reports no violations during severe faults."
+  choices={[
+    { label: "Timeouts marked failed", impact: "Committed unknown operations disappear from the model, allowing impossible histories to look legal.", recovery: "Record them as unknown and constrain them with later reads, server IDs, or idempotency lookup." },
+    { label: "Client log loss", impact: "Missing invocations or completions erase real-time and result constraints.", recovery: "Use durable append-only history independent from tested nodes." },
+    { label: "Weak oracle", impact: "Checking only total sum misses duplicated or misdirected transfers that happen to conserve value.", recovery: "Check per-key results, account bounds, ledger balance, sequence integrity, and model history together." },
+  ]}
+/>
+
+</RealExamples>
+
+<InterviewTraps title="Tests that create confidence without evidence">
+
+1. **“Chaos testing proves correctness.”** Fault injection without a formal model or invariant oracle measures symptoms, not the guarantee.
+2. **“A timeout is a failure.”** It is an unknown outcome and must remain optional in the history until evidence constrains it.
+3. **“Linearizable means serializable.”** The checker model must match object operations or multi-object transactions and their real-time contract.
+4. **“No anomaly in one run proves safety.”** Testing finds counterexamples; it cannot prove all executions correct.
+5. **“Kill random pods.”** Target the system's assumptions: quorum links, stale leaders, fsync, clocks, membership, and recovery paths.
+6. **“Stop when the partition heals.”** Verify convergence, resumed progress, cleaned prepared state, and restored redundancy.
+7. **“Production chaos first.”** Start with deterministic lab tests and bounded blast radius; protect customer state and external effects.
+
+</InterviewTraps>
+
+<Tradeoffs title="Fidelity, search cost, and operational safety">
+
+- Model checking gives precise counterexamples but state space grows quickly; narrow objects and independent-key partitioning help.
+- End-to-end tests include real drivers and networks but make timing evidence noisier than in-process model tests.
+- Deterministic fault schedules improve reproducibility; randomized schedules explore more interleavings.
+- Rich server instrumentation constrains unknowns but risks coupling the oracle to the implementation.
+- Production experiments reveal environmental behavior but require strict blast-radius, abort, and data-protection controls.
+
+</Tradeoffs>
+
+<KnowledgeCheck
+  question="A write invocation is recorded, the client times out, and no completion is observed. How should a linearizability history classify it?"
+  options={["Definitely failed", "Definitely succeeded", "Unknown; it may be linearized or omitted unless later evidence constrains it", "Delete it from the history"]}
+  correct={2}
+  explanation="The server may have committed before the response was lost. Treating timeout as failure can hide duplicate effects or create a false model."
+/>
+
+<ScenarioCheck
+  scenario="After a TokenX fault test, total supply remains 10 million units, but one idempotency key produced two transfer IDs and another account received both credits."
+  question="What should the test conclude?"
+  options={[
+    { label: "Pass, because conservation held", feedback: "A global sum is only one invariant and missed duplicate command execution." },
+    { label: "Fail the idempotency and per-command correctness contract, then retain the minimal history", feedback: "One key produced multiple authoritative results even though the aggregate sum happened to balance." },
+    { label: "Ignore it because the network was partitioned", feedback: "Partitions do not waive the declared idempotency or ledger contract." },
+    { label: "Change the expected total", feedback: "Changing the oracle hides the violated command identity." },
+  ]}
+  correct={1}
+  explanation="Consistency testing needs multiple independent invariants. Conservation alone cannot detect misdirected or duplicated balanced entries."
+/>
+
+<InterviewAnswer>
+
+“I turn a guarantee into a model and an independent history. The harness records invocation, completion, unique ID, result, and unknown timeouts, while a controlled nemesis injects partitions, pauses, clock faults, and acknowledgement loss. A linearizability checker searches for a legal real-time-respecting sequence; separate domain checks cover conservation, nonnegative balances, and one result per idempotency key.
+
+I validate the harness against known-good and deliberately broken systems, minimize counterexamples, and continue after healing to verify convergence and liveness. Tests find violations rather than prove all executions safe. See [CAP and practical consistency](/learn/cap-and-consistency-models), [idempotency](/learn/idempotency-and-deduplication), and [backup and recovery](/learn/backup-restore-and-disaster-recovery).”
+
+</InterviewAnswer>

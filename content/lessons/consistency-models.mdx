@@ -1,0 +1,150 @@
+---
+title: "Consistency Models"
+description: "Choose linearizable, serializable, causal, session, bounded-staleness, or eventual behavior from the invariant and user journey."
+module: 6
+moduleTitle: "CAP & Consistency"
+order: 2
+duration: 42
+difficulty: "Advanced"
+tags:
+  - linearizability
+  - serializability
+  - causal consistency
+  - session guarantees
+objectives:
+  - Distinguish real-time object consistency from transactional isolation
+  - Match causal, session, bounded-staleness, and eventual models to operations
+  - Trace how replicas enforce or violate read guarantees
+  - Defend mixed consistency without hiding user-visible anomalies
+---
+
+<BigPicture title="Consistency is an observable contract">
+
+A consistency model constrains which results concurrent clients may observe. It is not the same as durability, availability, or “the data looks right eventually.” The right model is operation-specific: TokenX balance authorization needs a current ordered decision, while an Ad Click dashboard can show a labeled, bounded-old aggregate.
+
+**Linearizability** makes each single-object operation appear to take effect once between invocation and response, respecting real-time order. **Serializability** makes committed transactions equivalent to some serial order, but that order need not respect wall-clock completion. **Strict serializability** provides both transactional serializability and real-time order. Naming these separately prevents a common interview error.
+
+</BigPicture>
+
+<UnderTheHood title="From histories to guarantees">
+
+Suppose write `W1` completes before read `R1` begins. A linearizable register requires `R1` to see `W1` or a later write. A serializable database could legally serialize a later transaction before an earlier completed one unless it also promises strict serializability. Snapshot isolation provides a consistent snapshot but may permit write skew across independently written rows.
+
+Other useful contracts are weaker but intentional:
+
+- **Causal consistency:** if B was created after observing A, anyone who sees B must also see A. Concurrent unrelated writes may appear in different orders.
+- **Read-your-writes:** a session sees its prior writes, often by carrying a minimum log position.
+- **Monotonic reads:** a session never goes backward to an older version.
+- **Monotonic writes:** one client's writes apply in issue order.
+- **Bounded staleness:** a read is at most a stated time or version distance behind.
+- **Eventual consistency:** absent new writes and failures, replicas converge; it says nothing about the interim order or duration unless bounded separately.
+
+<ExecutionTimeline
+  title="A TokenX transfer followed by a balance read"
+  steps={[
+    { title: "Commit", detail: "The ledger leader commits transfer T at log position 884 and returns that position with the transfer ID.", state: "Authoritative balance includes T.", failure: "The response can be lost after commit, so the client must retry with the same idempotency key." },
+    { title: "Carry a token", detail: "The client sends minimum_position=884 on the next balance read.", state: "The session declares its read-your-writes dependency.", failure: "Dropping the token permits routing to an older replica." },
+    { title: "Qualify a replica", detail: "The router chooses a replica only if its applied position is at least 884.", state: "Replica eligibility is measured by log position, not local clock.", failure: "If no replica qualifies, waiting without a deadline can hang the request." },
+    { title: "Wait or lead", detail: "The router waits within budget or falls back to the leader, then returns an as-of position.", state: "Read-your-writes is preserved.", failure: "Returning from an unqualified replica would show the user's money moving backward." },
+  ]}
+/>
+
+Clock age alone is an unsafe freshness proof when clocks can skew or replication is stalled. Version distance is stronger when a common ordered log exists. A 5-second bounded-staleness SLO also needs overload behavior: reject, fall back to the leader, or explicitly return older data with its age.
+
+Quorum arithmetic does not name the model by itself. `R + W > N` gives overlap only under stable membership and the intended replica set. A read still needs version comparison, conflict handling, and protection from a deposed writer. Sloppy quorums and last-write-wins timestamps can violate linearizability despite numerical overlap.
+
+</UnderTheHood>
+
+<MentalModel title="Consistency is the editing policy for a shared document">
+
+Linearizability is one live document where completed edits are immediately authoritative. Serializability is a stack of multi-page edits that can be arranged into a valid order. Causal consistency preserves replies after the messages they answer. Eventual consistency promises all copies will converge after editing stops, without promising what readers see meanwhile.
+
+Retain three questions: which operations must agree, which order must be preserved, and what may a client observe during lag or partition?
+
+</MentalModel>
+
+<ArchitectureDiagram
+  title="Per-operation consistency routing"
+  chart={"flowchart LR\n  CLIENT[Client with minimum position] --> ROUTER[Consistency-aware router]\n  ROUTER --> LEADER[(Ledger leader)]\n  LEADER --> LOG[(Committed log)]\n  LOG --> R1[(Replica applied 884)]\n  LOG --> R2[(Replica applied 872)]\n  ROUTER --> R1\n  ROUTER -. reject for session read .-> R2\n  R1 --> VIEW[Balance response as-of 884]\n  LOG --> PROJ[(Eventually consistent history)]\n  PROJ -. lag and rebuild .-> LOG"}
+>
+
+The leader and committed log own the authoritative balance order. Replicas own local applied positions; the router decides whether those positions satisfy this operation's contract. Wallet history is derived and rebuildable. A lagging replica remains usable for explicitly stale endpoints but is excluded from a read carrying position 884.
+
+<ArchitectureWalkthrough
+  title="Match state to its consistency boundary"
+  stages={[
+    { name: "Command", owner: "Ledger leader", state: "Transfer and balance mutation", boundary: "Strictly serializable commit.", failure: "Authority cannot be proven during partition.", recovery: "Reject the debit and retry after a fenced leader exists." },
+    { name: "Session read", owner: "Consistency router", state: "Client minimum position", boundary: "Read-your-writes and monotonic reads.", failure: "Eligible replicas exceed the latency budget.", recovery: "Fall back to leader or return a declared unavailable result." },
+    { name: "History", owner: "Projection consumer", state: "Wallet feed through an applied offset", boundary: "Eventual with visible as-of version.", failure: "Projection stalls or corrupts.", recovery: "Stop claiming freshness and rebuild from the log." },
+    { name: "Analytics", owner: "Aggregate pipeline", state: "Versioned campaign windows", boundary: "Bounded lateness plus corrections.", failure: "Late data changes a closed result.", recovery: "Publish a higher aggregate version and preserve audit history." },
+  ]}
+/>
+
+</ArchitectureDiagram>
+
+<RealExamples title="Different operations, different contracts">
+
+**TokenX.** Transfer creation and available-balance authorization require one current order; use strict serializability or an equivalent sequenced invariant. Wallet history can lag if the UI carries the transfer receipt and an as-of position. A stale history view must never authorize another debit.
+
+**Ad Click Aggregator.** Live dashboards can be bounded-stale and corrected after late events. Invoice close requires a stable input version and deterministic replay, not merely “eventual.” Causal consistency is useful when a campaign edit must be visible before metrics labeled with the new campaign version.
+
+<FailureScenario
+  title="Explore a consistency mismatch"
+  prompt="A user completes a transfer, refreshes, and a replica shows the old balance."
+  choices={[
+    { label: "Lost session token", impact: "The router cannot distinguish a sufficiently current replica from one behind the user's commit.", recovery: "Carry the commit position and require read-your-writes or use the leader." },
+    { label: "Replica stalls", impact: "Clock age may look small while the applied log position stops advancing.", recovery: "Gate eligibility on version progress and remove stalled replicas from freshness classes." },
+    { label: "Region partition", impact: "The local region cannot reach authority but may still hold an old copy.", recovery: "Reject balance-authorizing operations; optionally show a clearly labeled as-of view." },
+  ]}
+/>
+
+</RealExamples>
+
+<InterviewTraps title="Consistency language that sounds stronger than it is">
+
+1. **“Serializable means real-time.”** It constrains transaction equivalence; strict serializability additionally respects real-time order.
+2. **“Eventual consistency means a few seconds.”** Eventual has no time bound. State a bounded-staleness SLO and failure behavior if time matters.
+3. **“A leader makes reads linearizable.”** A stale or deposed leader can serve old data unless the read proves current authority or uses a quorum/read-index protocol.
+4. **“Read-your-writes is global consistency.”** It is a session guarantee and says little about what other clients observe.
+5. **“Timestamps establish order.”** Wall clocks skew and can move; use logical or hybrid mechanisms with explicit uncertainty assumptions.
+6. **“One model for the service.”** Classify commands, authorization reads, derived feeds, analytics, and offline exports separately.
+
+</InterviewTraps>
+
+<Tradeoffs title="Stronger observation versus coordination cost">
+
+- Linearizable operations simplify current-state reasoning but require coordination and may reject or wait during partitions.
+- Causal consistency preserves meaningful dependencies with more availability, but dependency metadata and session routing add complexity.
+- Bounded staleness gives a product-visible limit, but the system must shed, wait, or fall back when no replica meets it.
+- Eventual views scale and survive disconnection, but are inappropriate for uniqueness, spend authorization, or irreversible decisions without another authority.
+- Strict serializability is powerful for multi-row invariants; hot contention can make reservations, partitioned ownership, or redesigned invariants necessary.
+
+</Tradeoffs>
+
+<KnowledgeCheck
+  question="Transaction A completes before transaction B starts. The database produces a serial order with B before A, while all constraints remain valid. Which guarantee is missing?"
+  options={["Serializability", "Strict serializability's real-time order", "Eventual convergence", "Durability"]}
+  correct={1}
+  explanation="Serializable execution needs some valid serial order, but strict serializability also requires completed-before-started real-time order."
+/>
+
+<ScenarioCheck
+  scenario="A TokenX balance replica is at log position 872. The client's completed transfer returned position 884, and the read deadline has 40 ms remaining."
+  question="What is the most defensible routing behavior?"
+  options={[
+    { label: "Return position 872 because the replica is healthy", feedback: "Health does not satisfy the session's declared minimum version." },
+    { label: "Wait within the deadline for 884, then fall back to the leader or fail explicitly", feedback: "This preserves read-your-writes while keeping latency behavior bounded." },
+    { label: "Compare replica wall-clock time with the client", feedback: "Clock proximity does not prove that transfer 884 was applied." },
+    { label: "Clear the session token after one retry", feedback: "Discarding the dependency silently weakens the user-visible contract." },
+  ]}
+  correct={1}
+  explanation="Version-aware routing can wait or use an authoritative path, but must not silently return a version older than the client's commit."
+/>
+
+<InterviewAnswer>
+
+“I define consistency per operation. Linearizability is a real-time guarantee for individual operations; serializability is a valid transaction order, and strict serializability provides both. TokenX transfer authorization needs a current, strictly ordered invariant, while history can be an eventual projection if it exposes an as-of position and never authorizes spending.
+
+For sessions I carry the commit position and route only to a replica that has applied it, otherwise I wait within deadline or use the leader. Causal and bounded-stale models are useful when their weaker observations are acceptable. I do not infer linearizability from quorum arithmetic alone. See [replication and failover](/learn/replication-and-failover), [transactions across boundaries](/learn/transactions-across-boundaries), and [CAP and practical consistency](/learn/cap-and-consistency-models).”
+
+</InterviewAnswer>

@@ -1,0 +1,156 @@
+---
+title: "Time and Ordering"
+description: "Reason with physical, logical, vector, and hybrid clocks while making causal and total-order requirements explicit."
+module: 6
+moduleTitle: "CAP & Consistency"
+order: 7
+duration: 45
+difficulty: "Advanced"
+tags:
+  - logical clocks
+  - hybrid clocks
+  - causal ordering
+  - clock skew
+objectives:
+  - Separate wall-clock time from causal and total order
+  - Use Lamport, vector, and hybrid clocks within their guarantees
+  - Quantify clock uncertainty in leases and externally consistent commits
+  - Choose ordering scope without imposing an unnecessary global sequencer
+---
+
+<BigPicture title="Timestamps answer different questions than order">
+
+Physical clocks estimate when an event occurred. Logical clocks represent ordering evidence. A total-order sequencer decides one order even for concurrent events. Treating a wall-clock timestamp as all three causes lost updates, premature lease expiry, and broken audit narratives.
+
+TokenX needs deterministic ledger order within an account or shard and trustworthy commit evidence; it rarely needs one global order for every wallet. The Ad Click Aggregator needs event time for windows, ingestion time for operations, and per-partition order for replay. These are distinct fields with distinct owners.
+
+</BigPicture>
+
+<UnderTheHood title="Physical uncertainty and logical evidence">
+
+Wall clocks can drift, step after synchronization, and disagree across hosts. Monotonic clocks are suitable for local elapsed durations but cannot compare two machines. If node A reports 12:00:00.100 and B reports 12:00:00.090, that does not prove A's event happened later.
+
+### Logical clocks
+
+A Lamport clock increments before each local event and advances to `max(local, received) + 1` on message receipt. If event A causally precedes B, then `L(A) < L(B)`. The reverse is not guaranteed: smaller Lamport value does not prove causality, and concurrent events can be forced into an arbitrary tie-broken total order.
+
+Vector clocks track counters per participant. One vector dominating another proves causal inclusion; incomparable vectors indicate concurrency. Their metadata grows with participants. Hybrid Logical Clocks (HLCs) combine a physical component with a logical counter, preserving causality while staying near wall time under a bounded-clock operating assumption. They do not magically make unsynchronized clocks true.
+
+<ExecutionTimeline
+  title="Causal order across an ad campaign edit and click"
+  steps={[
+    { title: "Edit", detail: "Campaign service writes version 81 with HLC (1700000000,4) and emits that version in the outbox.", state: "Version 81 is authoritative campaign configuration.", failure: "The event may arrive after later wall-clock-stamped messages." },
+    { title: "Observe", detail: "An edge collector receives version 81 before accepting a click referencing the new creative.", state: "The click carries campaign_version=81 as an explicit dependency.", failure: "A partition may leave another collector on version 80." },
+    { title: "Replay", detail: "The partition log orders clicks locally, while the consumer waits for configuration version 81 before interpreting this click.", state: "Causal dependency is preserved without a global click order.", failure: "Sorting only by event timestamp could process the click before its configuration." },
+    { title: "Aggregate", detail: "The window processor uses event time for bucket assignment and ingestion sequence for deterministic corrections.", state: "Business time and replay order remain separate.", failure: "Late data follows the correction policy rather than rewriting history invisibly." },
+  ]}
+/>
+
+### Clock uncertainty and commit wait
+
+Some externally consistent databases expose a time interval `[earliest, latest]` that bounds current time. If a transaction chooses commit timestamp `t`, it can wait until the uncertainty interval's earliest possible current time exceeds `t` before acknowledging, ensuring later transactions observe real-time order. If uncertainty is 7 ms, this can add up to roughly 7 ms of commit wait, not counting replication.
+
+For leases, suppose estimated maximum clock error is 100 ms, network delay budget 200 ms, and process pause budget 1 second. A client must stop well before server expiry by at least that uncertainty envelope. Even then, fencing is required because assumptions can be exceeded.
+
+### Pick the smallest ordering scope
+
+Per-account sequence numbers give TokenX stable pagination and gap detection. Per-Kafka-partition offsets order one key's events when keyed correctly. A global sequencer adds cross-region latency, bottleneck risk, and an availability dependency. Use it only when the invariant or audit question truly compares all events globally.
+
+</UnderTheHood>
+
+<MentalModel title="A clock, a reply chain, and a ticket dispenser">
+
+A wall clock estimates time of day. A reply chain proves that one message depended on another. A ticket dispenser assigns a single line order even to people who arrived simultaneously. Physical time, causality, and total order are different tools.
+
+Retain: record business time and processing order separately, carry dependencies explicitly, and order only the scope that must agree.
+
+</MentalModel>
+
+<ArchitectureDiagram
+  title="Business time, causal dependency, and replay order"
+  chart={"flowchart LR\n  CFG[Campaign service] --> CDB[(Config version 81)]\n  CDB --> OUT[(Outbox with HLC)]\n  OUT --> EDGE[Edge collector]\n  EDGE --> CLICK[Click with event time and config 81]\n  CLICK --> LOG[(Partition log offset)]\n  LOG --> PROC[Window processor]\n  CDB --> PROC\n  PROC --> AGG[(Versioned aggregate)]\n  LATE[Late event] -. correction .-> PROC\n  CLOCK[Clock uncertainty monitor] -. unhealthy clock .-> STOP[Stop lease or commit path]"}
+>
+
+The configuration database owns version 81. The log owns per-partition replay order. The click owns source-reported event time plus an explicit configuration dependency. The aggregate is derived and versioned. Clock health can gate protocols that assume bounded uncertainty, but it does not replace version or fencing checks.
+
+<ArchitectureWalkthrough
+  title="Choose the right notion of order"
+  stages={[
+    { name: "Physical time", owner: "Clock service and host", state: "Timestamp plus uncertainty", boundary: "Measured synchronization assumptions.", failure: "Clock steps or exceeds bound.", recovery: "Quarantine time-dependent paths and use logical/version evidence." },
+    { name: "Causality", owner: "Message and version protocol", state: "Dependency version or logical clock", boundary: "Happened-before relation.", failure: "Consumer lacks prerequisite state.", recovery: "Buffer, fetch dependency, or reject rather than invent order." },
+    { name: "Total order", owner: "Sequencer or consensus log", state: "Term and sequence position", boundary: "One order inside the chosen scope.", failure: "Quorum unavailable.", recovery: "Stop ordered commits or degrade only operations whose invariants allow it." },
+    { name: "Event time", owner: "Domain event envelope", state: "Source time and ingestion time", boundary: "Watermark and correction policy.", failure: "Late or skewed timestamp.", recovery: "Bound accepted skew, retain raw evidence, and emit corrections." },
+  ]}
+/>
+
+</ArchitectureDiagram>
+
+<RealExamples title="Ordering only what the product needs">
+
+**TokenX.** The ledger assigns an account sequence inside the authoritative transaction. Two accounts on separate shards need no global timestamp for ordinary history. A cross-shard transfer carries one transfer ID and participant states; the transaction protocol, not timestamp comparison, decides completion.
+
+**Ad Click Aggregator.** Store event time, ingestion time, stable event ID, campaign version, and partition offset. Event time assigns windows; offset controls replay; version resolves configuration; ingestion time diagnoses delay. Sorting all clicks by client time would be expensive and incorrect under skew.
+
+**Audit logs.** A wall timestamp helps humans, while term/index or account sequence proves local order. Preserve both rather than claiming nanosecond timestamps form a global truth.
+
+<FailureScenario
+  title="Explore ordering failures"
+  prompt="A design sorts distributed events by wall-clock timestamp."
+  choices={[
+    { label: "Clock steps backward", impact: "A later local event can appear before an earlier one.", recovery: "Use a monotonic source for durations and a logical sequence for state transitions." },
+    { label: "Concurrent regions", impact: "Timestamp order invents causality between independent events or reverses a real dependency.", recovery: "Carry causal versions and use a sequencer only where total order is required." },
+    { label: "Offline client", impact: "Old event time arrives after current windows closed.", recovery: "Keep ingestion time, apply a lateness policy, and publish a correction rather than trust arrival or event time alone." },
+  ]}
+/>
+
+</RealExamples>
+
+<InterviewTraps title="Time claims without assumptions">
+
+1. **“Timestamp gives total order.”** Equal values, skew, and clock steps require a tie-breaker and still do not prove causality.
+2. **“Lamport order proves happened-before both ways.”** Causality implies increasing Lamport time; increasing time does not imply causality.
+3. **“Vector clocks scale to every client.”** Metadata grows with participant identity and needs compaction or scoped membership.
+4. **“HLC removes clock uncertainty.”** It preserves causal monotonicity near physical time; external-time claims still depend on bounded clocks.
+5. **“Kafka orders events.”** It orders records within one partition, not across the topic.
+6. **“Event time is trustworthy.”** Device clocks can be wrong or adversarial; retain ingestion evidence and bound accepted skew.
+7. **“Global order simplifies everything.”** It also adds a global coordination path; name the invariant that pays for it.
+
+</InterviewTraps>
+
+<Tradeoffs title="Order strength versus metadata and coordination">
+
+- Physical timestamps are compact and human-readable but provide uncertain cross-host order.
+- Lamport clocks are small and preserve causal implication, but cannot detect concurrency.
+- Vector clocks detect concurrency but grow with writers and complicate garbage collection.
+- HLCs stay near physical time and preserve causality, but rely on clock-health enforcement for bounded-time claims.
+- A global sequencer simplifies a global order at the cost of latency, throughput, and partition availability; per-key order is often sufficient.
+
+</Tradeoffs>
+
+<KnowledgeCheck
+  question="Event A has Lamport time 12 and event B has Lamport time 19. What can be concluded from those values alone?"
+  options={["A definitely caused B", "B definitely caused A", "The assigned logical order places A before B, but causality is not proven", "The events occurred seven milliseconds apart"]}
+  correct={2}
+  explanation="Happened-before implies increasing Lamport time, but the converse is false. The values are logical counters, not milliseconds."
+/>
+
+<ScenarioCheck
+  scenario="TokenX nodes have a measured clock uncertainty of up to 7 ms. A design assigns commit timestamp t and responds immediately, then another region starts a transaction after observing the response."
+  question="What is needed to claim external real-time ordering from timestamps?"
+  options={[
+    { label: "Nothing; timestamp t is already global truth", feedback: "The second region's clock interval may still overlap t." },
+    { label: "Wait until the uncertainty interval proves real time has passed t, while also using the database's replication protocol", feedback: "Commit wait closes the uncertainty window; replication still establishes durable ordered state." },
+    { label: "Round all timestamps to seconds", feedback: "Lower precision increases ties and does not remove uncertainty." },
+    { label: "Use the client device clock", feedback: "An uncontrolled client clock provides weaker evidence." },
+  ]}
+  correct={1}
+  explanation="External consistency needs both the ordered commit protocol and a wait that places the acknowledgement after the chosen timestamp under the stated uncertainty bound."
+/>
+
+<InterviewAnswer>
+
+“I separate physical time, causality, and total order. Wall clocks estimate business time and carry uncertainty; Lamport clocks preserve causal implication; vectors detect concurrency; hybrid clocks remain near physical time while adding logical order. None removes the need to state clock assumptions.
+
+TokenX uses account sequence numbers or consensus positions for authoritative order, not timestamp comparison. Ad clicks carry event time, ingestion time, campaign version, and partition offset because each answers a different question. I avoid a global sequencer unless a global invariant requires it. See [time-series storage](/learn/time-series-and-append-only-storage), [conflict resolution](/learn/conflict-resolution), and [distributed locks](/learn/distributed-locks-and-leases).”
+
+</InterviewAnswer>

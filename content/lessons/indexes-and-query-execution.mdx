@@ -1,0 +1,169 @@
+---
+title: "Indexes and Query Execution"
+description: "Design indexes from access paths, read query plans, and reason about write amplification, selectivity, pagination, and index failure modes."
+module: 1
+moduleTitle: "Storage & Data"
+order: 4
+duration: 39
+difficulty: "Intermediate"
+tags:
+  - indexes
+  - query planning
+  - b-tree
+  - performance
+objectives:
+  - Explain how B-tree indexes turn predicates into bounded page reads
+  - Design composite and covering indexes for real access paths
+  - Interpret query plans and diagnose stale statistics or index bloat
+  - Balance read latency against write amplification and operational cost
+---
+
+<BigPicture>
+
+An index is a maintained, ordered copy of selected columns plus a way to find the base row. It is not free acceleration: every indexed write adds CPU, random I/O, WAL, cache pressure, and recovery work. The useful question is therefore not “which columns are queried?” but “which access path must be bounded at the target cardinality?”
+
+TokenX must answer two very different queries: enforce a globally unique idempotency key during a transfer, and page through one wallet's history in reverse sequence order. The first needs a unique lookup; the second needs an ordered range. A single-column index on `wallet_id` does not satisfy the ordering and may still sort millions of rows.
+
+</BigPicture>
+
+<UnderTheHood>
+
+### B-tree mechanics and cost
+
+A B-tree stores sorted keys in fixed-size pages. Internal pages route to child pages; leaf pages hold keys and row locators, or table rows in a clustered organization. If an 8 KiB internal page can hold roughly 250 separators and pointers, four levels address about `250^4 = 3.9 billion` entries. A point lookup is therefore a handful of page visits—not a scan of 100 million rows—but cache misses and heap fetches still matter.
+
+For TokenX history, a useful index is:
+
+```sql
+CREATE INDEX CONCURRENTLY wallet_history_page
+ON ledger_entries (wallet_id, account_sequence DESC, entry_id DESC)
+INCLUDE (amount_minor, asset_code, entry_type, occurred_at);
+```
+
+The equality column comes first, followed by the range and ordering columns. `entry_id` breaks ties, so a cursor `(account_sequence, entry_id)` cannot skip or duplicate rows. Included display columns may enable an index-only scan when visibility metadata permits it. The index cannot efficiently serve a query filtering only by `account_sequence`; this is the composite index left-prefix rule.
+
+### Planning and execution
+
+The optimizer estimates row counts from statistics, compares sequential scan, index scan, join, and sort costs, then selects a plan. Execution may diverge when values are correlated, a hot wallet is underrepresented in samples, or statistics are stale. Always compare estimated and actual rows with a safe `EXPLAIN ANALYZE` environment.
+
+<ExecutionTimeline
+  title="How a wallet-history query executes"
+  steps={[
+    { title: "Bind a stable cursor", detail: "Use wallet_id plus the last account_sequence and entry_id; do not use OFFSET over a growing table." },
+    { title: "Plan from statistics", detail: "The optimizer estimates selectivity and chooses the composite index because it satisfies filtering and ordering." },
+    { title: "Descend the B-tree", detail: "Internal pages locate the first leaf page in roughly the tree height." },
+    { title: "Scan a bounded range", detail: "Read the next 51 entries to return 50 and determine whether another page exists." },
+    { title: "Fetch or verify visibility", detail: "An MVCC engine checks tuple visibility; missing covered columns require heap reads." },
+  ]}
+/>
+
+### Write and maintenance costs
+
+Suppose TokenX writes 6,000 ledger rows per second and each row updates five indexes. That is 30,000 logical index insertions per second before WAL and page splits. A new 40-byte index entry adds about `6,000 × 40 × 86,400 ≈ 20.7 GB/day` of logical index data, before overhead and replicas. Low-selectivity indexes, such as a boolean `settled`, rarely justify that cost alone; a partial index on unsettled rows may.
+
+MVCC leaves dead versions until vacuum or compaction reclaims them. Long transactions delay cleanup, inflate indexes, and increase page reads. Concurrent index creation avoids a long write-blocking table lock but consumes I/O, takes longer, and must be monitored for invalid remnants after failure.
+
+</UnderTheHood>
+
+<MentalModel>
+
+Think of an index as a specialized table of contents that the database rewrites every time the book changes. A composite index is alphabetized left to right: `(wallet, sequence)` quickly finds a wallet's sequence range, but not every wallet sharing one sequence.
+
+Retain four questions: which exact query, how many rows survive each predicate, whether the index supplies the required order and columns, and what every write now costs.
+
+</MentalModel>
+
+<ArchitectureDiagram
+  title="Query planning, indexed state, and recovery boundary"
+  description="The primary owns authoritative rows and indexes. WAL is the durability and replication boundary; replicas may serve explicitly stale reads."
+  chart={"flowchart LR\n  API[TokenX history API] --> PLAN[Planner and executor]\n  CAT[(Statistics catalog)] --> PLAN\n  PLAN --> IDX[(Wallet sequence B-tree)]\n  IDX --> HEAP[(Authoritative ledger rows)]\n  WRITE[Transfer transaction] --> HEAP\n  WRITE --> IDX\n  WRITE --> WAL[(Durable WAL)]\n  WAL --> REPL[(Read replica)]\n  REPL -. lag or failover .-> API\n  CAT -. stale estimates .-> BAD[Wrong plan]\n  BAD -. analyze or reindex .-> CAT"}
+>
+
+The consistency boundary is the primary commit: its rows, uniqueness constraints, index changes, and WAL record commit together. A replica is a separate readable copy and may lag. Stale statistics can cause a poor plan without corrupting data; a failed uniqueness index or missed constraint is a correctness incident and must not be treated as ordinary performance degradation.
+
+</ArchitectureDiagram>
+
+<ArchitectureWalkthrough
+  title="Walk the ownership boundaries"
+  stages={[
+    { name: "Primary transaction", owner: "Ledger database", state: "Transfer rows and idempotency", boundary: "One authoritative commit.", failure: "A constraint or transaction aborts.", recovery: "Retry the whole command with the same idempotency key." },
+    { name: "B-tree", owner: "Database storage engine", state: "Sorted keys and row locators", boundary: "Maintained atomically with table changes.", failure: "Bloat or a failed concurrent build.", recovery: "Clean invalid artifacts, vacuum or reindex with I/O headroom." },
+    { name: "WAL", owner: "Primary durability layer", state: "Ordered row and index mutations", boundary: "Durable commit position.", failure: "Log corruption or retention gap.", recovery: "Restore a verified snapshot and replay contiguous WAL." },
+    { name: "Replica", owner: "Read-routing tier", state: "Applied log position", boundary: "Declared lag and session policy.", failure: "The replica falls behind.", recovery: "Remove it from eligible reads, catch up, or reseed." },
+  ]}
+/>
+
+<RealExamples>
+
+**TokenX idempotency.** A unique index on `(tenant_id, idempotency_key)` turns concurrent duplicate requests into one winner. An application-side “check then insert” races. Store the request fingerprint too: reusing a key with different transfer parameters must be rejected, not replayed as success.
+
+**Ad Click Aggregator.** A dashboard query by `(campaign_id, bucket_start)` benefits from an ordered aggregate key. Indexing raw `user_agent` or a high-churn JSON payload makes ingestion more expensive while serving no bounded query. For time-correlated append tables, a compact block-range index can outperform a huge B-tree for broad time scans, but it is poor for isolated point lookups.
+
+**When the design fails.** Offset pagination becomes increasingly expensive and unstable as inserts shift rows. A function such as `LOWER(email)` will not use a plain `email` index unless the engine can transform it; use a matching expression index or normalized column. An index that returns 40% of a table may lose to a sequential scan.
+
+<FailureScenario
+  title="A hot-wallet query suddenly scans millions of rows"
+  prompt="After a bulk import, p99 jumps although the composite index exists. The plan estimates 200 rows but returns 3.2 million. What do you do first?"
+  choices={[
+    { label: "Stale statistics", impact: "The optimizer underestimates the hot-wallet cardinality and selects an expensive access path.", recovery: "Compare estimated with actual rows, refresh statistics, and add skew or correlated-column statistics if supported." },
+    { label: "Index bloat", impact: "Dead entries enlarge the tree and turn a bounded range into more page reads.", recovery: "Measure bloat and long transactions, then vacuum or rebuild with capacity and replica-lag safeguards." },
+    { label: "Unbounded request", impact: "A caller omitted the cursor or limit, so even a correct index returns millions of rows.", recovery: "Enforce server-side limits and require keyset pagination at the API boundary." },
+  ]}
+/>
+
+</RealExamples>
+
+<InterviewTraps>
+
+1. **“Add indexes to every filter.”** Ask for cardinality, read frequency, sort order, write rate, and storage budget. An unused index is a recurring tax.
+2. **“The index makes the query O(log n).”** The seek may be logarithmic, but returning `k` rows is at least `O(k)`, heap reads may be random, and sorting or joins can dominate.
+3. **“A covering index never touches the table.”** MVCC visibility checks or missing columns can still require heap access; engine details matter.
+4. **“OFFSET is fine because pages are small.”** The engine often scans and discards earlier rows. Use a unique, immutable keyset cursor and define snapshot semantics.
+5. **“Build the index in production now.”** Discuss lock behavior, I/O headroom, replica lag, cancellation, invalid-index cleanup, and rollback.
+
+A defensible IC6 answer connects an index to a named query and validates it with observed plans under production-like distributions.
+
+</InterviewTraps>
+
+<Tradeoffs>
+
+- Composite indexes serve a narrow family of left-prefix access paths; they are inappropriate when queries filter primarily on unrelated suffix columns.
+- Covering indexes reduce base-row reads but increase size, cache churn, WAL, and update cost.
+- Clustered organization makes range reads local but makes random-key inserts and secondary references more expensive.
+- Partial indexes are excellent for a small active subset, but queries must imply the predicate and operational tooling must understand them.
+- Search engines suit relevance, tokenization, and faceting; using one as the source of truth for balances trades away transactional enforcement.
+
+</Tradeoffs>
+
+<KnowledgeCheck
+  question="TokenX pages a wallet's entries with WHERE wallet_id = ? AND (account_sequence, entry_id) < (?, ?) ORDER BY account_sequence DESC, entry_id DESC LIMIT 51. Which index best matches?"
+  options={[
+    "(entry_id, wallet_id)",
+    "(wallet_id, account_sequence DESC, entry_id DESC)",
+    "(account_sequence DESC) only",
+    "Separate single-column indexes on all three columns",
+  ]}
+  correct={1}
+  explanation="The equality key leads, followed by the ordered range and stable tie-breaker. Separate indexes generally cannot preserve this compound ordering."
+/>
+
+<ScenarioCheck
+  title="Index budget under sustained writes"
+  scenario="A proposed index speeds a weekly report from 80 seconds to 4 seconds but adds 20 GB/day of logical index writes to a latency-sensitive TokenX primary. The report can be 15 minutes stale."
+  question="What is the strongest design response?"
+  options={[
+    { label: "Add it to the primary", feedback: "This spends continuous write and recovery budget for an infrequent stale-tolerant query." },
+    { label: "Run the report without an index", feedback: "A large scan can still disrupt the primary and is not an operational design." },
+    { label: "Build a projection off the outbox", feedback: "Move the report to a replayable read model with a 15-minute freshness SLO, preserving primary write headroom." },
+  ]}
+  correct={2}
+  explanation="Index decisions include workload placement. A derived store is often better than taxing an authoritative write path."
+/>
+
+<InterviewAnswer>
+
+“I begin with a concrete predicate, ordering, result size, and latency SLO. For TokenX history I use a composite keyset index on wallet and account sequence, include only stable display fields, and keep balance authorization on the primary. I validate estimated versus actual rows and test skew, cache-cold behavior, and pagination under concurrent inserts.
+
+Every index has a write, WAL, storage, vacuum, and restore cost, so I calculate amplification before adding it. Low-frequency analytical access paths belong in replayable projections when possible. Related lessons are [data modeling](/learn/data-modeling-from-access-patterns), [replication and failover](/learn/replication-and-failover), and [time-series storage](/learn/time-series-and-append-only-storage).”
+
+</InterviewAnswer>

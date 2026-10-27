@@ -1,0 +1,150 @@
+---
+title: "Consensus and Leader Election"
+description: "Understand terms, quorums, replicated logs, leader authority, membership changes, and the boundary between safety and liveness."
+module: 6
+moduleTitle: "CAP & Consistency"
+order: 3
+duration: 46
+difficulty: "Advanced"
+tags:
+  - consensus
+  - leader election
+  - replicated log
+  - fencing
+objectives:
+  - Trace a Raft-style election and log commit
+  - Separate consensus safety from timing-dependent liveness
+  - Explain leader epochs, quorum intersection, and stale-writer fencing
+  - Change cluster membership without creating disjoint majorities
+---
+
+<BigPicture title="Consensus chooses one history, not merely one server">
+
+Consensus lets independent nodes agree on an ordered sequence despite crashes and delayed messages. Leader election is one part: a leader proposes log entries, but safety comes from terms, voting restrictions, quorum intersection, log matching, and commit rules. A health check selecting “the fastest node” is not consensus.
+
+TokenX may use a consensus-backed database so committed ledger mutations survive leader failure with one authoritative order. The Ad Click Aggregator may use consensus for broker metadata and partition leadership even though individual aggregate values are eventually consistent.
+
+</BigPicture>
+
+<UnderTheHood title="Terms, votes, logs, and commit">
+
+In a Raft-style protocol, each node persists its current term, vote, and log. A follower that misses heartbeats starts an election after a randomized timeout, increments its term, votes for itself, and requests votes. A voter grants at most one vote per term and only to a candidate whose log is at least as up to date. In a five-node cluster, three votes elect a leader and the system tolerates two crash failures while retaining progress.
+
+<ExecutionTimeline
+  title="From election to committed transfer command"
+  steps={[
+    { title: "Election", detail: "Node C times out, enters term 18, persists its self-vote, and receives votes from A and D.", state: "C is leader for term 18 with a 3-of-5 majority.", failure: "Delayed term-17 messages cannot restore the old leader because recipients reject lower terms." },
+    { title: "Append", detail: "C appends transfer command X at log index 440 and sends it to followers.", state: "X is uncommitted and must not be externally applied as final.", failure: "C can fail before replication; a later leader may overwrite this uncommitted suffix." },
+    { title: "Replicate", detail: "A and D durably append X and acknowledge term 18, giving C a majority.", state: "The entry is stored on three failure-independent nodes.", failure: "An acknowledgement before durable storage weakens the assumed fault tolerance." },
+    { title: "Commit and apply", detail: "C advances commitIndex and applies X to the deterministic state machine; followers learn the commit position.", state: "X belongs to the chosen history.", failure: "A client timeout after commit creates an unknown outcome resolved by idempotency key." },
+  ]}
+/>
+
+Consensus safety does not require bounded network delay: two different values must not commit at the same log position. Liveness does require eventual timing conditions—messages must eventually arrive and one candidate must stay connected to a quorum long enough. During a long partition, the minority remains safe but unavailable for new commits.
+
+### Commit is more than replica count
+
+A leader normally commits a current-term entry after a majority stores it; earlier entries then become committed through log ordering. Simply finding an old entry on a majority at different times can be unsafe if terms and election rules are ignored. Reads also need authority: a read-index round, valid lease under bounded clock assumptions, or a committed no-op can establish that the leader is current.
+
+At 10,000 commands/s with 500-byte encoded log entries, payload append is 5 MB/s per replica before protocol and storage overhead. A five-node cluster writes roughly 25 MB/s of replica payload. Consensus is not a substitute for partitioning: one group still has one ordered commit stream and one hot leader path.
+
+### Membership changes
+
+Replacing three nodes at once can accidentally create an old majority and a disjoint new majority. Safe protocols use joint consensus or an equivalent staged configuration whose quorums overlap across old and new membership. Learners should treat “autoscale the consensus nodes” as a protocol operation, not ordinary instance replacement.
+
+</UnderTheHood>
+
+<MentalModel title="A numbered parliamentary record">
+
+Each term elects one chair. Proposals enter a numbered record, and a majority must preserve an entry before it becomes official. A former chair may still speak after losing contact, but every official recipient rejects statements carrying the old term.
+
+Retain: election chooses an epoch-scoped proposer; quorum plus log rules chooses history; fencing prevents obsolete authority from causing side effects.
+
+</MentalModel>
+
+<ArchitectureDiagram
+  title="Consensus log authority and stale-leader rejection"
+  chart={"flowchart LR\n  CLIENT[TokenX command] --> L[Leader term 18]\n  L --> A[(Follower A)]\n  L --> D[(Follower D)]\n  L --> B[(Follower B)]\n  L --> E[(Follower E)]\n  A --> Q[Majority commit]\n  D --> Q\n  L --> Q\n  Q --> SM[(Authoritative state machine)]\n  OLD[Old leader term 17] -. rejected lower term .-> A\n  OLD -. fenced side effect .-> SINK[External sink]\n  SNAP[(Snapshot)] -. restore plus log tail .-> A"}
+>
+
+The committed log and deterministic state machine own authoritative order. Followers own durable log prefixes, not independent truth. The external sink must validate a fencing epoch or consume an idempotent committed command; otherwise an isolated old leader can still damage resources outside the consensus group.
+
+<ArchitectureWalkthrough
+  title="Trace consensus ownership"
+  stages={[
+    { name: "Election", owner: "Voting members", state: "Persistent term and vote", boundary: "One vote per term and up-to-date-log rule.", failure: "Split votes repeat.", recovery: "Randomized timeouts and eventual message delivery permit one candidate to win." },
+    { name: "Replication", owner: "Current leader", state: "Proposed log suffix", boundary: "Followers accept matching term and prefix.", failure: "Leader has an uncommitted divergent suffix.", recovery: "A later leader backs it up to a matching prefix and overwrites it." },
+    { name: "Commit", owner: "Consensus group", state: "Commit index and chosen entries", boundary: "Overlapping majority under valid membership.", failure: "Quorum is unavailable.", recovery: "Remain safe and stop commits until quorum returns or membership changes safely." },
+    { name: "Side effect", owner: "State-machine adapter", state: "Last applied index and epoch", boundary: "Committed entries only plus fencing.", failure: "Old leader reaches an external resource.", recovery: "Reject lower epochs and reconcile stable command IDs." },
+  ]}
+/>
+
+</ArchitectureDiagram>
+
+<RealExamples title="Where consensus helps and where it stops">
+
+**TokenX ledger shard.** One consensus group orders transfers for accounts in that shard. A committed idempotency record resolves client retries. Cross-shard transfers still need a distributed transaction, reservation, or redesigned ownership protocol; two independent consensus groups do not magically share one atomic log.
+
+**Ad Click Aggregator.** Kafka-like brokers use a metadata quorum and per-partition leaders to decide ownership. Aggregation workers should not put every click through one global consensus group; the ordered partition log already provides the necessary local sequence.
+
+<FailureScenario
+  title="Explore election and commit failures"
+  prompt="A five-node group loses communication across a 2/3 partition."
+  choices={[
+    { label: "Three-node side", impact: "It can elect or retain a leader and commit if membership and logs satisfy the protocol.", recovery: "Continue with degraded redundancy, then catch up the isolated nodes before declaring full health." },
+    { label: "Two-node side", impact: "It cannot commit new entries but may still contain an old process claiming leadership.", recovery: "Reject writes and fence old-term side effects until it rejoins and learns the newer term." },
+    { label: "Partition heals", impact: "Divergent uncommitted suffixes may exist on the minority.", recovery: "The current leader's log-matching protocol truncates conflicting uncommitted entries and restores one prefix." },
+  ]}
+/>
+
+</RealExamples>
+
+<InterviewTraps title="Consensus claims that omit the proof">
+
+1. **“Three replicas tolerate two failures.”** A three-member majority is two, so only one crash can be tolerated while making progress.
+2. **“The newest timestamp wins the election.”** Election safety uses terms and log freshness, not unsynchronized wall clocks.
+3. **“Replicated means committed.”** An entry may exist on followers yet remain overwriteable until the protocol's commit condition holds.
+4. **“The leader can serve local reads.”** It must establish current authority; an isolated former leader can be stale.
+5. **“Consensus prevents split brain everywhere.”** It controls participating state. External stores need fencing tokens or idempotent committed commands.
+6. **“Add nodes for throughput.”** More members increase fault-domain options but add quorum latency and do not increase one log's ordered write capacity.
+7. **“Replace the cluster in parallel.”** Membership transition must preserve quorum intersection.
+
+</InterviewTraps>
+
+<Tradeoffs title="Safety, latency, availability, and scope">
+
+- Larger quorums tolerate more failures but add replication work and more slow-member exposure.
+- Odd-sized voter sets usually buy more fault tolerance per member; learners should calculate majority explicitly.
+- Leader leases can make reads faster but depend on bounded clock drift and lease enforcement; read-index protocols cost a round trip but use fewer clock assumptions.
+- Consensus gives strong ordering inside one group; globalizing unrelated keys creates latency and throughput bottlenecks.
+- Automatic reconfiguration helps operations but increases protocol risk; staged, observable membership changes are safer.
+
+</Tradeoffs>
+
+<KnowledgeCheck
+  question="A term-18 leader appends an entry locally and to one follower in a five-node cluster, then returns success. What is wrong?"
+  options={["Nothing; two copies are enough", "The entry lacks a three-member majority and may be overwritten", "The term must be even", "Followers should apply before writing the log"]}
+  correct={1}
+  explanation="A five-member majority is three. Without the protocol's commit condition, the entry is uncommitted and a later leader may replace it."
+/>
+
+<ScenarioCheck
+  scenario="An isolated old leader has term 17. The cluster elected term 18, but the old process can still call a storage appliance that does not participate in consensus."
+  question="Which control closes the split-brain side-effect path?"
+  options={[
+    { label: "Shorter heartbeat intervals", feedback: "Detection speed does not prevent the old process from reaching an external resource." },
+    { label: "A fencing token checked by the appliance", feedback: "The appliance rejects operations carrying an epoch lower than the highest one it has accepted." },
+    { label: "Five more read replicas", feedback: "Replica count does not extend consensus authority into the appliance." },
+    { label: "Use the old leader's wall clock", feedback: "Clock values do not prove current membership authority." },
+  ]}
+  correct={1}
+  explanation="Consensus must be extended to the side-effect boundary through a monotonically increasing fencing epoch or an equivalent committed-command adapter."
+/>
+
+<InterviewAnswer>
+
+“Consensus selects one ordered history through persistent terms, restricted voting, log matching, and overlapping quorums. In a five-node group, three durable acknowledgements form a majority and two crashes can be tolerated while retaining progress. Safety survives arbitrary delay; liveness needs eventual connectivity and a stable leader long enough to communicate.
+
+I distinguish proposed, replicated, committed, and applied entries. Reads must prove current authority, membership changes must preserve old/new quorum intersection, and external resources must reject stale fencing epochs. Consensus scopes to one group; cross-shard invariants need another protocol. See [replication and failover](/learn/replication-and-failover), [CAP and practical consistency](/learn/cap-and-consistency-models), and [idempotency](/learn/idempotency-and-deduplication).”
+
+</InterviewAnswer>

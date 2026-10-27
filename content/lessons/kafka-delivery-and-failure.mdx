@@ -1,0 +1,124 @@
+---
+title: "Kafka Delivery Semantics & Failure"
+description: "Reason precisely about offsets, retries, idempotency, consumer groups, and failure recovery."
+module: 3
+moduleTitle: "Kafka & Fault Tolerance"
+order: 1
+duration: 32
+difficulty: "Intermediate"
+tags:
+  - Kafka
+  - idempotency
+  - retries
+objectives:
+  - "Explain at-most-once and at-least-once boundaries"
+  - "Design replay-safe consumers"
+  - "Handle poison messages without blocking a partition"
+---
+
+<BigPicture title="Delivery semantics belong to a boundary">
+
+Kafka does not magically make a whole business workflow exactly once. It can durably replicate records and coordinate transactional reads and writes inside supported boundaries. Once a consumer calls an external payment API or database, correctness depends on that side effect too.
+
+Design for at-least-once delivery with idempotent effects unless you can name and enforce a narrower transactional boundary.
+
+Durability begins before consumption. With replication factor three, <code>acks=all</code> makes the producer wait for every replica currently in the in-sync replica set—not necessarily every configured replica. <code>min.insync.replicas=2</code> requires at least two in-sync replicas for an acknowledged write; if fewer remain, the broker rejects the write rather than silently weakening the guarantee. That trades write availability for a clearer loss boundary.
+
+Producer idempotence assigns producer IDs and sequence numbers so broker retries do not append the same producer batch twice within the producer session. It does not deduplicate two business commands with different event IDs, and it does not make an external database side effect exactly once.
+
+</BigPicture>
+
+<UnderTheHood title="The offset is part of your correctness protocol">
+
+If a consumer commits its offset before applying a side effect, a crash can lose work: at-most-once behavior. If it applies the side effect first and commits second, a crash can repeat work: at-least-once behavior.
+
+Make repetition safe with a unique event ID. In a relational database, write the business mutation and processed-event marker in one transaction. For outbound events, write an outbox row in that same transaction and publish it asynchronously.
+
+Retries should use capped exponential backoff with jitter. Non-transient failures go to a quarantined dead-letter path carrying original metadata, error class, and replay controls.
+
+Consumer offsets are group progress, not proof that a business effect committed. During a rebalance, ownership can move while a previous consumer still has work in flight. Consumers should stop fetching on revocation, finish or cancel bounded work, commit only completed offsets, and use database constraints or fencing so a stale owner cannot apply an effect twice. Long processing must also respect <code>max.poll.interval.ms</code>, or the group may replace an otherwise healthy consumer.
+
+<ExecutionTimeline
+  title="One record across producer, broker, consumer, and sink"
+  steps={[
+    { title: "Produce", detail: "An idempotent producer sends a sequenced batch and waits for acks=all.", state: "The producer owns retry sequencing.", failure: "An ambiguous response triggers the same batch retry, not a new business event." },
+    { title: "Replicate", detail: "The leader appends and enough in-sync replicas persist the record to satisfy min.insync.replicas.", state: "Kafka owns the durable log record.", failure: "Too few in-sync replicas cause a rejected write when durability is prioritized." },
+    { title: "Apply", detail: "The consumer transactionally writes the business effect and event-id marker.", state: "The sink owns business idempotency.", failure: "A crash after sink commit produces a replay." },
+    { title: "Advance offset", detail: "Only completed effects advance group progress; rebalance revocation stops new work first.", state: "Kafka owns group position.", failure: "A replay is safe because the sink fences the duplicate." }
+  ]}
+/>
+
+</UnderTheHood>
+
+<MentalModel title="Crash between any two lines">
+
+For every consumer, imagine the process dying before and after each operation: read, compute, write, acknowledge. If either ordering loses or duplicates an unacceptable effect, add idempotency or atomicity.
+
+Think of a coat-check ticket. Kafka's offset says which ticket number the attendant reached; it does not prove the coat reached the correct owner. The sink needs its own claim check—the event ID—and both the claim check and the handoff must be recorded together.
+
+Partitions provide order only within that partition. Consumer groups provide parallel ownership, not global order.
+
+</MentalModel>
+
+<ArchitectureDiagram title="Replay-safe order consumer and durability boundaries" chart={"flowchart LR\n  P[Idempotent producer] -->|acks=all| L[Partition leader]\n  L -->|replicate; min ISR=2| F1[In-sync follower]\n  L -->|replicate| F2[In-sync follower]\n  L --> K[(Authoritative Kafka log)]\n  K -->|partition ownership| C[Consumer group member]\n  C --> T{One sink DB transaction}\n  T --> O[(Orders + processed event IDs)]\n  T --> X[(Outbox)]\n  X --> R[Relay]\n  R --> N[Notifications]\n  C -->|after DB commit| OF[(Consumer offset)]\n  C -->|permanent failure + metadata| Q[(Quarantine topic)]\n  OF -. rebalance / replay .-> C"}>
+
+Kafka owns replicated log durability and group offsets. The sink database owns the business effect, dedupe marker, and outbox in one local transaction. The boundary between the sink commit and Kafka offset commit is deliberately at-least-once; replay safety closes the gap.
+
+</ArchitectureDiagram>
+
+<RealExamples title="Duplicate orders and analytics replays">
+
+An order-created event may be delivered twice after a rebalance. A uniqueness constraint on <code>event_id</code> makes the second database transaction a no-op. A click counter can instead use windowed state plus offset-aware checkpoints.
+
+TokenX settlement instructions need an idempotency key at the ledger boundary. Email delivery may accept a small duplication risk, but balance mutation cannot.
+
+<FailureScenario
+  title="Inspect a Kafka durability decision"
+  prompt="A replication-factor-three partition loses one follower, then the remaining follower becomes slow."
+  choices={[
+    { label: "min ISR = 2", impact: "acks=all writes pause or fail once fewer than two replicas are in sync; acknowledged writes retain the intended replica floor.", recovery: "Restore a follower or explicitly accept a weaker policy through an operator-controlled change." },
+    { label: "min ISR = 1", impact: "The leader can keep acknowledging alone, improving availability but exposing acknowledged data to loss if that broker fails before replication catches up.", recovery: "Recover the leader and validate log divergence before reopening normal traffic." },
+    { label: "Blind producer retries", impact: "Without producer idempotence, an ambiguous acknowledgment can append duplicate batches.", recovery: "Enable idempotence and keep a stable business event ID for end-to-end dedupe." }
+  ]}
+/>
+
+</RealExamples>
+
+<InterviewTraps title="Fault-tolerance claims that need correction">
+
+- Saying “exactly once” without defining source, sink, and failure boundary.
+- Committing offsets on a timer independent of side effects.
+- Retrying a poison record forever and blocking later records in the partition.
+- Adding partitions while assuming global ordering remains.
+- Ignoring consumer rebalance time and state restoration.
+
+</InterviewTraps>
+
+<Tradeoffs title="Ordering, parallelism, and recovery speed">
+
+More partitions increase parallelism but weaken the practical scope of ordering and raise coordination overhead. Long retention improves replay and debugging but costs storage. A dead-letter topic preserves throughput but creates an operational queue that needs ownership, alerts, and safe replay tooling.
+
+Quarantining a record can violate per-key order because later records may proceed without the missing transition. For state machines, park the entire key, route it to a repair stream, or make later records conditional on a sequence number. A dead-letter topic is inappropriate when skipping one event makes following state uninterpretable.
+
+</Tradeoffs>
+
+<KnowledgeCheck question="When can a consumer safely commit an offset before writing its database change?" options={["When losing the change is acceptable", "Whenever the broker has three replicas", "Only for keyed topics", "Whenever the consumer uses batching"]} correct={0} explanation="A crash after the early commit prevents Kafka from redelivering the record. That is at-most-once processing and is valid only when occasional loss is explicitly acceptable." />
+
+<ScenarioCheck
+  scenario="A transfer consumer commits TokenX ledger rows, crashes before committing its Kafka offset, and is replaced during a rebalance. The replacement receives the same event."
+  question="Which mechanism protects the balance invariant without pretending the external database shares Kafka's transaction?"
+  options={[
+    { label: "Insert the stable event ID and ledger mutation in one DB transaction; commit the Kafka offset only afterward.", feedback: "The replacement replays the record, but the unique event ID prevents a second ledger mutation." },
+    { label: "Commit the offset before writing the ledger so the replacement skips it.", feedback: "A crash after that early offset commit loses the transfer entirely." },
+    { label: "Rely on producer idempotence because it prevents all duplicate side effects.", feedback: "Producer idempotence deduplicates broker appends in a producer session, not consumer writes to an external ledger." },
+    { label: "Increase partition count so the retry reaches a different consumer.", feedback: "Ownership changes do not make the external effect idempotent and can change ordering scope." }
+  ]}
+  correct={0}
+  explanation="The sink must own end-to-end business idempotency. Kafka can redeliver safely when the database atomically records both the event ID and its effect."
+/>
+
+<InterviewAnswer>
+
+“I define the guarantee across the source and each side effect. I usually choose at-least-once consumption, then make the database mutation idempotent by storing the event ID in the same transaction. Outbound work uses an outbox. I commit the Kafka offset only after durable success, quarantine permanent failures, and retain enough history for replay. This accepts duplicate delivery while preventing duplicate business effects.”
+
+</InterviewAnswer>

@@ -1,0 +1,114 @@
+---
+title: "Latency, Throughput & Queues"
+description: "Connect utilization, queueing, tail latency, and backpressure to production performance."
+module: 4
+moduleTitle: "Performance"
+order: 1
+duration: 26
+difficulty: "Foundation"
+tags:
+  - latency
+  - throughput
+  - queueing
+objectives:
+  - "Distinguish latency from throughput"
+  - "Use Little's Law for capacity reasoning"
+  - "Protect tail latency with bounded queues"
+---
+
+<BigPicture title="Fast components do not guarantee a fast system">
+
+Latency is time per request; throughput is completed work per unit time. As utilization approaches capacity, queues grow and tail latency can explode even when average service time stays constant.
+
+Production SLOs should use percentiles such as p95 and p99. The slowest dependency often dominates user experience through fan-out.
+
+</BigPicture>
+
+<UnderTheHood title="Measure waiting separately from work">
+
+Instrument queue time, service time, and downstream time. A 20 ms database query may still yield a 900 ms response if it waits behind an unbounded connection pool.
+
+Little's Law states <code>L = λW</code>: average work in a defined system equals arrival rate times average time in that same system. At 2,000 requests per second and 200 ms average **end-to-end** latency, about 400 requests are in flight across the whole request path. That number does not tell us how many database connections are busy.
+
+<Calculation label="Concurrency estimate">
+Whole path: L = 2,000 requests/s × 0.2 s = 400 requests in flight
+
+If 65% reach the DB: λDB = 2,000 × 0.65 = 1,300 DB operations/s
+
+If a DB operation holds a connection for 20 ms: LDB = 1,300 × 0.020 = 26 busy connections on average
+
+A 50-connection pool is therefore about 52% utilized on average—not 400 ÷ 50.
+</Calculation>
+
+Database pool sizing must use the arrival rate **to the database** and the time a request actually holds a connection. It also needs headroom for p95 service time, transactions that issue multiple statements, and uneven bursts. Averages alone can hide a saturated pool.
+
+<InteractiveCalculation mode="little-law" title="Separate whole-request concurrency from DB demand" />
+
+</UnderTheHood>
+
+<MentalModel title="Utilization buys efficiency by spending latency">
+
+Think of a grocery checkout: arrival rate is shoppers entering, service time is time at a register, and concurrency is shoppers currently in the store or checkout system. Counting everyone in the store does not tell you how many registers are occupied. Define the boundary before applying the formula.
+
+Keep deliberate headroom. Bound every queue. When overload arrives, reject low-priority work quickly, shed optional features, and propagate backpressure rather than converting a short spike into minutes of stale work.
+
+</MentalModel>
+
+<ArchitectureDiagram title="Performance controls and ownership boundaries" chart={"flowchart LR\n  C[Clients] -->|deadline + idempotency key| A[Admission control]\n  A -->|accepted| Q[Bounded app queue]\n  A -->|overload| R[429 + retry-after]\n  Q --> W[Stateless worker pool]\n  W -->|acquire with timeout| P[Bounded DB connection pool]\n  P --> D[(Authoritative DB)]\n  D -. slow query / lock wait .-> P\n  W --> M[Queue, service, saturation metrics]\n  C -. capped retry with jitter .-> A"}>
+
+The application owns admission and its bounded queue; the connection pool owns scarce database concurrency; the database owns durable state. Deadlines and cancellation must propagate across both queues so abandoned work does not continue consuming capacity.
+
+</ArchitectureDiagram>
+
+<RealExamples title="Fan-out and batch processing">
+
+A profile page calling 20 services has more chances to encounter one p99 response. Use deadlines, parallel requests, cached fallbacks, and partial responses. In batch jobs, larger batches improve throughput by amortizing overhead but increase per-item wait and retry blast radius.
+
+<FailureScenario
+  title="Choose the overload you want to inspect"
+  prompt="Traffic jumps to twice the sustainable database rate. Explore how different controls change the failure mode."
+  choices={[
+    { label: "Unbounded queue", impact: "Requests wait until client deadlines expire; memory and stale work grow while retry traffic arrives.", recovery: "Bound the queue, cancel expired work, and shed requests before the database pool." },
+    { label: "Longer timeout", impact: "More work remains in flight, increasing queue depth and making a retry storm more likely.", recovery: "Use an end-to-end deadline budget and fix or protect the saturated resource." },
+    { label: "Admission control", impact: "Some callers receive an immediate overload response, but admitted requests retain predictable latency.", recovery: "Return retry-after, apply jitter, and preserve capacity for high-priority operations." }
+  ]}
+/>
+
+</RealExamples>
+
+<InterviewTraps title="Performance errors to avoid">
+
+- Reporting only average latency.
+- Increasing timeouts without reducing overload.
+- Using an unbounded queue as a shock absorber.
+- Assuming more threads help CPU-bound work.
+- Omitting the concurrency implied by latency and request rate.
+
+</InterviewTraps>
+
+<Tradeoffs title="Headroom is reliability capacity">
+
+Lower utilization costs more but contains queues and failures. Batching raises throughput but delays the oldest item. Hedged requests reduce tail latency but add load; issue them only after a delay and within a budget.
+
+</Tradeoffs>
+
+<KnowledgeCheck question="At 1,000 requests per second and 300 ms average end-to-end latency, what is the average concurrency?" options={["30", "300", "1,300", "3,333"]} correct={1} explanation="Little's Law gives 1,000 × 0.3 = 300 requests in flight on average." />
+
+<ScenarioCheck
+  scenario="A service receives 4,000 requests/s. Sixty percent use the database, holding a connection for 25 ms. The pool has 80 connections, but p99 DB time doubles during lock contention."
+  question="Which conclusion is most defensible?"
+  options={[
+    { label: "The average DB concurrency is 60, but tail contention can exhaust the pool; bound acquisition and reduce DB demand.", feedback: "This applies Little's Law at the DB boundary: 4,000 × 0.60 × 0.025 = 60. Tail service time can still consume all 80 connections." },
+    { label: "End-to-end request latency alone proves that 80 connections are sufficient.", feedback: "End-to-end time includes work outside the database and cannot size the DB pool by itself." },
+    { label: "Raise the pool to 800 so requests never wait.", feedback: "A larger pool can move the queue into the database and worsen lock contention or overload." },
+    { label: "Retry every pool-acquisition timeout immediately.", feedback: "Immediate retries amplify the overload and consume more admission capacity." }
+  ]}
+  correct={0}
+  explanation="Size each queue from its own arrival rate and service demand, then leave tail-latency headroom. A pool is a bulkhead, not a substitute for admission control."
+/>
+
+<InterviewAnswer>
+
+“I establish latency percentiles and throughput targets, then decompose queue, service, and dependency time. Little's Law gives the expected concurrency. I keep headroom, bound queues, use deadlines and cancellation, and shed work before saturation causes a retry storm. I optimize the bottleneck shown by profiles and saturation metrics, not whichever component looks easiest to scale.”
+
+</InterviewAnswer>

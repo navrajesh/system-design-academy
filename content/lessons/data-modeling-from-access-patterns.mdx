@@ -1,0 +1,189 @@
+---
+title: "Data Modeling from Access Patterns"
+description: "Design authoritative schemas and derived read models by tracing writes, queries, invariants, and evolution paths."
+module: 1
+moduleTitle: "Storage & Data"
+order: 3
+duration: 41
+difficulty: "Intermediate"
+tags:
+  - data modeling
+  - normalization
+  - denormalization
+  - schema evolution
+objectives:
+  - "Translate product operations into keys, constraints, and query paths"
+  - "Separate authoritative normalized state from denormalized views"
+  - "Model TokenX transfers with balanced immutable entries"
+  - "Plan additive schema evolution and backfills"
+---
+
+<BigPicture title="A schema is a workload contract">
+
+Data modeling is not drawing nouns and arrows until the diagram looks tidy. A production model must make critical writes correct, dominant reads bounded, and future changes survivable. Begin with operations and invariants, then choose entities, aggregates, keys, indexes, and derived views.
+
+Normalization reduces update anomalies by storing a fact once. Denormalization precomputes a read path by copying facts. Both are tools. The dangerous design is duplicated state with no declared authority, version, or repair path.
+
+This lesson builds on [Relational vs NoSQL Selection](/learn/relational-vs-nosql-selection) and prepares the index choices in [Indexes and Query Execution](/learn/indexes-and-query-execution).
+
+</BigPicture>
+
+<UnderTheHood title="Model TokenX from commands and queries">
+
+### 1. Write the access-pattern table
+
+For each operation, capture input key, result shape, frequency, latency, consistency, and expected cardinality.
+
+- Create transfer: lookup idempotency key; lock two balances; write one transfer and two or more ledger entries.
+- Get balance: point read by wallet and asset; must be authoritative for spending.
+- List transfers: cursor range by wallet and descending sequence; can be derived with bounded lag.
+- Reconcile supply: scan immutable ledger entries by asset; offline but exact.
+
+### 2. Define authoritative relations
+
+<code>wallet_balances(wallet_id, asset_id, available, version)</code> stores the current spendable projection. Its primary key prevents duplicate wallet-asset rows.
+
+<code>transfers(transfer_id, caller_id, idempotency_key, request_hash, status, committed_at)</code> stores operation identity. A unique constraint on <code>(caller_id, idempotency_key)</code> makes retries converge.
+
+<code>ledger_entries(transfer_id, entry_no, account_id, asset_id, delta, account_sequence)</code> is immutable. A deferred constraint, transaction procedure, or verified write path ensures deltas for one transfer sum to zero.
+
+The mutable balance is fast authorization state; the immutable ledger is the audit history. Reconciliation proves they agree.
+
+### 3. Bound every aggregate
+
+Never embed an unbounded transfer list in a wallet record. At 200 transfers per active wallet per year and 500 bytes per item, one million active wallets add roughly 100 GB/year of history, but distribution is skewed: exchange wallets may have millions of entries. Model history as independently pageable rows.
+
+<Calculation label="History and index scale">
+20M transfers/day × 2 wallet-history rows = 40M history rows/day
+
+At 160 bytes/row before indexes ≈ 6.4 GB/day
+
+One year ≈ 2.34 TB before replication, indexes, and compression
+
+A 0.1% exchange wallet share = 40,000 history rows/day for one hot wallet
+</Calculation>
+
+### 4. Build read models explicitly
+
+An outbox event projects transfers into <code>wallet_transfer_feed</code>, keyed by <code>(wallet_id, account_sequence)</code>. This duplicates transfer fields to avoid joins on the feed path. The projection stores source event ID and version so replay is idempotent.
+
+### 5. Evolve without a flag day
+
+Prefer expand-migrate-contract:
+
+1. Add nullable or defaulted fields that old writers tolerate.
+2. Deploy dual-compatible readers and writers.
+3. Backfill in small, resumable key ranges with rate limits.
+4. Verify counts, checksums, and business invariants.
+5. Make the new field required only after all writers and data comply.
+6. Remove the old representation in a later release.
+
+<ExecutionTimeline
+  title="Add a fee field without breaking mixed application versions"
+  steps={[
+    { title: "Expand", detail: "Add fee_amount and fee_asset as nullable columns; old binaries continue writing rows.", state: "Both schema versions are valid." },
+    { title: "Write compatibly", detail: "New writers populate fees; readers treat missing values as no fee.", state: "New and old records coexist." },
+    { title: "Backfill", detail: "Process bounded primary-key ranges with checkpoints and replica-lag limits.", state: "Backfill progress is durable and resumable.", failure: "A large unbounded update can saturate WAL and replicas." },
+    { title: "Contract", detail: "After verification and fleet rollout, enforce constraints and later remove obsolete fields.", state: "Only the new model remains." }
+  ]}
+/>
+
+</UnderTheHood>
+
+<MentalModel title="A library catalog and its reading lists">
+
+The normalized model is the library catalog: one authoritative record identifies each book and owner. A denormalized read model is a curated reading list: it repeats titles for fast use, but the catalog remains the authority when a title changes.
+
+Retain: **model commands around invariants; model queries around bounded keys; connect them with versioned, rebuildable projections.**
+
+</MentalModel>
+
+<ArchitectureDiagram title="Authoritative TokenX model and wallet-history projection" chart={"flowchart LR\n  C[Transfer command] --> S[Transfer service]\n  S -->|one serializable transaction| B[(Wallet balances)]\n  S --> T[(Transfers + idempotency)]\n  S --> L[(Immutable ledger entries)]\n  S --> O[(Transactional outbox)]\n  O --> P[History projector]\n  P --> H[(Derived wallet history)]\n  Q[Balance API] -->|authoritative| B\n  F[History API] -->|cursor range| H\n  H -. corrupt or lagging .-> P\n  O -. replay .-> P\n  L --> R[Reconciliation job]\n  R -. invariant alert .-> B"}>
+
+The transaction owns balances, transfer identity, ledger entries, and outbox intent. Wallet history is a derived access path; it can be replayed and may be stale. Reconciliation compares immutable entries with mutable balances and raises an alert rather than silently repairing financial state.
+
+<ArchitectureWalkthrough
+  title="Trace one fact through normalized and denormalized models"
+  stages={[
+    { name: "Command model", owner: "Ledger transaction", state: "Transfer request and locked balances", boundary: "Serializable invariant check.", failure: "Concurrent spend conflicts.", recovery: "Abort one transaction and retry with the same idempotency key." },
+    { name: "Audit model", owner: "Immutable ledger", state: "Balanced debit and credit entries", boundary: "Append-only inside the transfer commit.", failure: "Balance projection diverges.", recovery: "Reconcile and investigate from ledger entries." },
+    { name: "Projection", owner: "Outbox consumer", state: "Per-wallet feed rows", boundary: "At-least-once and versioned.", failure: "Duplicate or out-of-order event.", recovery: "Unique event IDs and account sequence fence stale updates." },
+    { name: "Evolution", owner: "Migration controller", state: "Schema version and backfill checkpoint", boundary: "Mixed-version compatibility.", failure: "Backfill overloads primary or replicas.", recovery: "Pause at checkpoint, reduce rate, and resume." }
+  ]}
+/>
+
+</ArchitectureDiagram>
+
+<RealExamples title="TokenX ledger and Ad Click dimensions">
+
+### TokenX double-entry model
+
+A 10-token transfer produces at least two entries: −10 for the source and +10 for the destination. Fees add entries rather than mutating the original amount invisibly. Account sequence numbers provide stable wallet pagination and detect gaps in a derived feed.
+
+### Ad Click Aggregator model
+
+Raw click facts contain event ID, campaign ID, ad ID, event time, ingest time, region, and cost metadata. Campaign and advertiser dimensions change less often. Analytics may use a star schema or columnar table partitioned by event date, while the real-time counter store uses <code>(campaign_id, minute)</code>. Do not force the analytical scan shape into the serving counter model.
+
+<FailureScenario
+  title="Inspect a denormalization failure"
+  prompt="Campaign name is copied into billions of click rows for convenient display."
+  choices={[
+    { label: "Rename campaign", impact: "Updating every historical fact is expensive and can rewrite immutable history.", recovery: "Store stable campaign_id in facts and join or snapshot the display name according to report semantics." },
+    { label: "Dimension deleted", impact: "Reports lose descriptive data if they depend only on a live dimension.", recovery: "Use soft deletion or versioned dimensions so historical facts remain interpretable." },
+    { label: "Projector replays", impact: "Blind inserts duplicate derived rows.", recovery: "Key projection writes by source event ID or deterministic fact key." }
+  ]}
+/>
+
+</RealExamples>
+
+<InterviewTraps title="Modeling questions at IC6 depth">
+
+- **“Normalize everything.”** Ask whether the critical read now requires an unbounded join or remote scatter.
+- **“Denormalize for performance.”** Name the authority, propagation mechanism, staleness contract, and repair procedure.
+- **Using timestamps as cursors.** Equal timestamps and clock skew cause duplicates or omissions. Use a stable ordered tuple such as sequence plus transfer ID.
+- **Soft deletion without uniqueness semantics.** Decide whether a deleted username or idempotency key may be reused and encode the rule.
+- **Schema change as DDL only.** The risky work is mixed-version behavior, backfill load, verification, and rollback.
+- **Follow-up: how do you reconcile?** Compare independently derived totals, verify balanced transfers, and retain evidence; never “fix” money by overwriting unexplained differences.
+
+</InterviewTraps>
+
+<Tradeoffs title="Write simplicity versus read simplicity">
+
+Normalized authority reduces conflicting updates and supports flexible queries, but joins and indexes cost latency. Denormalized projections give predictable reads, but add storage, lag, replay, and repair. Embedding keeps a bounded aggregate atomic; it fails when the aggregate grows without limit or receives skewed concurrent writes.
+
+A separate read model is inappropriate when the base query already meets the SLO and the organization cannot own projection lag. Premature materialization creates more failure modes than performance.
+
+</Tradeoffs>
+
+<KnowledgeCheck
+  question="Why should TokenX wallet history be modeled separately from the mutable wallet-balance row?"
+  options={[
+    "SQL rows cannot contain timestamps",
+    "History is unbounded and differently accessed, while the balance row must stay small and contention-aware",
+    "A wallet can have only one transfer",
+    "Derived data is always more consistent"
+  ]}
+  correct={1}
+  explanation="The balance is a bounded authorization aggregate; history is an unbounded cursor scan. Separating them avoids a growing hot record while preserving one authoritative ledger."
+/>
+
+<ScenarioCheck
+  scenario="A new TokenX release requires every transfer to record fee_asset. Ten percent of application instances will remain on the old version for a day."
+  question="Which migration is safest?"
+  options={[
+    { label: "Add a nullable field, deploy compatible readers and writers, backfill with checkpoints, verify, then enforce non-null after old writers are gone.", feedback: "This expand-migrate-contract sequence supports mixed versions and a resumable backfill." },
+    { label: "Add a non-null field without a default and immediately deploy the new writer.", feedback: "Old writers fail as soon as the schema constraint lands." },
+    { label: "Rewrite the entire transfer table in one transaction.", feedback: "A large rewrite can hold locks, generate extreme WAL, and overwhelm replicas." },
+    { label: "Store fee data only in the analytics projection.", feedback: "Fees affect financial accounting and belong in the authoritative transaction and ledger." }
+  ]}
+  correct={0}
+  explanation="Schema compatibility is a distributed-systems problem across application versions, data versions, replicas, and backfill workers."
+/>
+
+<InterviewAnswer>
+
+“I model from commands, queries, and invariants. For TokenX, one transaction owns balances, transfer identity, balanced immutable entries, and the outbox. Wallet history is an unbounded, cursor-based projection keyed by wallet and account sequence; it never authorizes spending and can be rebuilt.
+
+I quantify row cardinality and skew, keep aggregates bounded, and add indexes only for named access paths. Denormalization requires an authority, version, staleness SLO, and replay procedure. Schema changes use expand-migrate-contract with rate-limited, checkpointed backfills and invariant verification. The goal is not maximum normalization or fastest reads in isolation—it is a model whose correctness and evolution remain explainable.”
+
+</InterviewAnswer>

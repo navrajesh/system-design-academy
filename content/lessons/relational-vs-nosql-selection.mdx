@@ -1,0 +1,181 @@
+---
+title: "Relational vs NoSQL Selection"
+description: "Choose a storage model from invariants, access patterns, scale, and failure behavior instead of database fashion."
+module: 1
+moduleTitle: "Storage & Data"
+order: 2
+duration: 38
+difficulty: "Foundation"
+tags:
+  - relational databases
+  - NoSQL
+  - data stores
+  - consistency
+objectives:
+  - "Derive storage requirements from invariants and access patterns"
+  - "Compare relational, key-value, document, and wide-column models"
+  - "Defend a polyglot design without duplicating authority"
+  - "Recognize when operational complexity outweighs theoretical scale"
+---
+
+<BigPicture title="Pick the guarantee before the product name">
+
+“SQL or NoSQL?” is usually the wrong first question. Start with the operations that must be correct, the queries that must be fast, the expected scale, and what the system may do during failure. A relational database is often the simplest home for multi-row invariants and evolving queries. A key-value, document, or wide-column store can be excellent when access paths are known and independent partitions dominate.
+
+The categories overlap. Relational systems can store JSON and distribute data; NoSQL systems may offer transactions and secondary indexes. Compare the exact database and configuration, not a slogan.
+
+For TokenX, the authoritative balance and ledger need atomic constraints and a clear serial order. For the Ad Click Aggregator, immutable events and campaign-window counters favor append-oriented and partitioned stores. One architecture can use both, provided only one store owns each fact.
+
+See [Partitioning vs Sharding vs Aggregation](/learn/partitioning-vs-sharding-vs-aggregation) for placement mechanics and [Data Modeling from Access Patterns](/learn/data-modeling-from-access-patterns) for schema design.
+
+</BigPicture>
+
+<UnderTheHood title="Turn requirements into a storage decision">
+
+### 1. Classify invariants
+
+TokenX must prevent negative spendable balances, conserve token supply, and return the same result for one idempotency key. A database transaction can lock or validate both wallet rows, append balanced ledger entries, and store the idempotency result atomically.
+
+An ad click is different. The raw event is immutable and duplicates can be detected by event ID. Campaign counters are derived and can be rebuilt. This supports an append log plus a partitioned aggregate store.
+
+### 2. Enumerate access patterns
+
+- Point lookup: balance by <code>(wallet_id, asset)</code>
+- Multi-row mutation: debit one wallet and credit another
+- Range scan: wallet transfers ordered by time
+- High-volume append: click events by campaign and event time
+- Aggregate read: clicks by campaign and minute
+- Ad hoc analysis: cross-campaign reporting over historical events
+
+A key-value store makes point lookup cheap but does not create an efficient range or join automatically. A document store keeps an aggregate together, but unbounded embedded arrays turn one document into a contention and size hotspot. A wide-column store handles partition-local ordered rows well, but partition-key mistakes require application-level scatter.
+
+### 3. Evaluate the physical write path
+
+Many relational engines use a write-ahead log (WAL), buffer cache, and B-tree indexes. A commit becomes durable when the log reaches the required durability boundary; indexes add random page work and write amplification.
+
+Many high-write NoSQL engines use a log-structured merge tree (LSM): append to a WAL, update an in-memory table, flush sorted files, then compact. This favors sustained writes but moves cost into compaction and can amplify reads across files until indexes or Bloom filters eliminate misses.
+
+<Calculation label="Why access shape matters">
+TokenX peak transfers = 4,630/s
+
+Each transfer writes 1 transfer row + 2 balance rows + 2 ledger entries + 1 outbox row
+
+Logical row mutations ≈ 4,630 × 6 = 27,780 mutations/s before indexes and replication
+
+Ad clicks at 100M/day and 10× peak ≈ 11,600 events/s, mostly independent appends
+</Calculation>
+
+The similar order of magnitude hides different correctness needs. TokenX benefits from a transactionally rich authority. Click ingestion benefits from append throughput and partition-local work.
+
+<ExecutionTimeline
+  title="Evaluate one candidate store"
+  steps={[
+    { title: "Invariant", detail: "Write the rule that must survive concurrency and failure.", state: "Example: debit plus credit plus idempotency result are one atomic outcome.", failure: "If the store cannot enforce it, the application inherits a distributed protocol." },
+    { title: "Access path", detail: "List point, range, join, aggregate, and scan operations with frequency and latency.", state: "Every critical query has an intentional key or index." },
+    { title: "Scale path", detail: "Estimate peak operations, bytes, retention, skew, and replication work.", state: "Capacity follows measured workload rather than database category." },
+    { title: "Operate", detail: "Test failover, backup, schema evolution, observability, and team expertise.", state: "A database is acceptable only if the team can recover it.", failure: "An unfamiliar store can increase outage duration more than it increases capacity." }
+  ]}
+/>
+
+</UnderTheHood>
+
+<MentalModel title="Choose a workshop, not a label">
+
+A relational database is a workshop with shared jigs and inspectors: coordinated work is easy, but every shared constraint can become contention. A partitioned key-value store is a row of independent workbenches: parallel work flies when each job stays at one bench, but cross-bench coordination is your problem.
+
+Retain three questions: **What fact is authoritative? Which operations must be atomic? Which access paths dominate?** Pick the smallest operational model that answers all three.
+
+</MentalModel>
+
+<ArchitectureDiagram title="One authority per fact in a polyglot storage design" chart={"flowchart LR\n  U[TokenX client] --> S[Transfer service]\n  S -->|serializable transaction| R[(Relational ledger authority)]\n  R --> O[(Transactional outbox)]\n  O --> K[(Kafka event log)]\n  K --> D[(Document read model)]\n  K --> W[(Wide-column history)]\n  U -->|authoritative balance| R\n  U -->|portfolio history| D\n  C[Click collectors] --> K2[(Click event log)]\n  K2 --> A[(Partitioned aggregate store)]\n  A -. rebuildable .-> K2\n  R -. failover requires fencing .-> S"}>
+
+The relational ledger alone owns spendable balances and transfer outcomes. Document and wide-column stores own no financial invariant; they are replayable views. The click log owns raw events, while aggregate counters are derived. A read model may be stale, so its API must not authorize a TokenX spend.
+
+<ArchitectureWalkthrough
+  title="Follow authority across different storage models"
+  stages={[
+    { name: "Ledger", owner: "Relational database", state: "Balances, transfers, ledger entries, idempotency", boundary: "One serializable transaction.", failure: "Quorum or leader unavailable.", recovery: "Reject writes, elect a fenced leader, and resolve requests by idempotency key." },
+    { name: "Event log", owner: "Kafka", state: "Committed integration and click events", boundary: "Partition ordering and configured replication.", failure: "Consumers lag or replay.", recovery: "Retain history and make every sink idempotent." },
+    { name: "Read model", owner: "Document or wide-column consumer", state: "Wallet history and portfolio projections", boundary: "Eventual consistency; never spend authority.", failure: "Projection corrupts or falls behind.", recovery: "Drop and rebuild from the log." },
+    { name: "Analytics", owner: "Aggregate store", state: "Campaign-window counters", boundary: "Late-data and correction policy.", failure: "Hot campaign or missed window.", recovery: "Salt the hot key and replay authoritative events." }
+  ]}
+/>
+
+</ArchitectureDiagram>
+
+<RealExamples title="TokenX authority and Ad Click scale">
+
+### TokenX: relational first
+
+At roughly 4,630 peak transfers per second, a well-designed transactional database may have substantial headroom. Use constraints, deterministic row-lock ordering, balanced ledger entries, and an outbox. Do not split balances across independent stores because one offers faster reads.
+
+If one ledger later reaches measured limits, preserve the same invariant with distributed SQL, account ownership, escrow, or reservations. “Move to NoSQL” is not a protocol.
+
+### Ad Click Aggregator: append and derive
+
+Raw clicks belong in a durable append log or object-backed event archive. Counters keyed by campaign and minute can live in a wide-column or key-value store whose partition key matches reads. Cross-campaign BI queries belong in a columnar analytical store, not the low-latency counter database.
+
+<FailureScenario
+  title="Explore a storage mismatch"
+  prompt="A team chooses one document per TokenX wallet and embeds every transfer forever."
+  choices={[
+    { label: "Growing document", impact: "Each update rewrites or contends on an ever-larger aggregate and can hit document-size limits.", recovery: "Keep bounded wallet state in one record and transfer history in independently keyed rows." },
+    { label: "Cross-wallet transfer", impact: "Two wallet documents require a multi-document transaction or a compensating protocol.", recovery: "Use a transactional ledger authority and derive wallet documents afterward." },
+    { label: "Popular wallet", impact: "A whale or exchange wallet becomes one write hotspot even if other wallets distribute evenly.", recovery: "Queue by wallet, batch compatible entries, or use invariant-preserving sub-accounts." }
+  ]}
+/>
+
+</RealExamples>
+
+<InterviewTraps title="Questions behind SQL versus NoSQL">
+
+- **“NoSQL scales horizontally.”** Ask which partition key, consistency level, secondary-index path, and resharding protocol make that true for this workload.
+- **“SQL cannot scale.”** Ask for the measured limit. Read replicas, partitioning, distributed SQL, and workload isolation cover many systems before application-managed transactions are justified.
+- **“We need schema flexibility.”** Flexible writes move compatibility checks to readers. Explain validation, versioning, backfill, and mixed-version behavior.
+- **“Use one database for simplicity.”** One operational product can still contain multiple workload classes. Keep one authority per fact and add derived stores only when the benefit exceeds synchronization cost.
+- **Follow-up: what happens during failover?** State whether writes stop, whether stale reads continue, how leaders are fenced, and which committed point clients may observe.
+
+A defensible answer names a concrete property—serializable transactions, partition-local range scans, sustained append throughput—not a category preference.
+
+</InterviewTraps>
+
+<Tradeoffs title="Flexibility, coordination, and operational cost">
+
+Relational modeling gives constraints, joins, and query flexibility, but secondary indexes and cross-partition transactions increase write and coordination cost. Key-value and wide-column models make chosen paths predictable, but new queries often require new tables or pipelines. Document models align with bounded aggregates, but denormalization creates update fan-out and conflict rules.
+
+Polyglot persistence is inappropriate when the team cannot operate several recovery procedures or when duplicated data has no explicit owner and rebuild path. A single proven database with deliberate indexes is often the highest-scale design the organization can safely run.
+
+</Tradeoffs>
+
+<KnowledgeCheck
+  question="Which requirement most strongly favors a transactional relational authority for TokenX?"
+  options={[
+    "The UI needs a dark theme",
+    "A transfer must atomically enforce funds, debit and credit balances, append balanced entries, and preserve one idempotent result",
+    "Wallet history is paginated",
+    "Analytics can be delayed"
+  ]}
+  correct={1}
+  explanation="The multi-row invariant and idempotent outcome need one enforceable commit boundary. Pagination and delayed analytics can be served by derived models."
+/>
+
+<ScenarioCheck
+  scenario="A product has 200,000 writes/s, but every write and read is an independent lookup by device ID. There are no cross-device invariants, and retention is fixed."
+  question="Which reasoning is strongest?"
+  options={[
+    { label: "A partitioned key-value or wide-column store is a strong candidate because the invariant and access path stay within one key.", feedback: "The workload aligns with independent partitions and predictable point access." },
+    { label: "Relational databases are always required because all data has relationships.", feedback: "Relationships alone do not require joins or cross-row transactions on the critical path." },
+    { label: "Use a document store and embed every device in one tenant document.", feedback: "That creates a tenant hotspot and an unbounded aggregate." },
+    { label: "Choose the database with the highest published benchmark without testing the key distribution.", feedback: "Published throughput does not establish behavior under this workload's skew, durability, and failure policy." }
+  ]}
+  correct={0}
+  explanation="The operation boundary and access pattern are partition-local. The final choice still requires durability, failover, cost, and operational testing."
+/>
+
+<InterviewAnswer>
+
+“I choose storage from invariants and access patterns, not SQL versus NoSQL branding. TokenX needs an atomic, auditable balance mutation, so I start with a serializable relational ledger containing balances, double-entry rows, idempotency, and an outbox. Kafka then feeds replayable history and analytics stores, which never authorize spending.
+
+For ad clicks, raw events are immutable appends and counters are partition-local derived state, so a log plus wide-column or key-value aggregates fits better. I quantify peak writes, bytes, retention, skew, index amplification, and recovery objectives, then test the actual database configuration. Polyglot storage is justified only when every copy has one named authority, staleness contract, and rebuild path.”
+
+</InterviewAnswer>

@@ -1,0 +1,164 @@
+---
+title: "Transactions Across Boundaries"
+description: "Preserve invariants with local ACID transactions, isolation, outbox and inbox patterns, sagas, and explicit compensation."
+module: 1
+moduleTitle: "Storage & Data"
+order: 8
+duration: 48
+difficulty: "Advanced"
+tags:
+  - transactions
+  - isolation
+  - outbox
+  - sagas
+objectives:
+  - Recognize isolation anomalies and select an enforcement mechanism
+  - Keep authoritative invariants inside one transactional boundary when possible
+  - Design replay-safe outbox and inbox delivery across services
+  - Model sagas with reservations, idempotency, and business compensation
+---
+
+<BigPicture>
+
+A transaction turns several state changes into one decision: commit all or expose none. Inside one database, ACID transactions, locks, MVCC, and constraints can enforce that decision. Across a database, broker, payment provider, or another service, there is no automatic shared rollback. The architecture must either coordinate participants or model the workflow as durable state with retries and compensation.
+
+TokenX can move value between two wallets in one database transaction: lock or serialize the accounts, insert balanced ledger entries, update materialized balances, record the idempotency result, and append an outbox event. The broker publish happens later. This preserves financial invariants without pretending the database and Kafka share one atomic commit.
+
+</BigPicture>
+
+<UnderTheHood>
+
+### Isolation is about allowed histories
+
+Common anomalies include lost updates, dirty reads, non-repeatable reads, phantoms, and write skew. MVCC gives readers snapshots, but “snapshot isolation” can still allow two transactions to read the same valid state and make disjoint writes that jointly violate an invariant. Serializable isolation, an explicit lock, a uniqueness or exclusion constraint, or an atomic compare-and-set must protect the invariant—not a hopeful read followed by write.
+
+For TokenX, a conditional debit such as `UPDATE accounts SET balance = balance - ? WHERE id = ? AND balance >= ?` can atomically prevent a negative balance for one row. A transfer across two rows also needs deterministic lock order or serializable retry to avoid deadlocks and write skew. Deadlock aborts are normal control flow; retry the entire transaction with the same idempotency key.
+
+### Local transaction plus outbox
+
+<ExecutionTimeline
+  title="Replay-safe TokenX transfer"
+  steps={[
+    { title: "Claim the command", detail: "Insert tenant plus idempotency key and request hash under a unique constraint; conflicting payload reuse is rejected." },
+    { title: "Enforce the invariant", detail: "Lock accounts in stable order or run serializably, verify currency and funds, then append balanced debit and credit entries." },
+    { title: "Commit state and intent", detail: "Update balances, complete the idempotency result, and insert an outbox row in the same database transaction." },
+    { title: "Publish after commit", detail: "A relay claims unpublished outbox rows, sends them to Kafka with a stable event ID, and records progress." },
+    { title: "Apply idempotently", detail: "Each consumer records event ID in an inbox in the same transaction as its local side effect; duplicates become no-ops." },
+  ]}
+/>
+
+The relay can crash after Kafka accepts the event but before the outbox row is marked published, so it must publish again. Delivery is at least once. Consumer offset commits alone do not make an external database update replay-safe: the consumer can crash after the database commit but before committing the offset. The inbox uniqueness constraint closes that ambiguity for the database side effect.
+
+At 2,000 transfers/s, one event per transfer, and a 15-minute broker outage, the outbox accumulates `2,000 × 900 = 1.8 million` rows. At 700 bytes per row that is about 1.26 GB before indexes. If the relay recovers at 8,000 events/s while 2,000/s continue arriving, net drain is 6,000/s and ideal catch-up is 300 seconds. Size indexes, autovacuum, and alerting for the outage case, not only steady state.
+
+### When one transaction is impossible
+
+Two-phase commit (2PC) asks participants to prepare, then commit. It can provide atomic agreement for compatible resources, but the coordinator and prepared locks create availability and operational risks. Across independently deployed services or external providers, a saga is often more appropriate: persist workflow state, execute idempotent steps, and compensate completed steps when later steps fail.
+
+Compensation is not time travel. Refunding a card may incur fees; releasing inventory may fail; a delivered notification cannot be unsent. Reserve scarce resources before confirmation, give every step an idempotency key, use deadlines, and define manual-resolution states for exhausted retries.
+
+</UnderTheHood>
+
+<MentalModel>
+
+One database transaction is a sealed envelope: either the whole instruction becomes official or none does. A distributed workflow is a checklist mailed between offices. Each office stamps what it completed, recognizes duplicate mail, and knows the compensating procedure—but cannot erase real-world effects.
+
+Retain: shrink the invariant boundary, commit state and intent together, make every boundary replay-safe, and model compensation as a business action.
+
+</MentalModel>
+
+<ArchitectureDiagram
+  title="Transactional authority and replay-safe external effects"
+  description="The ledger and outbox share one commit. Kafka and consumer databases are separate consistency boundaries joined by stable IDs and inboxes."
+  chart={"flowchart LR\n  API[Transfer API] --> TX[Serializable transaction]\n  TX --> LEDGER[(Ledger and balances)]\n  TX --> OUT[(Outbox)]\n  OUT --> RELAY[Retrying relay]\n  RELAY --> K[(Kafka)]\n  K --> CONS[History consumer]\n  CONS --> INBOX[(Inbox and projection DB)]\n  RELAY -. crash after send .-> RELAY\n  CONS -. crash after DB commit .-> K\n  INBOX -. duplicate event ID .-> DROP[No-op]\n  K -. rebuild .-> CONS"}
+>
+
+The ledger database owns balances and accepted transfers. Kafka owns durable event delivery after publish, not the ledger commit. The projection database owns only its local view and inbox. Dashed paths show the two ambiguity windows; retries cross them safely because command and event identities are stable.
+
+</ArchitectureDiagram>
+
+<ArchitectureWalkthrough
+  title="Trace the transaction boundaries"
+  stages={[
+    { name: "Ledger commit", owner: "TokenX database", state: "Balances, entries, request result, and outbox", boundary: "One serializable ACID decision.", failure: "Conflict, deadlock, or process crash.", recovery: "Abort and retry the full command with its stable idempotency key." },
+    { name: "Relay boundary", owner: "Outbox publisher", state: "Claim and publish attempt", boundary: "At-least-once broker delivery.", failure: "Crash after send before marking published.", recovery: "Publish the same event ID again; consumers deduplicate." },
+    { name: "Consumer boundary", owner: "Projection database", state: "Inbox ID plus derived row", boundary: "One local transaction before offset commit.", failure: "Crash after DB commit before offset commit.", recovery: "Redelivery conflicts with inbox uniqueness and becomes a no-op." },
+    { name: "Rebuild path", owner: "Replay controller", state: "Source offsets and projection version", boundary: "Derived state only.", failure: "Replay triggers an external effect.", recovery: "Separate effect commands and guard them with durable idempotency records." },
+  ]}
+/>
+
+<RealExamples>
+
+**TokenX same-shard transfer.** Co-locate accounts that transact together when possible. Use balanced immutable entries and a unique idempotency key. A derived history consumer may process an event twice, but its inbox prevents duplicate rows. It never changes the authoritative balance.
+
+**TokenX cross-shard transfer.** Introduce a durable transfer state machine and reservation entries: reserve debit, confirm credit, then finalize; on timeout, release the reservation if the credit was never committed. A globally queryable transfer ID and epochs prevent an old coordinator from finalizing after compensation. If strict instantaneous conservation across shards is mandatory, distributed consensus or redesign may be required.
+
+**Ad Click billing.** Click aggregation is replayable, but invoicing an advertiser is an external effect. Close a versioned billing period, create one invoice command per account under a unique key, and record provider request and result. Replaying raw clicks may produce a corrected invoice version; it must not charge the card twice.
+
+<FailureScenario
+  title="Kafka redelivers after the database already committed"
+  prompt="A consumer inserted a billing row, crashed before committing its offset, and receives the event again. What prevents duplicate billing state?"
+  choices={[
+    { label: "Crash before DB commit", impact: "No billing row or inbox claim exists, so redelivery must try the transaction again.", recovery: "Process the same stable event ID normally and commit before advancing the offset." },
+    { label: "Crash after DB commit", impact: "Kafka redelivers because the offset did not advance, even though local state changed.", recovery: "Inbox uniqueness and the side effect share one transaction, so the duplicate becomes a no-op." },
+    { label: "Poison event", impact: "Repeated deterministic failure blocks the partition and grows lag.", recovery: "Classify it, quarantine with context under an operator-owned policy, and preserve ordered replay controls." },
+  ]}
+/>
+
+</RealExamples>
+
+<InterviewTraps>
+
+1. **“The database is ACID, so the workflow is atomic.”** List every resource boundary, including broker publish, emails, payment providers, caches, and search indexes.
+2. **“Read committed prevents double spend.”** It prevents dirty reads, not every lost update or write skew. Show the constraint, lock, or serializable transaction.
+3. **“Kafka exactly-once handles the database.”** Kafka can atomically coordinate Kafka records and offsets in supported flows; external database writes need inbox/idempotency or a connector with proven semantics.
+4. **“A saga rolls everything back.”** Compensation can be lossy or impossible. Name irreversible steps and manual resolution.
+5. **“Retry on timeout.”** A timeout means unknown outcome. Retry with the same identity and query the durable workflow state.
+6. **“2PC guarantees availability.”** Prepared transactions can hold locks while a coordinator is unavailable; discuss recovery tooling and participant support.
+
+IC6 answers state the invariant first, minimize its atomic scope, then describe every ambiguous crash point.
+
+</InterviewTraps>
+
+<Tradeoffs>
+
+- Serializable transactions simplify reasoning but may abort more under contention; they become inappropriate for a single ultra-hot row without partitioning or sequencing.
+- Explicit locks make ordering visible but reduce concurrency and require deadlock discipline.
+- Outbox/inbox accepts duplicate transport and operational cleanup in exchange for a local atomic boundary and replay safety.
+- 2PC offers atomic agreement for compatible participants but couples availability and operations across them.
+- Sagas preserve service autonomy and availability but expose intermediate states and require domain-specific compensation.
+
+</Tradeoffs>
+
+<KnowledgeCheck
+  question="Why must a consumer write its inbox event ID in the same local transaction as the projection update?"
+  options={[
+    "To make Kafka deliver each event only once",
+    "To make duplicate detection and the side effect one atomic decision",
+    "To avoid maintaining consumer offsets",
+    "To make the projection authoritative",
+  ]}
+  correct={1}
+  explanation="If inbox and side effect commit separately, a crash between them can still cause a lost update or duplicate side effect."
+/>
+
+<ScenarioCheck
+  title="Snapshot isolation and an on-call invariant"
+  scenario="Two doctors are on call. Two concurrent snapshot-isolated transactions each see both on call, then each removes a different doctor. Both commit because they update different rows."
+  question="What is the correct diagnosis and remedy?"
+  options={[
+    { label: "Dirty read; use read committed", feedback: "Snapshot isolation already avoids dirty reads; the anomaly is write skew." },
+    { label: "Write skew; serialize the invariant", feedback: "Use serializable isolation, lock a shared invariant row, or encode an enforceable constraint so one transaction aborts." },
+    { label: "Lost update; add an index", feedback: "The transactions update different rows, and an access index alone does not enforce the cross-row invariant." },
+  ]}
+  correct={1}
+  explanation="Isolation names matter less than demonstrating which histories the invariant permits."
+/>
+
+<InterviewAnswer>
+
+“I first state the invariant and place as much of it as possible inside one database transaction. TokenX commits balanced ledger entries, balances, idempotency result, and outbox intent together under an enforceable isolation strategy. A relay publishes at least once; consumers atomically combine an inbox key with their local update, so crashes around offset commits are replay-safe.
+
+When one transaction cannot span the workflow, I choose consciously between 2PC and a saga. A saga has durable states, reservations, idempotent steps, deadlines, compensations, and manual resolution for irreversible effects. Related lessons are [relational versus NoSQL](/learn/relational-vs-nosql-selection), [Kafka delivery](/learn/kafka-delivery-and-failure), and [replication](/learn/replication-and-failover).”
+
+</InterviewAnswer>

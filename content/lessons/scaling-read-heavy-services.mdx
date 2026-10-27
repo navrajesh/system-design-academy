@@ -1,0 +1,120 @@
+---
+title: "Scaling Read-Heavy Services"
+description: "A first-principles path from one service instance to cached, replicated, horizontally scaled reads."
+module: 2
+moduleTitle: "Scalability"
+order: 1
+duration: 28
+difficulty: "Foundation"
+tags:
+  - load balancing
+  - caching
+  - replication
+objectives:
+  - "Locate the first bottleneck from workload estimates"
+  - "Choose cache placement and invalidation behavior"
+  - "Explain horizontal scaling limits"
+---
+
+<BigPicture title="Scaling is bottleneck removal, not box drawing">
+
+A system scales when added resources produce useful capacity without breaking correctness. For a read-heavy catalog, the first design may be one stateless API and one database. Add components only when a measured or estimated constraint requires them.
+
+The core path is: distribute requests across stateless instances, serve reusable work from caches, add read replicas for residual queries, and preserve one clear authority for writes.
+
+</BigPicture>
+
+<UnderTheHood title="Follow a request through every queue">
+
+Suppose the catalog receives 50,000 reads per second and 500 writes per second. If 90% of reads hit a cache, the database sees about 5,000 reads per second—not 50,000. That ratio matters more than the number of API boxes.
+
+Use a load balancer with health checks and connection draining. Keep request handlers stateless; session state belongs in a signed token or shared store. A cache-aside read checks Redis, fetches the database on a miss, then inserts with a TTL plus jitter.
+
+A writer should commit the database before invalidating the cache, but that ordering alone does **not** eliminate stale repopulation. A concurrent reader can miss the cache, read database version 41, pause, then write version 41 into the cache after another request commits version 42 and invalidates the old entry. The invalidation already happened, so version 41 survives until eviction.
+
+Defenses depend on the freshness contract: attach a monotonic version and reject older cache fills; serialize fills per key; consume committed database changes through change-data capture (CDC); or use a write-through path with one owner. Delayed double-delete can reduce the race window but is timing-dependent, so it is not a correctness proof.
+
+<Calculation label="Cache impact">
+Origin reads = 50,000 × (1 − 0.90 hit rate) = 5,000 reads/s
+
+At 96% hit rate: origin reads = 2,000 reads/s
+
+The last 6 percentage points remove 60% of the remaining database load.
+</Calculation>
+
+<InteractiveCalculation mode="cache-load" title="Explore hit rate, origin load, and cold-cache exposure" />
+
+<ExecutionTimeline
+  title="How stale data can return after a valid invalidation"
+  steps={[
+    { title: "Reader misses", detail: "Reader A finds no cache entry and starts a database read.", state: "Cache empty; DB at version 41." },
+    { title: "Writer commits", detail: "Writer B commits version 42 to the authoritative database.", state: "Cache empty; DB at version 42." },
+    { title: "Writer invalidates", detail: "Writer B deletes the cache key. There is currently nothing to delete.", state: "Cache empty; DB at version 42." },
+    { title: "Reader fills", detail: "Reader A resumes with the version 41 value it read earlier and inserts it into cache.", state: "Cache incorrectly serves version 41.", failure: "DB-write-then-invalidate could not fence an older in-flight fill." }
+  ]}
+/>
+
+</UnderTheHood>
+
+<MentalModel title="Capacity is constrained by the narrowest stage">
+
+Model the request path as a pipeline. Each stage has capacity, latency, and a queue. Adding API instances does nothing if every request waits for the same saturated database connection pool.
+
+A cache is a photocopy near the reader, not the official record. Making more photocopies accelerates reads; it also creates a distribution problem when the original changes. Every cache answer needs an explicit maximum age or version rule.
+
+Retain three levers: **avoid work** with caching, **parallelize work** with horizontal scaling, and **move work off the critical path** with asynchronous processing.
+
+</MentalModel>
+
+<ArchitectureDiagram title="Read path, authoritative state, and invalidation" chart={"flowchart LR\n  U[Clients] --> LB[Health-aware load balancer]\n  LB --> A[Stateless API owners]\n  A -->|lookup + version| C[(Derived Redis cache)]\n  A -->|miss: bounded origin read| R[(Read replica)]\n  A -->|authoritative write| W[(Primary DB)]\n  W -. async replication .-> R\n  W -->|committed change / CDC| I[Invalidation consumer]\n  I -->|delete or version fence| C\n  C -. unavailable .-> A"}>
+
+The primary database owns catalog truth. Redis and replicas are derived, potentially stale views. The API owns cache-fill policy and must degrade to bounded origin traffic when Redis is unavailable; the CDC consumer repairs or invalidates entries only after database commit.
+
+</ArchitectureDiagram>
+
+<RealExamples title="Catalog reads and TokenX market data">
+
+Product details tolerate seconds of staleness, so CDN and Redis caching are effective. Inventory does not: overselling risk demands a short TTL, reservation service, or a strongly consistent read.
+
+TokenX token metadata and historical charts cache well. A spendable balance is sensitive to stale reads. Label data by freshness and correctness needs before applying one caching policy to an entire API.
+
+</RealExamples>
+
+<InterviewTraps title="Scaling mistakes to call out">
+
+- Scaling stateless compute while ignoring the database.
+- Treating cache hit rate as constant during a traffic spike or cache flush.
+- Reading immediately from an asynchronous replica after a write without read-your-writes handling.
+- Omitting backpressure, admission control, and load shedding.
+- Using sticky sessions when the service could simply be stateless.
+
+</InterviewTraps>
+
+<Tradeoffs title="Every cache spends consistency for capacity">
+
+Long TTLs improve hit rate but increase staleness. Explicit invalidation is fresher but introduces ordering races. Read replicas add throughput but serve lagging state. Autoscaling reduces idle cost but reacts after load begins and can amplify database pressure during scale-out.
+
+Caching becomes inappropriate when the object changes more often than it is reused, when every read must observe the latest committed value, or when invalidation fan-out costs more than the saved origin work. In those cases, optimize the authoritative read path or cache only immutable/versioned representations.
+
+</Tradeoffs>
+
+<KnowledgeCheck question="A service adds ten API instances but throughput is unchanged. What should you inspect first?" options={["The application logo size", "The shared downstream bottleneck and its queues", "Whether requests use JSON", "The number of DNS records"]} correct={1} explanation="Horizontal compute only helps when that tier is limiting capacity. A saturated database, connection pool, or cache can keep end-to-end throughput flat." />
+
+<ScenarioCheck
+  scenario="Reader A misses Redis and reads product version 41. Writer B commits version 42 and deletes the cache key. Reader A then fills Redis with version 41. Inventory must not regress after a confirmed update."
+  question="Which change most directly closes this stale-repopulation race?"
+  options={[
+    { label: "Require cache fills to carry a database version and reject any value older than the latest committed version.", feedback: "A monotonic version fences the delayed version-41 fill even though it arrives after invalidation." },
+    { label: "Increase the cache TTL to reduce database traffic.", feedback: "A longer TTL makes the stale value persist longer and does not order concurrent fills." },
+    { label: "Invalidate before committing the database write.", feedback: "A reader can refill the old value between the early invalidation and the commit." },
+    { label: "Add more stateless API replicas.", feedback: "More replicas increase potential concurrency but do not establish version ordering." }
+  ]}
+  correct={0}
+  explanation="Invalidation is a notification, not a fence. Versioned fills or a single ordered write-through/CDC owner make stale late arrivals detectable."
+/>
+
+<InterviewAnswer>
+
+“I would quantify reads, writes, object size, and acceptable staleness. I keep APIs stateless behind a health-aware load balancer, use cache-aside with TTL jitter for reusable reads, and send misses to read replicas. Writes go to the primary, followed by invalidation. I monitor hit rate, replica lag, queue depth, and database saturation. The main trade-off is capacity versus freshness, so inventory and balances get stricter treatment than catalog metadata.”
+
+</InterviewAnswer>

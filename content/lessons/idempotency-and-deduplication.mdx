@@ -1,0 +1,156 @@
+---
+title: "Idempotency and Deduplication"
+description: "Make retries safe with scoped keys, atomic outcome records, retention windows, payload fingerprints, and replay-aware side effects."
+module: 6
+moduleTitle: "CAP & Consistency"
+order: 8
+duration: 44
+difficulty: "Advanced"
+tags:
+  - idempotency
+  - deduplication
+  - retries
+  - exactly-once
+objectives:
+  - Design atomic idempotency records for commands and consumers
+  - Scope keys and retention from the retry and replay horizon
+  - Distinguish transport duplication from business identity
+  - Resolve timeouts and in-progress duplicates without repeating side effects
+---
+
+<BigPicture title="Retries are safe only when identity survives uncertainty">
+
+Networks turn success into ambiguity: a server can commit and lose the response, so a client timeout does not mean failure. Idempotency makes repeating the same logical command return the same outcome without repeating its effect. Deduplication detects an identity seen before; it is useful only when the identity, scope, atomic boundary, and retention window match the business operation.
+
+TokenX uses a tenant-scoped idempotency key for transfer creation and stores the request fingerprint plus result in the same transaction as the ledger mutation. The Ad Click Aggregator uses stable click IDs within a declared dedupe horizon, while replayable aggregate outputs use deterministic keys and versions.
+
+</BigPicture>
+
+<UnderTheHood title="Claim and effect must be one decision">
+
+The unsafe pattern is “check key, perform effect, then store key.” Two requests can both pass the check, or the process can crash after the effect but before recording it. The key claim and authoritative local effect must commit atomically, typically under a unique constraint.
+
+<ExecutionTimeline
+  title="TokenX command from first attempt through retry"
+  steps={[
+    { title: "Receive", detail: "The client sends tenant T, key K, and a canonical request fingerprint for a 100-token transfer.", state: "K is scoped to T and one operation class.", failure: "Reusing K with different parameters must not replay the old result as if equivalent." },
+    { title: "Claim atomically", detail: "The ledger transaction inserts (T,K,fingerprint,IN_PROGRESS) under a unique constraint and performs the transfer.", state: "Key, balanced entries, balances, and outbox share one commit.", failure: "A concurrent duplicate loses the unique insert and reads the existing state." },
+    { title: "Lose response", detail: "The transaction commits result R, but the response is dropped before the client receives it.", state: "The transfer happened exactly once within the ledger boundary.", failure: "The client sees timeout and cannot infer outcome." },
+    { title: "Replay result", detail: "The retry uses T and K; the service verifies the fingerprint and returns stored result R.", state: "No new ledger mutation occurs.", failure: "If the record expired too soon, the retry can become a new command." },
+  ]}
+/>
+
+### State machine and fingerprints
+
+Store states such as `IN_PROGRESS`, `SUCCEEDED`, and a carefully classified terminal failure. A duplicate encountering `IN_PROGRESS` can wait, return a retryable status with the resource URL, or help recover an abandoned claim. Do not cache every transient 500 forever. Persist a canonical hash of semantically relevant parameters; the same key with a different amount or destination is a conflict.
+
+The idempotency result should include the stable resource ID and enough response data to preserve API semantics. Large bodies may be regenerated from the authoritative resource if versioned. Scope keys by tenant and endpoint so two customers choosing `123` do not collide.
+
+### Retention is part of correctness
+
+If clients retry for 24 hours, queues replay for seven days, and offline devices can reconnect after 30 days, a one-hour dedupe TTL is not a safety guarantee. Retention must cover the longest accepted duplicate horizon or old requests must be rejected by protocol version/expiry.
+
+At 2,000 commands/s and seven-day retention, there are `2,000 × 604,800 ≈ 1.21 billion` records. At 120 bytes logical each, that is about 145 GB before indexes and replicas. Partition expiration by time, archive audit evidence if required, and keep the primary lookup bounded. A Bloom filter can reduce negative storage reads but cannot be the authority because false positives would reject valid commands and false-negative behavior after reset would admit duplicates.
+
+### Consumer deduplication
+
+For an external database consumer, commit an inbox event ID and local side effect in one database transaction. Commit the broker offset afterward. A crash before offset commit causes redelivery; inbox uniqueness makes it a no-op. Kafka transaction guarantees do not automatically include an unrelated database or payment provider.
+
+</UnderTheHood>
+
+<MentalModel title="A numbered coat-check ticket">
+
+Handing over ticket 842 again should return the same coat, not accept another coat or issue a second charge. The clerk checks both ticket number and claim details, records the outcome with the handoff, and keeps the record for as long as old tickets are honored.
+
+Retain: stable identity, correct scope, atomic claim-plus-effect, deterministic replay, and retention matching the ambiguity window.
+
+</MentalModel>
+
+<ArchitectureDiagram
+  title="Atomic idempotency and replay-safe delivery"
+  chart={"flowchart LR\n  CLIENT[Client key K plus hash] --> API[Transfer API]\n  API --> TX[Ledger transaction]\n  TX --> IDEM[(Idempotency record)]\n  TX --> LEDGER[(Balances and entries)]\n  TX --> OUT[(Outbox event ID E)]\n  OUT --> BROKER[(Kafka)]\n  BROKER --> CONS[Consumer]\n  CONS --> INBOX[(Inbox plus projection)]\n  CLIENT -. retry K .-> API\n  IDEM -. replay result R .-> API\n  CONS -. crash before offset .-> BROKER\n  INBOX -. duplicate E no-op .-> CONS"}
+>
+
+The ledger transaction owns command K, financial effect, outcome R, and event intent E. Kafka owns delivery after publish. The projection database owns inbox E and its local effect in one separate transaction. Each consistency boundary expects retries and closes its own ambiguity window with stable identity.
+
+<ArchitectureWalkthrough
+  title="Trace command and event identity"
+  stages={[
+    { name: "Command", owner: "API client and ledger", state: "Tenant key, fingerprint, and result", boundary: "Atomic with authoritative mutation.", failure: "Response is lost after commit.", recovery: "Retry the same key and replay the stored outcome." },
+    { name: "Publication", owner: "Outbox relay", state: "Stable event ID and publish status", boundary: "At-least-once broker send.", failure: "Crash after send before acknowledgement.", recovery: "Republish E; downstream treats duplicate E as expected." },
+    { name: "Consumption", owner: "Consumer database", state: "Inbox E plus derived mutation", boundary: "One local transaction.", failure: "Crash before broker offset commit.", recovery: "Redelivery conflicts with inbox E and performs no duplicate mutation." },
+    { name: "Expiry", owner: "Retention controller", state: "Oldest accepted command and replay horizon", boundary: "Protocol-declared dedupe window.", failure: "A valid old retry arrives after deletion.", recovery: "Reject expired commands explicitly or retain records through the supported horizon." },
+  ]}
+/>
+
+</ArchitectureDiagram>
+
+<RealExamples title="Identity at each side-effect boundary">
+
+**TokenX transfer.** Key scope is `(tenant, create-transfer, key)`. The fingerprint includes source, destination, asset, amount, and semantic options. A reused key with a different amount returns conflict. The stored result points to one immutable transfer ID.
+
+**Ad Click Aggregator.** Edge-generated click IDs dedupe transport retries. The service declares a seven-day online window; archival reprocessing uses a batch namespace plus deterministic event identity so it cannot collide with live state. Aggregate updates use `(campaign, window, version)` replacement, not blind increments on replay.
+
+**Payment provider.** The dispatcher first persists one provider command, then calls with that command ID as the provider's idempotency key. A timeout is resolved by replay or provider lookup. Local dedupe without provider support cannot prove the remote charge happened once.
+
+<FailureScenario
+  title="Explore idempotency gaps"
+  prompt="The same logical operation arrives more than once."
+  choices={[
+    { label: "Check then insert", impact: "Concurrent requests both observe absence and execute the effect.", recovery: "Use a unique constraint and commit claim, mutation, and outcome atomically." },
+    { label: "Key reused with new payload", impact: "Blind result replay can claim a different transfer succeeded.", recovery: "Compare canonical request fingerprints and reject mismatched reuse." },
+    { label: "Record expired", impact: "A delayed replay is treated as new and repeats the effect.", recovery: "Align retention with the accepted replay horizon or reject expired request epochs." },
+  ]}
+/>
+
+</RealExamples>
+
+<InterviewTraps title="Exactly-once claims with a missing boundary">
+
+1. **“The endpoint is idempotent because it uses PUT.”** HTTP method naming does not implement atomic identity or outcome replay.
+2. **“Store the key after success.”** A crash between effect and record leaves the exact ambiguity idempotency must solve.
+3. **“Deduplicate by payload.”** Two intentional equal purchases are distinct commands; identity must come from the caller or workflow.
+4. **“Keep keys for an hour.”** Derive retention from retry, queue, offline, and archival replay horizons.
+5. **“Kafka exactly-once covers our database.”** External state needs an inbox or a proven transactional connector boundary.
+6. **“Cache the 500 response.”** Distinguish terminal business failures from transient infrastructure failures and unknown outcomes.
+7. **“Bloom filter means seen.”** Probabilistic membership cannot be the authoritative rejection decision for money.
+
+</InterviewTraps>
+
+<Tradeoffs title="Safety window versus state cost">
+
+- Long retention handles delayed retries but creates large hot indexes and privacy/retention obligations.
+- Storing full responses gives exact replay but costs space; storing resource references requires stable versioned reads.
+- Waiting on `IN_PROGRESS` reduces duplicate work but can tie up requests; returning an operation URL makes progress explicit.
+- Client-generated keys preserve identity across network failure, but clients need correct scoping and persistence.
+- Natural business keys can be ideal when truly unique; forcing unrelated operations into one key can reject valid repeats.
+
+</Tradeoffs>
+
+<KnowledgeCheck
+  question="A transfer commits, but the client times out before receiving the response. Which retry behavior is correct?"
+  options={["Generate a new key", "Retry the same key and matching payload, then return the stored transfer result", "Check the cache and create another transfer if absent", "Assume failure after one second"]}
+  correct={1}
+  explanation="The original outcome is unknown to the client but durable at the authority. Stable identity turns the retry into result lookup rather than a new effect."
+/>
+
+<ScenarioCheck
+  scenario="Click events can replay from a 30-day archive, but the online dedupe table retains IDs for seven days. A recovery job will replay day 20 into the live aggregation path."
+  question="What is the safest design?"
+  options={[
+    { label: "Assume the seven-day table is sufficient", feedback: "Day-20 IDs have expired and can be counted again." },
+    { label: "Use a replay namespace and deterministic aggregate replacement/versioning, or rebuild isolated state before atomic publication", feedback: "This keeps archival replay from masquerading as new live increments." },
+    { label: "Randomize every replayed event ID", feedback: "That guarantees deduplication cannot recognize the original logical events." },
+    { label: "Disable all deduplication during recovery", feedback: "Duplicates and repeated recovery attempts would corrupt totals." },
+  ]}
+  correct={1}
+  explanation="Replay beyond the online window needs an explicitly separate, idempotent publication strategy rather than relying on expired live dedupe state."
+/>
+
+<InterviewAnswer>
+
+“Idempotency closes the unknown-outcome window with stable identity. For TokenX I scope the key by tenant and operation, hash the semantic request, and commit key, ledger mutation, result, and outbox intent together. A retry with the same payload returns the stored transfer; mismatched reuse is rejected.
+
+Every later boundary needs its own identity: outbox event ID, transactional consumer inbox, and provider idempotency key. Retention must cover the longest supported retry or replay horizon; otherwise old duplicates become new commands. See [transactions across boundaries](/learn/transactions-across-boundaries), [Kafka delivery](/learn/kafka-delivery-and-failure), and [distributed transactions](/learn/distributed-transactions).”
+
+</InterviewAnswer>

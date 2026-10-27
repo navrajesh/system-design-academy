@@ -1,0 +1,158 @@
+---
+title: "Object Storage and Large Files"
+description: "Build safe large-file workflows with immutable objects, metadata authority, multipart upload, checksums, lifecycle rules, and CDN delivery."
+module: 1
+moduleTitle: "Storage & Data"
+order: 7
+duration: 36
+difficulty: "Intermediate"
+tags:
+  - object storage
+  - multipart upload
+  - cdn
+  - lifecycle
+objectives:
+  - Separate object bytes from transactional metadata and authorization
+  - Design resumable multipart upload with checksum and finalize semantics
+  - Estimate transfer time, part counts, storage, and egress
+  - Handle orphaned uploads, partial workflows, deletion, and recovery
+---
+
+<BigPicture>
+
+Object storage is a durable key-to-bytes service optimized for large immutable blobs, massive namespace scale, and lifecycle tiering. It is not a relational database, shared POSIX filesystem, or transaction coordinator. A production design normally keeps authorization, ownership, state, and business metadata in a database while object storage owns the bytes.
+
+TokenX may store monthly statements, identity evidence, and reconciliation exports. The Ad Click Aggregator may store ad creatives and immutable raw event segments. In both cases, clients should move large bytes directly to object storage through narrowly scoped signed requests while an application service controls which object becomes visible.
+
+</BigPicture>
+
+<UnderTheHood>
+
+### Control plane and data plane
+
+The control API authenticates the user, creates an upload record with an unguessable object key, size limit, content policy, and expiry, then returns short-lived signed part URLs. The client uploads directly. Finalization verifies part checksums, expected total size, object existence, and scanning policy before atomically changing metadata from `UPLOADING` to `AVAILABLE`.
+
+Never treat a user-provided filename as the storage key or authorization boundary. Store it as escaped display metadata. Prefer immutable keys such as `tenant/object-id/version`; replacing content creates a new version, then one metadata transaction changes the active reference.
+
+<ExecutionTimeline
+  title="Safe multipart upload"
+  steps={[
+    { title: "Initiate", detail: "Create an UPLOADING metadata row and signed URLs constrained to one object, part range, byte limit, and short expiry." },
+    { title: "Upload parts", detail: "The client sends parts in parallel and retains each returned part checksum or ETag for resume." },
+    { title: "Complete bytes", detail: "Object storage assembles the declared parts; the service verifies total size and a whole-object cryptographic checksum." },
+    { title: "Scan and classify", detail: "An asynchronous scanner validates media type and malware policy in a quarantine namespace." },
+    { title: "Publish metadata", detail: "One conditional database update marks the exact immutable object version AVAILABLE; CDN delivery starts only then." },
+  ]}
+/>
+
+### Transfer calculation
+
+A 5 GiB export split into 64 MiB parts needs `5 × 1024 / 64 = 80` parts. A 100 Mbit/s uplink carries at most 12.5 MB/s, so the ideal lower bound is about `5,368 MB / 12.5 ≈ 429 seconds`, or 7.2 minutes. Eight-way parallel upload can hide per-request latency and recover individual failures, but it cannot exceed the bottleneck link. Budget retries, encryption, and provider throttling.
+
+Part size is a three-way compromise: small parts improve retry granularity but increase request and metadata overhead; large parts reduce requests but make retries costly; provider part-count limits impose a lower bound for huge objects.
+
+### Reads, integrity, and lifecycle
+
+Range requests support video seeking and partial downloads. A CDN reduces origin requests and user latency, but private objects need signed delivery URLs and cache-key discipline. Store content type from validated bytes, not a trusted client header. Use cryptographic whole-object checksums for integrity; multipart ETags are provider-specific and may not be a content hash.
+
+Lifecycle rules transition immutable versions to colder tiers and eventually expire them. Deleting the database row first can orphan bytes; deleting bytes first can leave a visible broken reference. Use a state machine: mark `DELETING`, revoke access, delete versions, verify, then tombstone metadata. Legal holds and backup retention override ordinary expiry and must be auditable.
+
+</UnderTheHood>
+
+<MentalModel>
+
+Think of object storage as a warehouse and the metadata database as the claim-ticket desk. The warehouse stores sealed boxes; the desk decides who owns a box, which version is active, and whether it may be collected. A box on a loading dock is not available just because its first pieces arrived.
+
+Retain: immutable bytes, transactional pointers, verified finalize, explicit lifecycle.
+
+</MentalModel>
+
+<ArchitectureDiagram
+  title="Large-file state ownership and incomplete-upload recovery"
+  description="The metadata database owns visibility and authorization; object storage owns immutable bytes. Quarantine and cleanup make failure states explicit."
+  chart={"flowchart LR\n  CLIENT[Browser or exporter] --> API[Control API]\n  API --> META[(Metadata DB)]\n  API --> SIGN[Scoped signed URLs]\n  SIGN --> OBJ[(Object storage quarantine)]\n  CLIENT --> OBJ\n  OBJ --> SCAN[Checksum and malware scan]\n  SCAN --> META\n  META --> CDN[Private CDN]\n  CDN --> READER[Authorized reader]\n  META -. stale UPLOADING .-> CLEAN[Orphan cleanup]\n  CLEAN --> OBJ\n  OBJ -. missing version .-> REPAIR[Reconcile and restore]"}
+>
+
+The publish boundary is the conditional metadata transition to `AVAILABLE` for a verified immutable version. Bytes uploaded before that boundary are quarantined and invisible. A sweeper owns expired incomplete uploads; a reconciliation job detects metadata pointing to missing objects and invokes restore or marks the asset unavailable.
+
+</ArchitectureDiagram>
+
+<ArchitectureWalkthrough
+  title="Walk the upload boundaries"
+  stages={[
+    { name: "Metadata row", owner: "Control-plane database", state: "Tenant, expected size, lifecycle, and active version", boundary: "Transactional visibility and authorization.", failure: "Metadata references incomplete bytes.", recovery: "Keep state quarantined until verification, or mark it unavailable." },
+    { name: "Signed request", owner: "Control API", state: "Bounded delegated operation", boundary: "Exact key, method, expiry, and size.", failure: "A URL leaks or expires mid-upload.", recovery: "Expire quickly and issue a new scoped request after authorization." },
+    { name: "Object version", owner: "Object store", state: "Immutable bytes and checksum", boundary: "Successful multipart completion.", failure: "Part or checksum verification fails.", recovery: "Retry the affected part or abandon the candidate version." },
+    { name: "Recovery jobs", owner: "Lifecycle controller", state: "Upload expiry and reconciliation cursor", boundary: "Idempotent cleanup policy.", failure: "Orphan bytes or a missing active version.", recovery: "Abort stale uploads, restore bytes, or tombstone the broken reference." },
+  ]}
+/>
+
+<RealExamples>
+
+**TokenX statement export.** A background worker writes a statement to an immutable version, verifies row count and checksum, then updates the statement record. The download API authorizes the wallet owner and returns a short-lived CDN URL. Regeneration creates a new version; audit logs retain which version a customer received.
+
+**Ad creative upload.** The client uploads directly to quarantine. Image and malware validation runs before campaign metadata can reference it. Derivative thumbnails have deterministic keys derived from source version plus transformation version, so retries do not create duplicates.
+
+**Raw click archive.** Stream processors seal hourly segments with schema version, time bounds, record count, and checksum in a manifest. A segment is discoverable only after the manifest commits. Reprocessing reads the manifest, not a bucket listing whose ordering or cross-provider semantics should not be assumed.
+
+<FailureScenario
+  title="The client disappears after uploading 73 of 80 parts"
+  prompt="Bytes exist, but finalization never ran. What should the platform do?"
+  choices={[
+    { label: "Resume within TTL", impact: "The upload remains incomplete and invisible while the client retries only missing parts.", recovery: "Issue newly authorized part URLs for the same upload ID and verify every part at finalize." },
+    { label: "TTL expires", impact: "Orphan multipart storage and an UPLOADING metadata row remain.", recovery: "Idempotently abort the multipart upload and transition metadata to EXPIRED." },
+    { label: "Finalize races cleanup", impact: "A publisher and sweeper may disagree about whether the candidate can become visible.", recovery: "Use a conditional state transition so only one owner wins, then clean or publish accordingly." },
+  ]}
+/>
+
+</RealExamples>
+
+<InterviewTraps>
+
+1. **“Store the file in the database.”** Small transactional blobs can be reasonable, but large files inflate WAL, backups, replicas, and buffer caches. Quantify the crossover.
+2. **“The signed URL handles security.”** Scope key, method, size, checksum, content rules, tenant, and expiry; authorize again on download.
+3. **“ETag is the MD5.”** Multipart and encrypted objects may use different semantics. Request and verify a defined checksum.
+4. **“Rename the object atomically.”** Many object stores use copy-plus-delete or lack filesystem rename. Publish by switching a metadata pointer to an immutable key.
+5. **“Delete means gone.”** Account for versions, replicas, CDN caches, archives, backups, legal holds, and encryption keys.
+
+An IC6 answer names the incomplete states and cleanup owners rather than describing only the happy path.
+
+</InterviewTraps>
+
+<Tradeoffs>
+
+- Direct client upload removes application bandwidth but requires constrained delegation and hostile-input validation.
+- Multipart transfer improves resume and parallelism but creates incomplete state and request cost.
+- Immutable versioning simplifies caches, audit, and rollback but consumes storage until lifecycle rules expire old versions.
+- CDN delivery reduces latency and egress from origin but complicates revocation and cache invalidation.
+- Cold tiers reduce storage price but increase retrieval latency and fees; they are inappropriate for data with tight restore objectives unless staged copies exist.
+
+</Tradeoffs>
+
+<KnowledgeCheck
+  question="How many 64 MiB parts are required for a 5 GiB object?"
+  options={["64", "80", "100", "5120"]}
+  correct={1}
+  explanation="Five GiB is 5 × 1024 MiB; dividing by 64 MiB gives 80 parts."
+/>
+
+<ScenarioCheck
+  title="Publishing a newly generated statement"
+  scenario="A worker uploads a new statement version, but crashes before updating the database. The old version is still active."
+  question="What recovery behavior preserves correctness?"
+  options={[
+    { label: "List the bucket and choose the newest key", feedback: "Creation time does not prove validation or authorization, and concurrent attempts can race." },
+    { label: "Overwrite the old object in place", feedback: "Readers and caches may observe mixed behavior, and rollback is lost." },
+    { label: "Reconcile then conditionally publish", feedback: "Verify the immutable candidate and atomically switch metadata only if the expected prior version is still active; otherwise clean it up." },
+  ]}
+  correct={2}
+  explanation="Object creation and business publication are separate state transitions joined by idempotent reconciliation."
+/>
+
+<InterviewAnswer>
+
+“I separate the data plane from the control plane. Object storage owns immutable bytes; the metadata database owns tenant, authorization, lifecycle state, and the active version. Clients use short-lived, tightly scoped multipart URLs. Finalization verifies size and cryptographic checksum, scans in quarantine, then atomically publishes one exact version.
+
+I calculate part count and link-limited transfer time, design bounded resume plus orphan cleanup, and include versions, CDN caches, backups, and legal holds in deletion. Related lessons are [time-series archives](/learn/time-series-and-append-only-storage), [transactions across boundaries](/learn/transactions-across-boundaries), and [backup and recovery](/learn/backup-restore-and-disaster-recovery).”
+
+</InterviewAnswer>

@@ -1,0 +1,209 @@
+---
+title: "Partitioning vs Sharding vs Aggregation"
+description: "Learn how to split data, distribute ownership, and recombine partial results without creating hot keys or correctness gaps."
+module: 1
+moduleTitle: "Storage & Data"
+order: 1
+duration: 42
+difficulty: "Intermediate"
+tags:
+  - partitioning
+  - sharding
+  - aggregation
+  - hot keys
+objectives:
+  - "Distinguish logical partitions from physical shards"
+  - "Size an ingestion path from traffic and retention"
+  - "Design two-stage aggregation with replay-safe writes"
+  - "Explain hot-key mitigations and their costs"
+---
+
+<BigPicture title="Three operations, three different jobs">
+
+These terms are often used as if they were synonyms. They are not.
+
+- **Partitioning** divides a dataset or stream into disjoint subsets using a rule. The rule might be a hash, a range, geography, or time.
+- **Sharding** places those partitions across independent storage or compute nodes so capacity and load are distributed.
+- **Aggregation** combines many records or partial results into a smaller result, such as clicks per campaign per minute.
+
+A partition is a logical boundary. A shard is an ownership and placement boundary. An aggregate is a derived result. One system often uses all three: partition events, place partitions on brokers or databases, then aggregate local counters into a global total.
+
+<Callout type="tip" title="The sentence to remember">
+Partitioning decides **which bucket** an item belongs to; sharding decides **which machine owns that bucket**; aggregation decides **how bucket-level results are combined**.
+</Callout>
+
+</BigPicture>
+
+<UnderTheHood title="Start with a 100M clicks/day workload">
+
+Assume an advertising platform receives **100 million click events per day**. Each event carries an event ID, ad ID, campaign ID, user region, timestamp, and cost metadata. The product needs near-real-time campaign counters and an immutable audit trail.
+
+<Calculation label="Traffic envelope">
+Average rate = 100,000,000 / 86,400 ≈ 1,158 events/s
+
+Design peak at 10× average ≈ 11,600 events/s
+
+At 800 bytes/event: peak ingress ≈ 9.3 MB/s
+
+With replication factor 3: broker write traffic ≈ 28 MB/s
+
+Thirty-day raw retention ≈ 2.4 TB before replication and indexing
+</Calculation>
+
+<InteractiveCalculation mode="event-ingress" title="Stress the click-ingestion assumptions" />
+
+The average is almost never the sizing number. Ad traffic follows time zones, campaigns launch on the hour, and major events create sharp bursts. Use measured or explicitly assumed peak factors, and say whether byte estimates include protocol overhead, indexes, and replication.
+
+### Partition the event log
+
+Hashing by <code>campaign_id</code> keeps a campaign's events ordered within one Kafka partition and makes campaign-local aggregation simple. It also creates a risk: a viral campaign becomes a hot partition. Hashing by <code>event_id</code> spreads writes evenly but destroys per-campaign ordering and requires a shuffle before aggregation.
+
+A practical key is <code>campaign_id + salt</code>, where the salt is deterministic from stable event data and has 8–32 buckets for large campaigns. This produces partial counters that a second stage merges.
+
+Adaptive salting needs a **versioned policy**, not a mutable “salt count” lookup. Record <code>salt_policy_version</code> and the chosen salt on each event or derived key. Activate a new version at a declared window boundary; during transition, the merger reads every version valid for that window. Otherwise retries made after a policy change may route to a different partial, and readers may omit old partials. For emergency mid-window changes, dual-read both versions until the window is finalized, then compact into one canonical aggregate.
+
+### Shard the durable stores
+
+The raw event log is already physically distributed across Kafka brokers. The serving database can be sharded independently—perhaps by <code>hash(campaign_id)</code>—because its access pattern is “fetch campaign counters,” not “replay time ranges.” Partitioning strategies should follow each store's dominant read and write path; they do not need to match end to end.
+
+### Aggregate without losing correctness
+
+Consumers maintain one-minute partial counters. Every output is keyed by <code>(campaign_id, window_start, salt_policy_version, salt)</code>. A merge stage sums all valid partials into <code>(campaign_id, window_start)</code>. Retain the raw log long enough to rebuild derived state.
+
+Kafka offsets and an external counters database do not share an automatic transaction. For an external relational sink, one replay-safe pattern is:
+
+1. Begin a database transaction.
+2. Insert <code>event_id</code> into a processed-events table with a unique constraint.
+3. Only when that insert succeeds, update the partial counter in the same transaction.
+4. Commit the database transaction, then commit the Kafka offset.
+
+A crash before database commit causes a harmless replay. A crash after database commit but before offset commit redelivers the event; the unique event ID turns the second database transaction into a no-op. The processed-event retention window must cover the maximum replay horizon. If both input and output remain in Kafka, Kafka transactions can atomically publish output and offsets inside that Kafka boundary; they still do not make an unrelated external database atomic.
+
+<ExecutionTimeline
+  title="External database write with an at-least-once consumer"
+  steps={[
+    { title: "Poll", detail: "Read the event and its partition offset without committing the offset.", state: "Kafka retains replay ownership.", failure: "A crash simply redelivers the event." },
+    { title: "Fence duplicate", detail: "Insert event_id under a unique constraint inside the database transaction.", state: "The database owns deduplication state.", failure: "A conflicting event_id proves this delivery was already applied." },
+    { title: "Update counter", detail: "Mutate the salted partial in the same database transaction as the dedupe marker.", state: "No marker can commit without its business mutation." },
+    { title: "Commit offset", detail: "After the database commit succeeds, advance the Kafka consumer offset.", state: "Kafka may now retire this delivery for the group.", failure: "If this step fails, replay is absorbed by the dedupe constraint." }
+  ]}
+/>
+
+</UnderTheHood>
+
+<MentalModel title="Separate routing, placement, and reduction">
+
+Walk through three questions in order:
+
+1. **Routing:** Given a record, what deterministic rule finds its logical partition?
+2. **Placement:** Which node owns that partition now, and how does ownership move during rebalance?
+3. **Reduction:** Which partial values can be combined, and is the combine operation associative and commutative?
+
+Counts and sums combine cleanly. Exact distinct counts do not: two sets overlap, so adding their sizes is wrong. For distinct reach, merge sets when cardinality is small or use a mergeable sketch such as HyperLogLog when an error bound is acceptable.
+
+Think of a postal system. Partitioning is the ZIP-code rule printed on an envelope, sharding is which sorting center currently owns that ZIP range, and aggregation is the regional report that combines each center's totals. Changing a sorting center does not change the address, and adding totals does not decide where mail belongs.
+
+In map/reduce terms, partitioning is the map-side routing decision, aggregation is the reduce, and sharding is the physical execution plan underneath both.
+
+</MentalModel>
+
+<ArchitectureDiagram
+  title="Salted, two-stage click aggregation"
+  chart={"flowchart LR\n  C[Stateless click collectors] -->|acks=all after ISR replication| K[(Kafka: authoritative event log)]\n  K --> P1[Partition consumer A]\n  K --> P2[Partition consumer B]\n  P1 -->|event + policy version| T1{DB transaction}\n  P2 -->|event + policy version| T2{DB transaction}\n  T1 --> S[(Dedupe IDs + partial counters)]\n  T2 --> S\n  S --> M[Window merge owner]\n  M -->|versioned idempotent upsert| D[(Derived serving DB)]\n  D --> A[Reporting API]\n  K -. replay after crash .-> P1\n  K -. full replay rebuilds derived state .-> S"}
+>
+
+Collectors acknowledge a click only after Kafka satisfies the configured durability acknowledgment. Kafka owns the immutable event history. The database transaction owns both the dedupe marker and partial mutation; the Kafka offset is committed afterward. The serving database is derived and rebuildable. The merge stage emits finalized counters after a watermark, while late events update a correction version.
+
+<ArchitectureWalkthrough
+  title="Follow ownership and recovery across the aggregation path"
+  stages={[
+    { name: "Durable ingest", owner: "Kafka partition leader + replicas", state: "Raw event and ordering within one partition", boundary: "Collector success means the configured replica condition was met.", failure: "Leader fails before durable acknowledgment.", recovery: "Collector retries with the same event ID; downstream dedupe absorbs duplicates." },
+    { name: "Partial update", owner: "Consumer plus external DB", state: "Dedupe marker and salted counter", boundary: "One local DB transaction; Kafka offset remains outside it.", failure: "DB commits but offset commit fails.", recovery: "Kafka redelivers; unique event_id makes the second DB mutation a no-op." },
+    { name: "Window merge", owner: "Merge worker", state: "All salt-policy versions for one campaign window", boundary: "Watermark decides provisional versus finalized output.", failure: "A salt policy changes during an open window.", recovery: "Read both versioned policies, then compact after finalization." },
+    { name: "Serve", owner: "Sharded counters DB", state: "Versioned materialized campaign totals", boundary: "Derived state, not the audit source of truth.", failure: "Serving shard loses data.", recovery: "Replay Kafka and rebuild partials and merged windows." }
+  ]}
+/>
+
+</ArchitectureDiagram>
+
+<RealExamples title="Ad Click Aggregator and TokenX">
+
+### Example A: the campaign hot key
+
+Campaign 42 suddenly receives 35% of all clicks. With plain <code>campaign_id</code> hashing, one Kafka partition and one consumer absorb that entire load. Adding 16 deterministic salts turns one key into 16 independently processed keys. The merge layer now performs 16 reads per campaign-window instead of one, but the write path scales horizontally.
+
+Do not salt every key blindly. Small campaigns gain read amplification with no write benefit. A key-frequency detector can publish a versioned “heavy key” policy; only those keys use a larger salt factor. Store the policy version, effective window, and salt count alongside aggregation metadata so readers know which partials to combine.
+
+### Example B: TokenX balance and transfer history
+
+TokenX is a token ledger. Its immutable transfer history can be partitioned by time for retention and replay, but balance mutations should be sharded by account or wallet ID. A transfer touching two wallets may cross shards, creating a distributed transaction problem.
+
+Aggregation is appropriate for portfolio views, daily volume, and supply dashboards. It is **not** the source of truth for authorization. Before accepting a spend, TokenX must consult strongly consistent balance or reservation state. An eventually consistent sum of transfer events can lag or double count during replay.
+
+For a whale wallet that receives enormous fan-out, salted event processing can spread analytics load. The canonical wallet balance cannot be independently salted unless the system introduces a coordinator, escrow partitions, or another invariant-preserving protocol. This is where “just shard it” stops being an answer.
+
+</RealExamples>
+
+<InterviewTraps title="Where otherwise strong designs fail">
+
+- **Equating a partition with a server.** Many partitions can live on one node, and a partition can have replicas on several nodes. Say “logical partition” and “physical placement” explicitly.
+- **Using modulo hashing without discussing resharding.** Changing from N to N+1 shards remaps most keys. Consistent hashing or virtual shards reduce movement.
+- **Claiming exactly-once end to end.** Kafka transactions cover a defined boundary. External side effects still need idempotency keys, deduplication, or an outbox.
+- **Ignoring skew.** Uniform hashing spreads many distinct keys; it does not split one extremely popular key.
+- **Aggregating away auditability.** Derived counters cannot explain a discrepancy unless raw events or a durable change log are retained.
+- **Forgetting query scatter.** Sharding by campaign makes campaign reads cheap but cross-campaign reporting fans out. Precompute common rollups or accept bounded scatter.
+- **Moving shards with no transition protocol.** During migration, define who owns writes, how old data copies, and how reads behave before cutover.
+
+</InterviewTraps>
+
+<Tradeoffs title="Choose the boundary that matches the workload">
+
+**Hash partitioning** gives even distribution and direct point routing, but range scans fan out and adding shards can move data. **Range partitioning** makes interval queries efficient, but sequential keys and recent timestamps can overload the newest range.
+
+**More partitions** increase parallelism and make rebalancing granular, but add metadata, open files, replication work, and coordination overhead. Start above today's consumer count to leave headroom, but not by orders of magnitude without broker-specific evidence.
+
+**Pre-aggregation** reduces storage and query cost, but loses raw detail and complicates corrections. Keep the log as the source of truth; treat aggregates as rebuildable materialized views.
+
+**Salting** spreads a hot key, but it converts one read or write into N partial operations. Adaptive salting limits that tax to observed heavy hitters, at the cost of control-plane complexity.
+
+Salting becomes inappropriate when the operation requires a single serial order or immediate invariant check—such as authorizing a TokenX spend—unless a coordinator, reservation, or escrow protocol restores that invariant.
+
+<Details summary="How would you reshard the counters database?">
+Use many more virtual buckets than physical shards. Route <code>hash(campaign_id) mod V</code> to a virtual bucket, then map buckets to physical shards in a versioned routing table. To move a bucket: copy a snapshot, replicate the change stream, briefly fence or dual-route writes, verify parity, switch the routing-table version, and retain the old copy for rollback. Clients must refresh stale routing metadata safely.
+</Details>
+
+</Tradeoffs>
+
+<KnowledgeCheck
+  question="A single campaign drives 40% of traffic. Why does adding more hash partitions not automatically fix the hotspot?"
+  options={[
+    "Kafka can only store one replica of each key",
+    "A deterministic key still routes all events for that campaign to one partition",
+    "Hash partitioning works only for numeric keys",
+    "Aggregation cannot run in parallel"
+  ]}
+  correct={1}
+  explanation="More partitions spread distinct keys, but one unchanged campaign key still maps to exactly one partition. Split that logical key with deterministic salting, then merge partials."
+/>
+
+<KnowledgeCheck
+  question="Which TokenX value should remain authoritative rather than being served from an eventually consistent analytics aggregate?"
+  options={[
+    "Daily transfer volume",
+    "Approximate unique wallets",
+    "Spendable wallet balance",
+    "Hourly transaction count"
+  ]}
+  correct={2}
+  explanation="A stale spendable balance can violate the no-double-spend invariant. Analytics metrics can tolerate lag or bounded error; authorization state generally cannot."
+/>
+
+<InterviewAnswer>
+
+“I separate the concepts first. Partitioning is the logical routing function, sharding is the physical distribution of those partitions, and aggregation combines partial values. For 100 million clicks per day I get roughly 1.2 thousand events per second on average; I would design for an explicit 10× peak, around 12 thousand per second, and validate event size and retention.
+
+I would durably append clicks to Kafka, initially partitioned by campaign for local ordering. Because a major campaign can dominate traffic, heavy keys use a deterministic salt. Consumers deduplicate on event ID and produce per-minute, per-salt counters; a second stage merges those into campaign totals and performs idempotent upserts to a database sharded by campaign ID. Raw events remain replayable, aggregates are rebuildable, and late data creates corrections after the watermark.
+
+The trade-off is that salting improves write parallelism but adds merge and read amplification. For TokenX I would apply the same pattern to analytics, not to the authoritative spendable balance, because that invariant needs strong coordination across any shards touched by a transfer.”
+
+</InterviewAnswer>

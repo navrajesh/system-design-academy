@@ -1,0 +1,161 @@
+---
+title: "Replication and Failover"
+description: "Reason about log shipping, replica lag, read consistency, quorum durability, fencing, and recovery without creating split brain."
+module: 1
+moduleTitle: "Storage & Data"
+order: 5
+duration: 42
+difficulty: "Advanced"
+tags:
+  - replication
+  - failover
+  - durability
+  - consistency
+objectives:
+  - Trace a committed write through synchronous and asynchronous replication
+  - Quantify replica lag, recovery point, and catch-up time
+  - Design a fenced failover that prevents two writable primaries
+  - Match read routing to session and business consistency requirements
+---
+
+<BigPicture>
+
+Replication creates additional copies for availability, read scale, and disaster recovery, but it does not make every copy equally current or authoritative. The design must name who may accept writes, which acknowledgements make a commit durable, how stale reads may be, and how an old primary is prevented from returning after failover.
+
+For TokenX, a balance check immediately after a transfer needs read-your-writes behavior and usually routes to the leader or waits for a replica to reach the commit log position. An Ad Click Aggregator dashboard can often tolerate seconds of lag. Applying one routing rule to both either violates correctness or wastes capacity.
+
+</BigPicture>
+
+<UnderTheHood>
+
+### From commit to replica
+
+In leader-follower replication, the leader validates a transaction, records changes in a write-ahead log (WAL), makes the commit durable according to its policy, and streams ordered log records to followers. Each follower persists and replays the log. Track at least the leader commit position, follower received position, durable position, and applied position; “connected” does not mean “caught up.”
+
+With asynchronous replication, the leader may acknowledge before any follower persists the record. Failover can therefore lose acknowledged writes. Synchronous acknowledgement lowers the loss window but adds network and follower storage latency to the commit path. A quorum configuration is safe only if membership, failure domains, and acknowledgement semantics are explicit.
+
+<ExecutionTimeline
+  title="A fenced TokenX failover"
+  steps={[
+    { title: "Detect loss of lease", detail: "A quorum-based coordinator stops renewing the leader's term; client timeouts alone do not authorize promotion." },
+    { title: "Fence the old writer", detail: "Revoke its lease, storage access, or routing token so it cannot accept writes if the network heals." },
+    { title: "Choose the safest candidate", detail: "Compare durable log positions and promote a replica with the latest eligible history." },
+    { title: "Increment the term", detail: "The new leader writes with a higher epoch; databases and consumers reject stale-epoch writes." },
+    { title: "Redirect and reconcile", detail: "Route clients, restore redundancy, and reconcile requests whose outcomes were ambiguous at the cutover." },
+  ]}
+/>
+
+### Lag and catch-up calculation
+
+Assume the leader generates 15 MB/s of WAL and a follower is disconnected for 120 seconds. It accumulates `15 × 120 = 1.8 GB` of backlog. After reconnection it can ingest 45 MB/s while new WAL continues at 15 MB/s, leaving 30 MB/s of catch-up capacity. Ideal catch-up time is `1,800 / 30 = 60 seconds`, before replay CPU or I/O contention. During those 60 seconds, routing correctness-sensitive reads there is unsafe.
+
+Lag is not just wall-clock time. Compare log positions and retained log availability. If required WAL has already been recycled, the replica must be re-seeded from a snapshot; retrying the stream cannot fill the gap.
+
+### Read guarantees
+
+- **Eventual reads:** route freely and tolerate bounded or measured staleness.
+- **Read-your-writes:** attach the commit position to the session, then read from a replica only after it has applied that position, with a leader fallback.
+- **Monotonic reads:** pin the session or carry a minimum position so it never observes an older snapshot.
+- **Linearizable reads:** read through the current leader or use a quorum protocol that proves leadership and ordering.
+
+Replication also multiplies bad state. An accidental delete, corrupt application write, or compromised credential is faithfully copied; backups and point-in-time recovery solve a different problem.
+
+</UnderTheHood>
+
+<MentalModel>
+
+Imagine a court reporter producing an official transcript while assistants copy it. A copy may be behind, and promoting an assistant requires proving the original reporter can no longer add pages. Replication is copying plus authority control—not merely extra disks.
+
+Remember: acknowledge policy defines possible data loss, applied log position defines freshness, and fencing defines whether failover is safe.
+
+</MentalModel>
+
+<ArchitectureDiagram
+  title="Replication authority, consistency boundary, and split-brain defense"
+  description="A quorum grants one epoch-scoped writer. WAL crosses the replication boundary; reads are routed according to the required log position."
+  chart={"flowchart LR\n  CLIENT[TokenX client] --> ROUTER[Consistency-aware router]\n  ROUTER --> LEADER[(Leader epoch 42)]\n  LEADER --> WAL[(Durable WAL)]\n  WAL --> R1[(Replica A applied LSN)]\n  WAL --> R2[(Replica B applied LSN)]\n  QUORUM[Quorum and lease] --> LEADER\n  QUORUM --> FENCE[Fencing token]\n  FENCE -. rejects old epoch .-> OLD[(Old leader epoch 41)]\n  ROUTER --> R1\n  R1 -. lag exceeds token .-> LEADER\n  R2 -. WAL gap .-> SEED[Snapshot reseed]"}
+>
+
+The leader is the write authority only while its current epoch is valid. WAL is the ordered durability and recovery boundary. Followers own local replay state, not independent truth. The dashed paths make degraded behavior explicit: stale reads fall back to the leader, an obsolete leader is rejected, and an unrecoverable log gap triggers reseeding.
+
+</ArchitectureDiagram>
+
+<ArchitectureWalkthrough
+  title="Read and failure paths"
+  stages={[
+    { name: "Commit", owner: "Current leader", state: "Committed WAL position", boundary: "Configured durability acknowledgement.", failure: "Leader fails before follower persistence.", recovery: "Honor the documented RPO and resolve requests by idempotency key." },
+    { name: "Replicate", owner: "Follower", state: "Received, durable, and applied positions", boundary: "Ordered WAL replay.", failure: "Replay stalls or required WAL expires.", recovery: "Remove from routing, catch up, or reseed from a snapshot." },
+    { name: "Route", owner: "Consistency-aware router", state: "Session minimum position", boundary: "Per-operation staleness policy.", failure: "No replica satisfies the token.", recovery: "Wait within deadline or fall back to the leader." },
+    { name: "Recover", owner: "Quorum coordinator", state: "Membership, lease, and epoch", boundary: "One fenced writer.", failure: "Old leader returns after promotion.", recovery: "Reject its stale epoch and reconcile ambiguous commits." },
+  ]}
+/>
+
+<RealExamples>
+
+**TokenX transfer.** The POST response includes a transfer ID and commit position. A subsequent balance GET carries that position. A local replica may serve it only after applying the position; otherwise the router waits briefly or uses the leader. An idempotency key resolves a timeout where the client cannot tell whether commit occurred.
+
+**Ad Click Aggregator.** Campaign dashboards read followers with a 10-second freshness SLO. If lag exceeds the threshold, show “data delayed” or route to another replica rather than silently presenting old totals as current. Raw events remain in the durable log so projections can be rebuilt.
+
+**Regional failure.** Asynchronous cross-region replication may have an RPO greater than zero. If product claims zero loss, the design needs synchronous cross-region consensus and must accept the latency and availability consequences. DNS cutover alone is not fencing.
+
+<FailureScenario
+  title="The old primary returns after promotion"
+  prompt="A network partition isolates the primary. A follower is promoted, then connectivity returns and both nodes accept writes. Which missing control is fundamental?"
+  choices={[
+    { label: "Old leader accepts writes", impact: "Two histories diverge even if most clients route to the promoted node.", recovery: "Reject the old epoch at storage or database enforcement and quarantine its divergent writes." },
+    { label: "Replica lacks recent WAL", impact: "Promotion can lose acknowledged asynchronous commits.", recovery: "Select by durable log position, publish the true RPO, and reconcile ambiguous requests by idempotency key." },
+    { label: "Clients cache the old route", impact: "Some requests keep reaching an obsolete endpoint after cutover.", recovery: "Combine routing changes with server-side epoch rejection; DNS alone is not fencing." },
+  ]}
+/>
+
+</RealExamples>
+
+<InterviewTraps>
+
+1. **“Replicas guarantee no data loss.”** Ask when success is returned and how many failure-independent copies have persisted the commit.
+2. **“Promote when health checks fail.”** A slow node and a partition look alike. Promotion requires quorum and fencing, not a single observer's timeout.
+3. **“Replica lag is two seconds.”** Specify received, durable, and applied positions; clock-based lag can hide a stalled stream with no new traffic.
+4. **“Read replicas are transparent.”** State which endpoints tolerate stale data and how read-your-writes or monotonic sessions are enforced.
+5. **“Replication is our backup.”** Replication propagates logical corruption and deletion. Tested, isolated recovery points are still necessary.
+
+A strong IC6 answer includes the ambiguity window: after a leader dies, clients retry with stable idempotency keys while operators reconcile commits near the last durable position.
+
+</InterviewTraps>
+
+<Tradeoffs>
+
+- Asynchronous replication preserves low write latency and regional independence but permits a nonzero RPO.
+- Synchronous replication reduces acknowledged-write loss but makes commit latency and availability depend on the acknowledgement set.
+- Automated failover shortens RTO but increases split-brain risk unless membership and fencing are rigorous.
+- Serving reads from replicas increases capacity but requires explicit staleness, session, and overload policies.
+- Multi-leader replication improves local write availability only for conflict-tolerant domains; balances and uniqueness invariants make merge semantics dangerous.
+
+</Tradeoffs>
+
+<KnowledgeCheck
+  question="A follower has 1.8 GB of WAL backlog. It receives 45 MB/s while the leader continues producing 15 MB/s. Ignoring overhead, how long until it catches up?"
+  options={["40 seconds", "60 seconds", "120 seconds", "It can never catch up"]}
+  correct={1}
+  explanation="Only 30 MB/s is available to reduce backlog, so 1,800 MB divided by 30 MB/s is 60 seconds."
+/>
+
+<ScenarioCheck
+  title="Zero-loss requirement across regions"
+  scenario="TokenX requires acknowledged transfers to survive total loss of the primary region. Inter-region round-trip time is 70 ms, and the product also asks for 20 ms p99 writes."
+  question="What should the design review conclude?"
+  options={[
+    { label: "Use async replication and call it zero loss", feedback: "Acknowledged writes can be stranded in the failed region, so this violates the requirement." },
+    { label: "Promise both with faster servers", feedback: "Compute does not remove the wide-area acknowledgement lower bound." },
+    { label: "Expose the requirement conflict", feedback: "Synchronous cross-region durability adds network latency; renegotiate latency, durability, or region topology with measured bounds." },
+  ]}
+  correct={2}
+  explanation="CAP-style trade-offs become concrete SLO conflicts. State the acknowledgement boundary and its latency cost."
+/>
+
+<InterviewAnswer>
+
+“I define replication with positions and authority. The leader acknowledges according to a quantified durability policy, followers publish durable and applied positions, and the router enforces eventual, read-your-writes, or linearizable behavior per operation. I calculate backlog and catch-up headroom rather than calling a replica healthy because it is connected.
+
+Failover requires quorum, fencing, a new epoch, idempotent retries, and reconciliation of ambiguous commits. Cross-region asynchronous copies imply nonzero RPO; synchronous copies add WAN latency and can reduce availability. Replication is not backup. See [indexes and query execution](/learn/indexes-and-query-execution), [transactions across boundaries](/learn/transactions-across-boundaries), and [backup and recovery](/learn/backup-restore-and-disaster-recovery).”
+
+</InterviewAnswer>

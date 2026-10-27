@@ -1,0 +1,151 @@
+---
+title: "Conflict Resolution"
+description: "Resolve concurrent writes with versions, deterministic merge functions, CRDTs, and user-visible repair without hiding lost intent."
+module: 6
+moduleTitle: "CAP & Consistency"
+order: 5
+duration: 44
+difficulty: "Advanced"
+tags:
+  - conflict resolution
+  - version vectors
+  - CRDT
+  - last-write-wins
+objectives:
+  - Detect concurrency with version vectors rather than wall-clock guesses
+  - Evaluate last-write-wins, application merge, and CRDT semantics
+  - Preserve user intent through conflict surfacing and repair
+  - Reject merge strategies that violate non-mergeable invariants
+---
+
+<BigPicture title="Convergence is not the same as correctness">
+
+When replicas accept writes without coordinating, concurrent versions are inevitable. Conflict resolution decides whether one wins, values merge, or a person repairs the result. A deterministic rule can make replicas converge and still lose money, resurrect deleted data, or violate an invariant.
+
+Use merge semantics only when the domain has a meaningful join. Ad campaign labels, shopping-cart items, or observed counters can sometimes merge. TokenX balances cannot be merged by picking the largest value or adding replica totals; spend authorization requires a single invariant-preserving authority, escrow rights, or a transaction protocol.
+
+</BigPicture>
+
+<UnderTheHood title="Detect first, resolve second">
+
+A scalar version from one leader totally orders its writes but cannot describe independent replica progress. A version vector records the greatest counter observed from each replica. Vector `{A:3, B:1}` dominates `{A:2, B:1}` because every component is at least as large and one is greater. `{A:3, B:1}` and `{A:2, B:2}` are concurrent: neither dominates the other.
+
+<ExecutionTimeline
+  title="Concurrent campaign edits during a partition"
+  steps={[
+    { title: "Shared base", detail: "Replicas A and B hold campaign version {A:2,B:1} with label Summer and status ACTIVE.", state: "Both have the same causal past.", failure: "The network partitions before either edit propagates." },
+    { title: "Concurrent edits", detail: "A changes the label and advances to {A:3,B:1}; B pauses the campaign and advances to {A:2,B:2}.", state: "Neither vector dominates; the writes are concurrent.", failure: "A timestamp-only rule may discard the pause because of clock skew." },
+    { title: "Exchange siblings", detail: "After healing, replicas retain both versions and invoke a field-aware merge.", state: "Label and status changes do not conflict semantically.", failure: "A generic whole-document winner loses one user's intent." },
+    { title: "Publish merge", detail: "The service writes label Autumn, status PAUSED with a vector dominating both siblings.", state: "Replicas converge on a causally newer version.", failure: "If both users changed the same non-mergeable field, surface a conflict instead." },
+  ]}
+/>
+
+### Resolution choices
+
+- **Last-write-wins (LWW):** choose the greatest timestamp or version tuple. It is compact and convergent but depends on clock/order assumptions and silently discards concurrent intent.
+- **Multi-value register:** retain concurrent siblings and resolve in application or UI. It preserves evidence but pushes complexity to readers.
+- **Deterministic application merge:** combine independent fields or apply business precedence. It must be associative, commutative, and idempotent if merge order varies.
+- **Conflict-free replicated data type (CRDT):** a data type whose operations or states converge under defined algebra. Grow-only sets and counters are simple; removal needs causal context or tombstones.
+
+An observed-remove set removes only additions it has observed. A concurrent add may survive a remove. That can be right for collaborative tags and wrong for an access revocation. Security revocation generally needs centralized or monotonic-deny semantics, not a convenient add-wins set.
+
+Metadata has cost. A version vector with one entry per device grows without bound; systems compact identities, use dotted vectors, or scope replicas. Tombstones also require a safe garbage-collection frontier proving no old replica can reintroduce deleted state.
+
+</UnderTheHood>
+
+<MentalModel title="Merge is constitutional law, not cleanup">
+
+Two branches edit copies of a policy. Version metadata tells whether one edit included the other or whether they were independent. The constitution specifies which edits combine, which rule prevails, and which conflict needs human judgment. “Newest file wins” is merely one law—and often a bad one.
+
+Retain: detect causality, choose domain semantics, preserve evidence, and prove convergence separately from business validity.
+
+</MentalModel>
+
+<ArchitectureDiagram
+  title="Concurrent writes, sibling ownership, and repair"
+  chart={"flowchart LR\n  USER1[Operator A] --> RA[(Replica A)]\n  USER2[Operator B] --> RB[(Replica B)]\n  RA -. partition .- RB\n  RA --> VA[Version A3 B1]\n  RB --> VB[Version A2 B2]\n  VA --> MERGE[Domain merge service]\n  VB --> MERGE\n  MERGE --> RES[(Resolved version A3 B2)]\n  RES --> RA\n  RES --> RB\n  MERGE -. non-mergeable .-> REVIEW[User-visible repair]\n  GC[Tombstone frontier] --> RA\n  GC --> RB"}
+>
+
+Replicas own accepted sibling versions and causal metadata. The merge service owns deterministic domain policy but not arbitrary authority to invent values. Non-mergeable conflicts remain visible for repair. Tombstone collection is safe only after the system establishes a frontier beyond which obsolete replicas cannot return.
+
+<ArchitectureWalkthrough
+  title="Trace detection, merge, and repair"
+  stages={[
+    { name: "Detect", owner: "Replica version tracker", state: "Causal vector or operation dots", boundary: "Dominance versus concurrency.", failure: "Metadata is truncated too early.", recovery: "Retain siblings or resynchronize from an authoritative snapshot." },
+    { name: "Resolve", owner: "Domain merge function", state: "Sibling inputs and policy version", boundary: "Associative, commutative, idempotent behavior.", failure: "Merge order changes the result.", recovery: "Version and test the function against permutations and replay." },
+    { name: "Surface", owner: "Application workflow", state: "Unresolved user intent", boundary: "No silent loss for non-mergeable fields.", failure: "One edit disappears without audit.", recovery: "Show both versions, actors, and causal history for explicit repair." },
+    { name: "Collect", owner: "Replica membership controller", state: "Causal stability frontier", boundary: "All eligible replicas passed the tombstone.", failure: "An offline replica resurrects deleted state.", recovery: "Require full resync before an obsolete replica rejoins." },
+  ]}
+/>
+
+</ArchitectureDiagram>
+
+<RealExamples title="Mergeable facts and non-mergeable authority">
+
+**Ad campaign configuration.** Concurrent edits to independent presentation fields can merge. A PAUSED status should usually dominate a concurrent cosmetic edit, but that rule must be explicit and audited. Budget changes may require serialization because combining two independent increases can overspend.
+
+**Ad click counters.** A grow-only per-replica counter can merge by component-wise maximum and sum components. Retrying the same click still requires event deduplication; a CRDT counter does not identify duplicate business events.
+
+**TokenX.** Wallet notes or notification preferences may merge. Ledger entries and spendable balances may not use LWW or generic CRDT merge. A concurrent debit conflict must be rejected, reserved, or ordered by the ledger authority.
+
+<FailureScenario
+  title="Explore conflict policies"
+  prompt="Two replicas reconnect with concurrent values."
+  choices={[
+    { label: "Clock-skewed LWW", impact: "A later real-world edit can lose because its clock is behind, while replicas still converge cleanly.", recovery: "Use causal metadata or a server-assigned ordered version; surface important concurrent intent." },
+    { label: "Delete without tombstone", impact: "An offline replica can return the old value and resurrect it.", recovery: "Propagate a causally ordered tombstone and garbage-collect only after a safe frontier." },
+    { label: "Non-commutative merge", impact: "Replicas processing siblings in different orders converge to different values.", recovery: "Make merge algebra deterministic under reordering and duplication, then replay all siblings." },
+  ]}
+/>
+
+</RealExamples>
+
+<InterviewTraps title="Convergence claims that lose intent">
+
+1. **“LWW keeps the latest write.”** It keeps the largest ordering value, which may not be the latest real event under skew.
+2. **“CRDT means no conflicts.”** The conflict policy is embedded in the type; its semantics may still be wrong for the product.
+3. **“Counters merge, so retries are safe.”** Transport duplication and logical event identity are separate from replica convergence.
+4. **“Delete wins forever.”** Tombstones consume space and require a causal-stability rule before collection.
+5. **“Version vectors totally order writes.”** Concurrent vectors are intentionally incomparable.
+6. **“Merge the balances.”** Financial conservation is not a semilattice; enforce spend rights before accepting writes.
+7. **“Hide conflict from users.”** For documents or configuration, silent resolution can destroy intent; repair may be a product feature.
+
+</InterviewTraps>
+
+<Tradeoffs title="Metadata, availability, and semantic risk">
+
+- LWW is operationally simple but loses concurrent intent and inherits ordering assumptions.
+- Multi-value siblings preserve evidence but increase read complexity and can multiply under sustained concurrency.
+- CRDTs allow coordination-free convergence for suitable algebra, at the cost of metadata, tombstones, and sometimes surprising semantics.
+- Central serialization simplifies non-mergeable invariants but reduces write availability during partitions.
+- User-visible repair is honest and flexible, but adds product and support complexity.
+
+</Tradeoffs>
+
+<KnowledgeCheck
+  question="Replica A has {A:5,B:2}; replica B has {A:4,B:3}. What does the version comparison show?"
+  options={["A dominates B", "B dominates A", "The versions are concurrent", "The vectors are equal"]}
+  correct={2}
+  explanation="A is greater in component A while B is greater in component B, so neither vector includes the other's complete causal history."
+/>
+
+<ScenarioCheck
+  scenario="During a partition, one operator pauses an ad campaign while another changes its display name. Their versions are concurrent."
+  question="Which resolution is most defensible?"
+  options={[
+    { label: "Choose the largest client timestamp for the whole document", feedback: "Clock skew can discard the safety-relevant pause along with unrelated fields." },
+    { label: "Apply a field-aware merge where PAUSED is preserved and the independent name edit is retained", feedback: "This preserves compatible intent under an explicit, audited domain rule." },
+    { label: "Add both status strings together", feedback: "Status is not a mergeable collection and would have invalid semantics." },
+    { label: "Treat convergence as proof that billing is correct", feedback: "Replica agreement does not prove the merged business state satisfies budget or billing invariants." },
+  ]}
+  correct={1}
+  explanation="Causal metadata detects the conflict; domain policy can safely combine independent fields while giving the pause safety precedence."
+/>
+
+<InterviewAnswer>
+
+“I separate conflict detection from resolution. Version vectors can show that one version contains another or that writes are concurrent; timestamps alone cannot prove causality. Then I choose a domain rule: LWW for low-value replaceable state, multi-value siblings for explicit repair, or a CRDT only when its algebra matches product intent.
+
+Convergence is not correctness. Campaign labels may merge, a pause can dominate cosmetic edits, but TokenX balances require ordered spend authorization rather than LWW or generic merge. I also design tombstone retention and obsolete-replica rejoin rules. See [consistency models](/learn/consistency-models), [time and ordering](/learn/time-and-ordering), and [data modeling](/learn/data-modeling-from-access-patterns).”
+
+</InterviewAnswer>

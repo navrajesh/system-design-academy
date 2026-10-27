@@ -1,0 +1,116 @@
+---
+title: "Networking for System Design"
+description: "Understand DNS, connections, load balancing, timeouts, and the failure modes between services."
+module: 5
+moduleTitle: "Networking"
+order: 1
+duration: 29
+difficulty: "Foundation"
+tags:
+  - DNS
+  - TCP
+  - load balancing
+objectives:
+  - "Trace a request from DNS to application"
+  - "Place timeouts and retries safely"
+  - "Choose L4 and L7 load balancing behavior"
+---
+
+<BigPicture title="The network is part of the distributed system">
+
+Remote calls can be slow, duplicated, or fail with an ambiguous outcome. TCP preserves byte order **within one connection**, but independent connections and concurrent application requests can complete in a different order from submission. A timeout means the caller stopped waiting; it does not prove the server did no work.
+
+Treat every hop as a budgeted, observable failure boundary.
+
+</BigPicture>
+
+<UnderTheHood title="Trace the request">
+
+DNS resolves a name, often through multiple caches. The client opens or reuses a TCP connection, negotiates TLS, and sends HTTP. A load balancer selects a healthy backend, which may make further pooled calls.
+
+L4 load balancers route connections using transport metadata. L7 proxies understand HTTP, enabling path routing, header policies, retries, and richer telemetry at additional processing cost.
+
+Set a decreasing deadline budget down the call chain. Retry only transient failures, only when the operation is idempotent or carries an idempotency key, and with jitter.
+
+<ExecutionTimeline
+  title="Trace one first request, then a reused connection"
+  steps={[
+    { title: "Resolve", detail: "The client checks local and recursive DNS caches before an authoritative lookup is needed.", state: "Resolvers own cached name-to-address data until TTL expiry.", failure: "Stale or negative cache entries delay a failover." },
+    { title: "Connect", detail: "TCP establishes transport state and TLS authenticates the server; later requests may reuse this connection.", state: "Both endpoints and intervening NATs own connection state.", failure: "Handshake loss or port exhaustion prevents application work from starting." },
+    { title: "Route", detail: "An L4 balancer selects a connection target or an L7 proxy applies HTTP routing and policy.", state: "The balancer owns backend health and routing metadata.", failure: "A shallow health check can route traffic to a process whose dependencies are unavailable." },
+    { title: "Execute", detail: "The service spends its remaining deadline across connection-pool wait and downstream execution.", state: "The receiver may commit even if the caller times out.", failure: "A blind retry can duplicate a non-idempotent effect." }
+  ]}
+/>
+
+</UnderTheHood>
+
+<MentalModel title="A timeout creates uncertainty">
+
+After a timed-out transfer request, the safe question is not “should I retry?” It is “can I retry this operation without applying it twice?” Carry a stable operation ID so the receiver can return the first result.
+
+Think of sending a signed form by courier. Losing the delivery receipt does not mean the office never stamped the form. Resending is safe only when the office recognizes the same form number and returns the original result.
+
+</MentalModel>
+
+<ArchitectureDiagram title="A request, its deadlines, and failure boundaries" chart={"flowchart LR\n  U[Client + idempotency key] -->|DNS TTL| DNS[Recursive resolver]\n  DNS -->|address set| E[Edge / CDN]\n  E -->|TLS + remaining deadline| L7[L7 load balancer]\n  L7 -->|health-aware route| S[Stateless service]\n  S -->|bounded acquire| P[Connection pool]\n  P -->|transaction| D[(Authoritative DB)]\n  S -. trace context .-> T[Telemetry]\n  D -. ambiguous commit after timeout .-> S\n  U -. capped retry + jitter .-> E"}>
+
+DNS owns cached routing hints, not health truth. The load balancer owns backend selection, the service owns deadline propagation, and the database owns committed state. A deadline crosses every hop; a timeout response crosses none of the commit boundary automatically.
+
+</ArchitectureDiagram>
+
+<RealExamples title="Static assets and TokenX transfers">
+
+A CDN can terminate TLS near users and serve immutable assets without reaching origin. API responses need cache keys that include relevant authorization and variation headers.
+
+A TokenX transfer timed out after submission may already be committed. Retrying with the same idempotency key is safe; generating a new key risks a second transfer.
+
+<FailureScenario
+  title="Inspect a network failure without guessing"
+  prompt="A TokenX caller receives no response before its deadline."
+  choices={[
+    { label: "DNS failed", impact: "No application request reached TokenX; retries may still use a cached bad address until TTL expiry.", recovery: "Use resolver telemetry, multiple healthy addresses, and bounded retry after name resolution recovers." },
+    { label: "Response was lost", impact: "The transfer may be fully committed even though the client saw a timeout.", recovery: "Retry the same idempotency key or query the transfer result; never invent a new command ID." },
+    { label: "DB pool exhausted", impact: "The request may spend its budget waiting before execution and trigger upstream retries.", recovery: "Bound acquisition, cancel expired work, shed load, and remove the downstream bottleneck." }
+  ]}
+/>
+
+</RealExamples>
+
+<InterviewTraps title="Networking assumptions that break">
+
+- Treating DNS changes as instantaneous despite caches and TTLs.
+- Retrying non-idempotent requests at several layers.
+- Giving every downstream the full user-facing timeout.
+- Health-checking a process without checking whether it can serve dependencies.
+- Ignoring connection pool exhaustion and TLS handshake cost.
+
+</InterviewTraps>
+
+<Tradeoffs title="Smarter proxies versus simpler paths">
+
+L7 policy is expressive but adds a hop and operational surface. Long-lived connections amortize handshakes but complicate load distribution during scale-out. Aggressive health checks detect failure quickly but can create false positives during transient load.
+
+Automatic retries become inappropriate when several layers retry independently, when remaining deadline is insufficient, or when the operation lacks a stable idempotency identity. L7 proxying is unnecessary for opaque high-throughput transport that only needs connection routing and would pay for unused HTTP policy.
+
+</Tradeoffs>
+
+<KnowledgeCheck question="A client times out while creating a payment. What does the timeout prove?" options={["The server rolled back", "The packet never left the client", "Only that the client stopped waiting", "The load balancer rejected it"]} correct={2} explanation="The operation may have completed, may still be running, or may have failed. A stable idempotency key lets the client safely resolve the ambiguity." />
+
+<ScenarioCheck
+  scenario="A user request has a 900 ms deadline. The API calls Service B with 900 ms, and both the API proxy and Service B automatically retry twice."
+  question="Which redesign best contains retry amplification and preserves time for a response?"
+  options={[
+    { label: "Give Service B a smaller remaining-deadline budget and place one capped, jittered retry policy at the layer with idempotency context.", feedback: "This prevents multiplicative retries and leaves the caller time to receive the result or a controlled failure." },
+    { label: "Increase every timeout to 30 seconds and retain retries at both layers.", feedback: "This holds resources longer and keeps the multiplicative retry tree." },
+    { label: "Retry only after generating a new idempotency key.", feedback: "A new key represents a new command and can duplicate the side effect." },
+    { label: "Disable deadlines so downstream work always finishes.", feedback: "Without deadlines, abandoned work can accumulate and amplify overload." }
+  ]}
+  correct={0}
+  explanation="Retries consume both load and time. Centralize them where the operation's safety is known and propagate a decreasing deadline."
+/>
+
+<InterviewAnswer>
+
+“I trace DNS, connection establishment, TLS, edge, load balancer, service, and downstream pools. Every call gets a deadline shorter than its caller's remaining budget. Retries are capped, jittered, and restricted to transient failures plus idempotent operations. I monitor connection saturation, handshake rate, status codes, and per-hop latency, because a remote call is never just a function call.”
+
+</InterviewAnswer>

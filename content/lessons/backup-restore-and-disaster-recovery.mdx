@@ -1,0 +1,159 @@
+---
+title: "Backup, Restore, and Disaster Recovery"
+description: "Turn RPO and RTO into tested snapshot, log archive, regional recovery, reconciliation, and controlled cutover procedures."
+module: 1
+moduleTitle: "Storage & Data"
+order: 9
+duration: 43
+difficulty: "Advanced"
+tags:
+  - backups
+  - disaster recovery
+  - rpo
+  - rto
+objectives:
+  - Translate business impact into tiered RPO and RTO targets
+  - Design snapshot plus log-archive point-in-time recovery
+  - Estimate restore throughput and expose unrealistic recovery targets
+  - Build an isolated, validated, and fenced disaster-recovery runbook
+---
+
+<BigPicture>
+
+High availability keeps serving through expected component failures. Disaster recovery reconstructs trustworthy service after region loss, operator error, corruption, compromise, or a failure that replication propagated. A backup is useful only if the organization can find it, decrypt it, restore it, validate it, and safely make it authoritative within the promised time.
+
+Recovery Point Objective (RPO) is the maximum acceptable lost history; Recovery Time Objective (RTO) is the maximum acceptable time to restore service. TokenX may require near-zero loss for the ledger but tolerate rebuilding search for hours. The Ad Click Aggregator may accept five minutes of dashboard loss if durable raw clicks can replay. One global RPO/RTO hides these different business consequences.
+
+</BigPicture>
+
+<UnderTheHood>
+
+### Recovery layers
+
+A common database strategy combines periodic full or incremental snapshots with continuous archived WAL. Restore loads the latest usable snapshot before the target time, then replays WAL to a chosen point just before corruption or deletion. The snapshot and all required log segments must share compatible engine, schema, encryption, and checksum metadata.
+
+Copies should cross failure boundaries: another account or project, another region, immutable retention, and tightly separated credentials. Offline or logically isolated copies reduce ransomware and operator-blast-radius risk. Replicas remain useful for availability but are not a substitute because they replicate bad writes.
+
+<ExecutionTimeline
+  title="Controlled point-in-time recovery"
+  steps={[
+    { title: "Declare and fence", detail: "Open an incident, stop or isolate writers, record the suspected bad interval, and preserve evidence." },
+    { title: "Select a recovery point", detail: "Choose the newest verified snapshot plus contiguous WAL ending before corruption, consistent with the business RPO." },
+    { title: "Restore in isolation", detail: "Provision known-compatible infrastructure, restore keys and data, replay logs, and prevent accidental external side effects." },
+    { title: "Validate invariants", detail: "Check manifests, row counts, balanced ledgers, referential constraints, sample queries, and downstream positions." },
+    { title: "Promote and reconcile", detail: "Fence the old epoch, switch traffic gradually, resolve accepted-after-recovery-point requests, then rebuild derived stores." },
+  ]}
+/>
+
+### Throughput makes RTO concrete
+
+A 20 TB database restored at a sustained 500 MB/s has an ideal transfer floor of about `20,000,000 MB / 500 MB/s = 40,000 seconds`, or 11.1 hours, before provisioning, decompression, WAL replay, index recovery, validation, and cutover. A four-hour RTO is impossible with that plan. Options include smaller independently restorable shards, warm standby, parallel restore, pre-staged snapshots, or a renegotiated objective.
+
+If WAL is generated at 15 MB/s, one day is about `15 × 86,400 = 1.296 TB`. With a five-minute RPO, archive monitoring must detect and resolve a broken upload before more than `15 × 300 = 4.5 GB` of unprotected log accumulates. “Nightly backup” cannot meet that RPO.
+
+### Dependencies and order
+
+Restore identity and encryption dependencies before encrypted data, but protect keys separately so one compromised account cannot destroy both. Restore authoritative databases before derived search, caches, and analytics. Consumers need known replay positions; otherwise they may repeat external effects or skip events. Re-enable scheduled jobs, webhooks, email, and payment calls only after idempotency and cutover epochs are verified.
+
+Backups need automated integrity checks plus regular full exercises. A checksum proves bytes are intact, not that schemas migrate, keys work, the application starts, or balances reconcile.
+
+</UnderTheHood>
+
+<MentalModel>
+
+A backup is a parachute packed in a sealed bag; a restore drill is the inspected jump. Owning the bag proves little. You need the deployment sequence, compatible harness, safe landing zone, and evidence the parachute actually opened.
+
+Retain: tier objectives by data class, isolate copies, calculate restore physics, validate invariants, and fence before cutover.
+
+</MentalModel>
+
+<ArchitectureDiagram
+  title="Recovery copies, trust boundary, and controlled cutover"
+  description="Snapshots and continuous WAL leave the production account for an immutable vault. Restore occurs in isolation and becomes authoritative only after validation and fencing."
+  chart={"flowchart LR\n  PROD[(Primary ledger)] --> SNAP[Encrypted snapshots]\n  PROD --> WAL[Continuous WAL archive]\n  SNAP --> VAULT[(Cross-account immutable vault)]\n  WAL --> VAULT\n  KEYS[Separated key escrow] --> RESTORE[Isolated restore environment]\n  VAULT --> RESTORE\n  RESTORE --> VERIFY[Checksums and invariant validation]\n  VERIFY --> FENCE[Fence old epoch]\n  FENCE --> CUT[Controlled traffic cutover]\n  CUT --> REBUILD[Rebuild derived stores]\n  VAULT -. missing log segment .-> ALERT[Archive gap alert]\n  VERIFY -. validation fails .-> SELECT[Choose earlier recovery point]"}
+>
+
+Production remains authoritative until an incident fence stops unsafe writes. The vault is a recovery source, not a serving replica. The restored environment has no outbound side effects while logs replay. Validation is the consistency boundary for promotion; failure returns to recovery-point selection instead of forcing corrupt state live.
+
+</ArchitectureDiagram>
+
+<ArchitectureWalkthrough
+  title="Walk the disaster boundary"
+  stages={[
+    { name: "Production", owner: "Primary data platform", state: "Snapshots, WAL, manifests, and archive position", boundary: "Continuous protected recovery point.", failure: "An archive segment is late or corrupt.", recovery: "Alert within the RPO window and resend before source retention expires." },
+    { name: "Vault", owner: "Separate recovery account", state: "Immutable encrypted copies", boundary: "Independent credentials and retention lock.", failure: "Key or manifest is unavailable.", recovery: "Use tested escrow and redundant manifests from another failure domain." },
+    { name: "Restore environment", owner: "Disaster-recovery team", state: "Isolated replay position", boundary: "No outbound business side effects.", failure: "Schema, engine, or invariant validation fails.", recovery: "Select an earlier recovery point or repair the tested restore tooling." },
+    { name: "Promotion", owner: "Incident commander", state: "New authority epoch and traffic percentage", boundary: "Validation plus fenced cutover.", failure: "Old writers or ambiguous requests reappear.", recovery: "Reject stale epochs and reconcile requests around the recovery point." },
+  ]}
+/>
+
+<RealExamples>
+
+**TokenX point-in-time restore.** An operator runs an erroneous bulk update at 14:03. Restore the latest prior snapshot, replay WAL to just before the transaction, verify that debits equal credits per asset and idempotency records align, then reconcile legitimate transfers accepted after the recovery point from signed request logs or a surviving durable region. Do not silently discard them.
+
+**Ad Click Aggregator rebuild.** If aggregate state is lost, restore raw immutable segments and Kafka positions, then recompute versioned minute totals. Dashboard service can return a delayed status while recovery proceeds. Billing remains closed until replay reaches the declared watermark and reconciliation totals match manifests.
+
+**Ransomware scenario.** Same-account snapshots accessible by the production administrator may be deleted with production. Cross-account write-only backup roles, immutability locks, multi-party break-glass restore, and tested key escrow reduce correlated loss.
+
+<FailureScenario
+  title="The backup dashboard is green, but restore fails"
+  prompt="Snapshots exist and checksums pass, yet the application cannot decrypt them after a region-loss exercise. What control was missing?"
+  choices={[
+    { label: "Key unavailable", impact: "The bytes are intact but unusable, so effective RTO is unbounded.", recovery: "Exercise separated key escrow, permissions, and versions from the disaster account." },
+    { label: "WAL gap", impact: "The snapshot restores, but point-in-time replay stops before the target.", recovery: "Alert on contiguous archive positions and restore a redundant segment or choose an earlier safe point." },
+    { label: "Application mismatch", impact: "Data restores but current code or migrations cannot open the recovered schema.", recovery: "Archive compatible artifacts and exercise full application smoke tests, not only storage checksums." },
+  ]}
+/>
+
+</RealExamples>
+
+<InterviewTraps>
+
+1. **“We take daily backups.”** Ask for RPO, archive frequency, retention, isolation, and the last measured restore time.
+2. **“Replication gives zero RPO.”** Confirm acknowledgement semantics and failure domains; replication also copies deletion and corruption.
+3. **“RTO starts after infrastructure is ready.”** Business RTO includes detection, decision, provisioning, restore, replay, validation, DNS or routing, and reconciliation.
+4. **“Checksums validate recovery.”** They validate bytes, not application invariants, schema compatibility, credentials, or external effects.
+5. **“Switch DNS to the backup.”** First fence old writers and establish a higher epoch; DNS caches do not prevent split brain.
+6. **“Restore everything together.”** Prioritize authoritative tiers and degrade derived features so the critical path is smaller.
+
+An IC6 response produces an evidence-based runbook and names the human decision points, not merely a storage feature list.
+
+</InterviewTraps>
+
+<Tradeoffs>
+
+- Frequent snapshots reduce log replay but increase snapshot I/O and storage; continuous logs are still needed for fine-grained point-in-time recovery.
+- Warm standby shortens RTO but costs more and can replicate corruption; isolated backups remain necessary.
+- Immutable retention protects against deletion but can conflict with privacy erasure unless retention and key-destruction policies are designed together.
+- Smaller shards restore in parallel but increase coordination and cross-shard consistency work.
+- Automated cutover is fast for well-understood failures; corruption incidents often require a deliberate recovery point and human validation.
+
+</Tradeoffs>
+
+<KnowledgeCheck
+  question="Ignoring overhead, what is the minimum time to transfer 20 TB at a sustained 500 MB/s using decimal units?"
+  options={["About 1.1 hours", "About 4 hours", "About 11.1 hours", "About 40 hours"]}
+  correct={2}
+  explanation="20,000,000 MB divided by 500 MB/s is 40,000 seconds, approximately 11.1 hours. Real restore time is longer."
+/>
+
+<ScenarioCheck
+  title="Four-hour RTO versus restore physics"
+  scenario="The authoritative database is 20 TB, measured end-to-end restore takes 16 hours, and the business requires four hours after a regional disaster."
+  question="What is the strongest next design move?"
+  options={[
+    { label: "Document four hours anyway", feedback: "An untested objective is not a recovery capability." },
+    { label: "Rely only on the cross-region replica", feedback: "It shortens outage recovery but does not protect against replicated corruption or compromise." },
+    { label: "Redesign the recovery path", feedback: "Add a fenced warm copy or parallel independently restorable units while retaining isolated PITR backups, then drill the full path below four hours." },
+  ]}
+  correct={2}
+  explanation="RTO is an architectural constraint verified by exercises, not a target written beside an incompatible restore pipeline."
+/>
+
+<InterviewAnswer>
+
+“I classify data by business impact and assign measured RPO and RTO per tier. For authoritative state I combine compatible snapshots with continuous WAL in a cross-account immutable vault, separated key recovery, archive-gap alerts, and retention that includes privacy and legal obligations.
+
+I calculate the transfer and replay lower bounds; a 20 TB restore at 500 MB/s already exceeds 11 hours before validation, so a four-hour RTO requires warm or parallel recovery architecture. Restore happens without external side effects, then checksums, application tests, ledger invariants, fencing, and reconciliation gate cutover. Related lessons are [replication](/learn/replication-and-failover), [object storage](/learn/object-storage-and-large-files), and [transactions](/learn/transactions-across-boundaries).”
+
+</InterviewAnswer>

@@ -1,0 +1,164 @@
+---
+title: "Time-Series and Append-Only Storage"
+description: "Design event-time storage, immutable segments, retention, rollups, and late-data correction for high-volume histories."
+module: 1
+moduleTitle: "Storage & Data"
+order: 6
+duration: 40
+difficulty: "Intermediate"
+tags:
+  - time series
+  - append-only
+  - retention
+  - compaction
+objectives:
+  - Separate event time, ingestion time, and processing time
+  - Estimate raw, replicated, compressed, and retained storage
+  - Design partitions, rollups, watermarks, and late-event correction
+  - Explain append-only recovery, compaction, and high-cardinality failure modes
+---
+
+<BigPicture>
+
+Time-series systems optimize for a dominant shape: records arrive continually, recent time ranges are hot, old data becomes colder, and retention or aggregation changes its resolution. Append-only storage turns random mutation into sequential writes and an auditable history, but derived answers still need correction policies when events arrive late or duplicated.
+
+The Ad Click Aggregator stores raw click facts before producing minute and campaign totals. TokenX uses an immutable ledger for financial history. Both append facts, but their truth models differ: ad totals can be recomputed from an event log, while a TokenX ledger entry is authoritative and corrections are new compensating entries, never edits to history.
+
+</BigPicture>
+
+<UnderTheHood>
+
+### Three clocks and an ordered identity
+
+- **Event time** says when the click or transfer happened at the source.
+- **Ingestion time** says when the platform durably accepted it.
+- **Processing time** says when a consumer computed a result.
+
+Use a stable event ID for deduplication and retain both event and ingestion timestamps. Device clocks can be wrong, so event time alone cannot define operational retention or idempotency. Within a TokenX account, an assigned monotonic `account_sequence` provides deterministic ordering even when timestamps collide.
+
+### Write path and immutable segments
+
+Many time-series engines append first to a WAL, update an in-memory structure, flush sorted immutable segments, then compact segments in the background. Reads merge memory and overlapping segments. Bloom filters can avoid unnecessary segment reads for point keys; min/max time metadata prunes ranges. Tombstones represent deletion until compaction, so a delete is neither immediate space reclamation nor necessarily cheap.
+
+<ExecutionTimeline
+  title="Click from arrival to cold retention"
+  steps={[
+    { title: "Durable append", detail: "Validate the envelope, assign ingestion time, and append the stable event ID to the partition log." },
+    { title: "Hot aggregation", detail: "Update campaign-minute state by event time and deduplicate within the promised window." },
+    { title: "Seal the window", detail: "A watermark closes the normal path after the allowed lateness; publish a versioned result." },
+    { title: "Correct late data", detail: "Events beyond the watermark enter a correction stream that emits a new aggregate version and audit reason." },
+    { title: "Tier and expire", detail: "Compact raw segments, move them to object storage, retain rollups longer, and apply deletion policy to every copy." },
+  ]}
+/>
+
+### Capacity and retention
+
+At 100 million clicks per day, average ingress is about `100,000,000 / 86,400 ≈ 1,157 events/s`. A 12× peak is about 13,900 events/s. If an encoded event averages 800 bytes, raw volume is 80 GB/day. Thirty days is 2.4 TB raw; replication factor three makes 7.2 TB before indexes and metadata. At 3:1 compression, the replicated payload is roughly 2.4 TB, but budget additional headroom for compaction that temporarily holds old and new segments.
+
+<InteractiveCalculation mode="event-ingress" initialRate={100000000} initialEventBytes={800} initialPeakFactor={12} />
+
+Rollups radically change the long-term footprint. One row per campaign per minute for 200,000 active campaigns is up to 288 million rows/day if every campaign is active every minute—often much larger than expected. Sparse activity and coarser hourly rollups must be measured, not assumed.
+
+### Partitioning and late data
+
+Partition by a bounded time unit for pruning and lifecycle operations, then distribute within it by a stable entity hash when write volume demands it. Partitioning only by timestamp funnels current writes to one shard; partitioning only by campaign can make retention deletes expensive. Watermarks are a product contract: a five-minute watermark means most answers stabilize after five minutes, not that later events disappear. Corrections need versioning and downstream upsert semantics.
+
+</UnderTheHood>
+
+<MentalModel>
+
+Picture a bound laboratory notebook. New observations go on the next page; you do not erase old measurements. Later you publish summaries, and a correction cites the original page. Immutable facts make replay possible, while watermarks tell readers when a summary is likely—not guaranteed—to stop changing.
+
+Retain: append durable facts, separate the clocks, derive versioned views, and budget compaction plus late-data correction.
+
+</MentalModel>
+
+<ArchitectureDiagram
+  title="Append-only ownership, window boundary, and replay path"
+  description="The durable event log owns accepted clicks. Hot aggregates and cold rollups are rebuildable projections with explicit correction paths."
+  chart={"flowchart LR\n  EDGE[Click collectors] --> LOG[(Durable partition log)]\n  LOG --> HOT[Window processor]\n  HOT --> STATE[(Minute state)]\n  STATE --> API[Dashboard API]\n  HOT --> LATE[Late-event correction]\n  LATE --> STATE\n  LOG --> SEG[(Immutable raw segments)]\n  SEG --> COLD[(Object archive)]\n  STATE --> ROLL[(Versioned rollups)]\n  COLD -. replay after loss .-> HOT\n  WM[Watermark policy] --> HOT\n  STATE -. state loss .-> HOT"}
+>
+
+The accepted-event boundary is the durable log. Minute state and rollups are derived, versioned copies. If state is lost, replay uses stable event IDs and deterministic aggregation. If a late event crosses a closed watermark, it follows the explicit correction path rather than silently mutating a published number.
+
+</ArchitectureDiagram>
+
+<ArchitectureWalkthrough
+  title="Trace ownership and recovery"
+  stages={[
+    { name: "Log", owner: "Partition broker", state: "Accepted click envelopes and offsets", boundary: "Durable append per partition.", failure: "Broker or consumer state is lost.", recovery: "Elect an in-sync replica and replay from a checkpoint." },
+    { name: "Window state", owner: "Stream processor", state: "Aggregate version and dedupe window", boundary: "Watermark and event-time policy.", failure: "Late or duplicate events alter a closed result.", recovery: "Publish a higher idempotent correction version." },
+    { name: "Archive", owner: "Object store and manifest", state: "Checksummed immutable segments", boundary: "Manifest publication after segment verification.", failure: "A segment is missing or corrupt.", recovery: "Restore a redundant copy and verify the manifest checksum." },
+    { name: "Recovery", owner: "Replay controller", state: "Checkpoint and source offsets", boundary: "Deterministic projection rebuild.", failure: "Replay repeats an output.", recovery: "Replace by aggregate key and version instead of incrementing blindly." },
+  ]}
+/>
+
+<RealExamples>
+
+**Ad Click Aggregator.** Store `event_id`, campaign, creative, event time, ingestion time, cost attributes, and schema version. Deduplicate for the advertised retry window. Dashboard rows carry `(campaign, minute, version)` so corrections replace an older result rather than double-add it.
+
+**TokenX ledger.** Append balanced debit and credit entries in the authoritative transaction. A reversal is another transfer linked to the original. A searchable wallet-history projection may use the same append-and-replay techniques, but deleting or rebuilding that projection cannot alter balances.
+
+**When it fails.** High-cardinality labels such as raw user IDs in every metric create enormous indexes and fan-out. Tiny time partitions overload metadata. Huge partitions make retention and repair slow. Compaction without I/O limits can starve foreground ingestion. A retention job that deletes the hot store but not archives or backups violates the data policy.
+
+<FailureScenario
+  title="A correction doubles yesterday's revenue"
+  prompt="A late-event replay republishes the full aggregate, but the downstream sink treats every message as an increment. What contract is missing?"
+  choices={[
+    { label: "Replay repeats a full total", impact: "An increment-only sink adds the same logical aggregate again and overstates revenue.", recovery: "Key outputs by aggregate identity and version, then replace or reject older versions." },
+    { label: "Late event crosses watermark", impact: "A previously published result is no longer final for billing.", recovery: "Emit an audited correction version and keep live estimates separate from financial close." },
+    { label: "Dedupe state expired", impact: "An old source event may enter the aggregate a second time.", recovery: "Deduplicate again during archival replay or rebuild the window deterministically from authoritative raw facts." },
+  ]}
+/>
+
+</RealExamples>
+
+<InterviewTraps>
+
+1. **“Timestamp is the event ID.”** Clocks collide and retry; carry an independently stable identifier.
+2. **“Exactly-once means no deduplication.”** End-to-end side effects still require idempotent keys and transactional boundaries.
+3. **“Close the window and ignore late events.”** State the allowed lateness, correction path, and product behavior for final reports.
+4. **“Compression makes storage negligible.”** Include replicas, indexes, compaction headroom, metadata, and backups.
+5. **“Append-only means nothing is deleted.”** Retention, privacy erasure, cryptographic deletion, tombstones, and backup expiry still need an enforceable policy.
+
+At IC6, distinguish authoritative facts from disposable views and state how every derived view is rebuilt and corrected.
+
+</InterviewTraps>
+
+<Tradeoffs>
+
+- Fine time buckets improve pruning and deletion but increase partitions, metadata, and small files.
+- Longer deduplication windows handle delayed retries but require more state and may still not cover archival replay.
+- Longer watermarks reduce corrections but increase result latency.
+- LSM-style writes favor ingestion but cause read amplification and background compaction cost.
+- Raw retention preserves audit and recomputation options; it becomes inappropriate when privacy, cost, or business policy demands earlier deletion.
+
+</Tradeoffs>
+
+<KnowledgeCheck
+  question="At 100 million events/day and 800 bytes/event, what is the approximate raw payload before replication and indexes?"
+  options={["8 GB/day", "80 GB/day", "800 GB/day", "2.4 TB/day"]}
+  correct={1}
+  explanation="100,000,000 multiplied by 800 bytes is 80,000,000,000 bytes, or about 80 GB in decimal units."
+/>
+
+<ScenarioCheck
+  title="Late billing events"
+  scenario="The dashboard watermark is five minutes, but 0.02% of billable clicks arrive up to 24 hours late. Finance requires exact daily invoices."
+  question="Which design is defensible?"
+  options={[
+    { label: "Bill from the five-minute dashboard", feedback: "The dashboard's latency contract is not an exact financial close." },
+    { label: "Drop events after five minutes", feedback: "That knowingly under-bills and destroys auditability." },
+    { label: "Separate live estimates from close", feedback: "Keep fast versioned dashboard corrections, then run an auditable delayed close from durable raw facts before invoicing." },
+  ]}
+  correct={2}
+  explanation="One event stream can support products with different finality contracts; name them separately."
+/>
+
+<InterviewAnswer>
+
+“I make the durable append log the accepted-event boundary, retain event and ingestion time plus a stable ID, and build versioned aggregates as replayable projections. For 100 million 800-byte clicks per day I budget 80 GB/day raw, then replicas, indexes, compression, compaction headroom, and backups separately.
+
+Partitions combine time for lifecycle management with a distribution key for write spread. Watermarks define normal result latency; late events follow a correction stream with idempotent replacement semantics. The same append shape supports TokenX history, but ledger entries are authoritative and corrections are compensating entries. Related lessons are [partitioning](/learn/partitioning-vs-sharding-vs-aggregation), [object storage](/learn/object-storage-and-large-files), and [Kafka delivery](/learn/kafka-delivery-and-failure).”
+
+</InterviewAnswer>

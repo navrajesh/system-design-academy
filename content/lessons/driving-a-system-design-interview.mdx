@@ -1,0 +1,246 @@
+---
+title: "Driving a System Design Interview"
+description: "Use a complete TokenX transfer design to turn ambiguous requirements into a quantified, defensible architecture."
+module: 7
+moduleTitle: "Architecture & Mock Interviews"
+order: 1
+duration: 52
+difficulty: "Advanced"
+tags:
+  - interview
+  - architecture
+  - requirements
+  - TokenX
+objectives:
+  - "Structure a 45-minute design discussion"
+  - "Turn product requirements into explicit invariants"
+  - "Quantify scale before selecting components"
+  - "Defend failure, recovery, and evolution decisions at IC6 depth"
+---
+
+<BigPicture title="The interview tests judgment in motion">
+
+A strong design is not the most elaborate architecture. It is a traceable argument: requirements create constraints, constraints drive decisions, and every decision has consequences. The interviewer should be able to point at any box and hear why it exists, what state it owns, and how it fails.
+
+We will work one complete prompt:
+
+> **Design TokenX**, a custodial token-transfer service that lets a user read balances, transfer one token between wallets, and inspect transfer history.
+
+The first architecture is deliberately smaller than a global cryptocurrency exchange. It targets one authoritative region, an immutable audit trail, and a rebuildable analytics path. Multi-region writes, fiat settlement, market trading, smart contracts, and blockchain consensus are out of scope unless the interviewer adds them.
+
+### Requirements and invariants
+
+- A caller can create a transfer with an idempotency key, read its result, read a wallet balance, and list transfers.
+- A successful transfer debits and credits exactly once. Total token supply is conserved.
+- A wallet cannot spend more than its available balance.
+- An ambiguous client timeout must be resolvable by replaying the same idempotency key.
+- Balance authorization reads authoritative state; portfolio charts and notifications may lag.
+- Target p99 is 300 ms for transfer creation and 150 ms for balance reads under normal load.
+
+This is the “why” behind the architecture: the invariant, not the traffic number, makes a quorum-backed transactional ledger the center of the design. Kafka is valuable after the commit boundary, but it is not the balance authority.
+
+</BigPicture>
+
+<UnderTheHood title="Work the TokenX design from numbers to state transitions">
+
+### 1. Estimate the workload
+
+Assume 50 million registered wallets, 5 million daily active wallets, and 20 million transfers per day. Design for a 20× peak around market events.
+
+<Calculation label="TokenX planning envelope">
+Average transfers = 20,000,000 / 86,400 ≈ 231 transfers/s
+
+Peak transfers at 20× ≈ 4,630 transfers/s
+
+At 1 KB of durable transfer + ledger data: ≈ 20 GB/day before indexes and replication
+
+One year of raw transfer records ≈ 7.3 TB before indexes, replicas, and backups
+
+Balance reads at 10 per transfer: ≈ 46,300 peak reads/s
+</Calculation>
+
+These numbers do not require hundreds of write shards. They do justify independent read scaling, partition-ready keys, and load tests around the ledger's commit rate. Starting with a strongly consistent relational or distributed SQL ledger is simpler than inventing a cross-shard money protocol prematurely.
+
+### 2. Define the API contract
+
+- <code>POST /v1/transfers</code> with header <code>Idempotency-Key</code> and body <code>{'{fromWallet, toWallet, asset, amount}'}</code>. Returns <code>{'{transferId, status, committedAt}'}</code>.
+- <code>GET /v1/transfers/{'{transferId}'}</code> resolves ambiguous outcomes.
+- <code>GET /v1/wallets/{'{walletId}'}/balances</code> reads authoritative or explicitly versioned state.
+- <code>GET /v1/wallets/{'{walletId}'}/transfers?cursor=...</code> returns stable, cursor-based history.
+
+The idempotency key is scoped to the authenticated caller and request shape. Reusing it with a different amount is a conflict, not a second transfer.
+
+### 3. Model authoritative data
+
+- <code>wallet_balances(wallet_id, asset, available, version)</code> — current authorization state.
+- <code>transfers(transfer_id, caller_id, idempotency_key, request_hash, status, created_at)</code> — operation identity and result.
+- <code>ledger_entries(transfer_id, account_id, asset, delta, sequence)</code> — immutable debit and credit entries whose sum is zero.
+- <code>outbox(event_id, transfer_id, event_type, published_at)</code> — post-commit integration events.
+
+Unique constraints cover <code>(caller_id, idempotency_key)</code> and ledger-entry identity. The transfer row, both balance mutations, balanced ledger entries, and outbox record commit in one serializable database transaction.
+
+### 4. Execute one transfer
+
+<ExecutionTimeline
+  title="TokenX transfer critical path"
+  steps={[
+    { title: "Fence request", detail: "Authenticate, rate-limit, hash the request, and look up the caller's idempotency key.", state: "The transfer table owns operation identity.", failure: "A repeated key with a different hash returns a conflict." },
+    { title: "Lock balances", detail: "Lock source and destination balance rows in deterministic wallet order to avoid deadlocks.", state: "The ledger transaction owns both mutable rows.", failure: "Lock timeout aborts without a partial debit." },
+    { title: "Commit ledger", detail: "Check available funds, apply debit and credit, append balanced entries, mark success, and insert an outbox event.", state: "One serializable transaction owns the invariant.", failure: "Any error rolls back every mutation." },
+    { title: "Publish effects", detail: "An outbox relay publishes the committed event for notifications and analytics.", state: "Kafka owns replayable integration history.", failure: "Relay retries do not repeat the balance mutation." }
+  ]}
+/>
+
+### 5. Plan the evolution path
+
+At the stated peak, prefer one logical ledger with partitioned tables and quorum replication. When a single writer or lock domain becomes the measured bottleneck, introduce many virtual wallet buckets. Same-bucket transfers remain local. Cross-bucket transfers require a proven protocol—distributed serializable transactions, reservations with fencing, or escrow—not two unrelated writes plus hope.
+
+<InteractiveCalculation mode="event-ingress" title="Stress the TokenX event-volume assumptions" initialRate={20000000} initialPeakFactor={20} initialEventBytes={1000} initialReplication={3} />
+
+</UnderTheHood>
+
+<MentalModel title="Requirements → constraints → decisions → consequences">
+
+Think like a courtroom, not a shopping list. Requirements are the claims, estimates are evidence, the architecture is the argument, and failure analysis is cross-examination. Naming Kafka or Redis without connecting it to evidence is not a defensible case.
+
+Retain this loop:
+
+1. **Requirement:** What must users do, and what must never happen?
+2. **Constraint:** What scale, latency, consistency, durability, and cost bound follows?
+3. **Decision:** What is the simplest mechanism that satisfies it?
+4. **Consequence:** Which availability, complexity, or future migration cost did that mechanism introduce?
+
+For TokenX: “no double spend” leads to serializable balance mutation; that decision adds coordination latency and means transfer creation may reject during quorum loss. Analytics does not inherit that cost because it consumes committed outbox events asynchronously.
+
+</MentalModel>
+
+<ArchitectureDiagram title="TokenX authoritative transfer and derived-event paths" chart={"flowchart LR\n  C[Client] -->|idempotency key + deadline| E[API edge]\n  E --> T[Stateless transfer service]\n  T -->|serializable transaction| L[(Authoritative ledger DB)]\n  L --> B[(Balances)]\n  L --> J[(Balanced ledger entries)]\n  L --> O[(Transactional outbox)]\n  O --> R[Idempotent outbox relay]\n  R --> K[(Kafka integration log)]\n  K --> N[Notifications]\n  K --> A[(Derived analytics)]\n  T -->|authoritative balance read| L\n  A -->|stale charts only| C\n  L -. quorum loss: reject writes .-> T\n  K -. replay rebuilds consumers .-> A"}>
+
+The ledger database owns balances, operation identity, and immutable double-entry records in one consistency boundary. The outbox is committed inside that boundary; Kafka begins a new at-least-once boundary. Notifications and analytics are replayable derivatives and never authorize spending.
+
+<ArchitectureWalkthrough
+  title="Defend every TokenX state boundary"
+  stages={[
+    { name: "API edge", owner: "Gateway", state: "Authentication context, rate budget, request deadline", boundary: "No balance authority.", failure: "Client disconnects after forwarding.", recovery: "Client retries the same idempotency key and queries transfer status." },
+    { name: "Transfer service", owner: "Stateless compute", state: "No durable business state", boundary: "Builds one ledger transaction.", failure: "Process dies mid-request.", recovery: "Database rollback or committed idempotency record determines the result." },
+    { name: "Ledger commit", owner: "Quorum-backed database", state: "Balances, transfer, ledger entries, outbox", boundary: "Serializable transaction conserves supply.", failure: "Leader fails during commit.", recovery: "Client resolves the stable transfer ID; only quorum-committed state is returned." },
+    { name: "Async consumers", owner: "Kafka consumer groups", state: "Notification and analytics progress", boundary: "At-least-once after ledger commit.", failure: "Consumer replays or Kafka is unavailable.", recovery: "Idempotent consumers replay the durable outbox event without touching balances." }
+  ]}
+/>
+
+</ArchitectureDiagram>
+
+<RealExamples title="Normal flow, hot wallet, and ambiguous timeout">
+
+### Successful transfer
+
+Wallet A sends 25 TokenX to Wallet B. The database transaction locks both rows in a deterministic order, verifies A has funds, changes both balances, writes debit −25 and credit +25 entries, records success, and inserts the outbox event. Only then does the API return success.
+
+### Hot exchange wallet
+
+A large exchange wallet can become a lock hotspot even when storage is evenly partitioned. Adding hash shards does not split one wallet's serial invariant. Options include batching deposits, separating deposit addresses, queued single-writer ownership, or escrowed sub-balances. Each option changes freshness, operational complexity, or withdrawal semantics.
+
+### Timeout after commit
+
+The ledger commits, but the response is lost. The client resends the same idempotency key. TokenX compares the stored request hash and returns the original transfer result. A new idempotency key would represent a new command and could legitimately create another transfer.
+
+<FailureScenario
+  title="Explore TokenX degraded modes"
+  prompt="Select a failure and inspect what the architecture promises."
+  choices={[
+    { label: "Ledger quorum lost", impact: "Transfer creation cannot prove a serial order and rejects or times out; stale analytics may remain readable.", recovery: "Elect a fenced leader after quorum returns, then resolve ambiguous requests by idempotency key." },
+    { label: "Kafka unavailable", impact: "Committed transfers remain correct, but notifications and analytics lag while outbox rows accumulate.", recovery: "Apply backpressure to the relay, alert on outbox age, and publish idempotently when Kafka recovers." },
+    { label: "Hot wallet", impact: "Lock waits raise transfer tail latency for one account without necessarily saturating the whole database.", recovery: "Rate-limit, queue by wallet, batch compatible operations, or introduce invariant-preserving sub-balances." },
+    { label: "Analytics corrupt", impact: "Charts may be wrong, but spendable balances and the immutable ledger remain authoritative.", recovery: "Drop derived state and replay committed integration events from Kafka or the outbox archive." }
+  ]}
+/>
+
+</RealExamples>
+
+<InterviewTraps title="IC6 follow-ups and a defensible rubric">
+
+### Questions the interviewer should be able to ask
+
+- Where is the no-double-spend invariant enforced, and what happens during quorum loss?
+- What does a timeout tell the caller, and how is the original result recovered?
+- Why is the outbox in the ledger transaction while Kafka is outside it?
+- What prevents two opposite-direction transfers from deadlocking?
+- At what measured threshold would you shard, and how would cross-shard transfers preserve supply?
+- Which data can be stale, and how is that staleness communicated?
+- How would you prove backups restore both balances and their audit trail?
+
+### IC6 scoring rubric
+
+- **Requirements:** separates authoritative transfer semantics from derived views and explicitly excludes unsupported product scope.
+- **Quantification:** converts daily volume to peak rate, storage, read amplification, and a testable capacity target.
+- **Correctness:** states invariants, transaction isolation, idempotency scope, unique constraints, and ambiguous-outcome behavior.
+- **Architecture:** assigns one owner to every durable state and marks consistency boundaries and replay paths.
+- **Operations:** covers quorum loss, hot keys, consumer lag, recovery point objective, reconciliation, and observable alerts.
+- **Evolution:** delays sharding until measured, then names the protocol needed for cross-partition invariants.
+- **Communication:** revises the design when assumptions change and distinguishes a mechanism from the property it provides.
+
+A weak answer says “Kafka gives exactly once” or independently updates two balances. A defensible answer names the transaction boundary, explains why async effects are outside it, and states where availability is intentionally sacrificed.
+
+</InterviewTraps>
+
+<Tradeoffs title="Why this design—and when it stops fitting">
+
+**Serializable ledger transaction:** simplest invariant proof and audit story, but coordination adds latency and transfer writes may be unavailable without quorum.
+
+**Transactional outbox:** prevents a committed transfer from permanently losing its integration event, but creates relay lag, duplicate publication, and an operational backlog to monitor.
+
+**Derived Kafka consumers:** scale notifications and analytics independently, but must tolerate duplication, reordering across keys, and replay.
+
+**Single authoritative region:** reduces conflict and keeps latency predictable for one market, but increases remote-user latency and requires a tested regional recovery plan.
+
+This design becomes inappropriate when regulatory isolation forbids one ledger region, peak writes exceed the proven transaction capacity, or cross-region write latency violates the product target. The next design must introduce explicit regional ownership, escrow, or globally consistent transactions; active-active last-write-wins balances are not an acceptable shortcut.
+
+</Tradeoffs>
+
+<KnowledgeCheck
+  question="A TokenX transfer commits to the ledger, but Kafka is unavailable before the notification event is published. What should happen?"
+  options={[
+    "Roll back the already committed transfer from a Kafka consumer",
+    "Keep the transfer committed; retain its outbox row and publish idempotently after Kafka recovers",
+    "Create a second transfer so Kafka receives a fresh event",
+    "Serve the analytics balance as the new source of truth"
+  ]}
+  correct={1}
+  explanation="The ledger transaction already established the authoritative result and atomically retained the outbox intent. Async publication may lag, but it must not change or repeat the balance mutation."
+/>
+
+<ScenarioCheck
+  scenario="Two users simultaneously transfer in opposite directions between Wallet A and Wallet B. Both transactions lock their source wallet first."
+  question="What is the cleanest first defense against a deadlock cycle?"
+  options={[
+    { label: "Lock both wallet rows in a deterministic global order, then retry a transaction if the database still reports a deadlock.", feedback: "Ordering removes the common A-then-B versus B-then-A cycle; bounded retry handles residual database aborts." },
+    { label: "Disable transactions and update each wallet independently.", feedback: "This removes atomic supply conservation and creates partial-transfer states." },
+    { label: "Increase the Kafka partition count.", feedback: "Kafka partitioning does not order database row-lock acquisition inside the ledger transaction." },
+    { label: "Use wall-clock timestamps to decide which balance update wins.", feedback: "Last-write-wins can erase a debit or credit and violate the ledger invariant." }
+  ]}
+  correct={0}
+  explanation="Deterministic lock ordering is a simple local mechanism. It preserves the serializable transaction and still requires bounded deadlock retry."
+/>
+
+<ScenarioCheck
+  scenario="The current ledger sustains 12,000 transfers/s in load tests with acceptable p99 latency. Forecast peak is 4,630/s, but an interviewer asks why it is not sharded by wallet today."
+  question="Which answer demonstrates the strongest judgment?"
+  options={[
+    { label: "Keep the simpler transactional boundary with measured headroom; define virtual keys now and shard only when telemetry shows a bottleneck with an invariant-safe migration plan.", feedback: "This ties complexity to evidence while preserving an evolution path." },
+    { label: "Every large company uses shards, so add 1,000 immediately.", feedback: "Shard count is not a requirement and creates cross-shard invariant work before capacity requires it." },
+    { label: "Sharding is never appropriate for financial systems.", feedback: "Financial ledgers can be partitioned, but the design must preserve cross-partition invariants." },
+    { label: "Move balances to the analytics store because it already scales reads.", feedback: "A stale derived store cannot authorize spending." }
+  ]}
+  correct={0}
+  explanation="IC6 judgment includes resisting premature distribution while preparing keys, measurements, and a safe migration path."
+/>
+
+<InterviewAnswer>
+
+“I scope TokenX to wallet balances, transfers, and history in one authoritative region. The hard invariants are no double spend, conserved supply, and one effect per caller idempotency key. At 20 million transfers per day and a 20× peak, I design for roughly 4.6 thousand writes per second plus about ten times that read traffic.
+
+I use a quorum-backed relational ledger. One serializable transaction checks the idempotency record, locks both wallets in deterministic order, verifies funds, updates balances, appends balanced immutable ledger entries, records the transfer result, and writes an outbox event. A timeout is resolved by replaying the same key. An outbox relay publishes to Kafka for notifications and analytics; those consumers are idempotent and never authorize spending.
+
+During ledger quorum loss I reject transfers rather than risk conflicting balances, while labeled stale portfolio views may remain available. I monitor lock waits, commit latency, outbox age, consumer lag, and reconciliation mismatches. I would not shard at the stated load until measurements require it; when they do, cross-shard transfers need distributed transactions, reservations, or escrow—not independent balance writes.”
+
+</InterviewAnswer>
