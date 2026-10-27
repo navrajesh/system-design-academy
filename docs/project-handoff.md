@@ -56,7 +56,7 @@ Modules 1–7 are complete in topic coverage on `feat/module-7-mock-interviews`.
 - Phase 1A authored all nine lessons in Module 1 and all nine lessons in Module 6.
 - The repository contains **64 of 64 lessons** after completing Module 7 on this branch.
 - All seven modules are complete in topic coverage.
-- The future Architecture Reference Library remains Phase 2 and has not been implemented. The plan, including the Technology Landscape & Architecture Reference feature, lives in [phase-2-architecture-reference.md](./phase-2-architecture-reference.md). It does not change the 64-lesson curriculum.
+- The Architecture Reference Library is Phase 2. **Phase 2A (Storage & Data)** is in progress on `feat/phase-2a-technology-landscape` under `/reference`. It does not change the 64-lesson curriculum. The full seven-landscape product is not complete. See [phase-2-architecture-reference.md](./phase-2-architecture-reference.md).
 
 ## Technical audit status
 
@@ -88,10 +88,8 @@ The Modules 1 and 6 audit found **13 items**. All 13 are addressed and merged to
 
 ## Next milestone
 
-1. Pause for approval of Module 7 (11/11) on `feat/module-7-mock-interviews`. Do not push, merge, or deploy this branch until a later decision. Do not apply or drop `stash@{0}` until a later decision.
-2. Phase 2 Architecture Reference remains documentation-only.
-
-Phase 2 is explicitly out of scope for this milestone. The Phase 2 plan is documented only; do not build library routes, components, or navigation until a later decision.
+1. Phase 2A (Storage & Data vertical slice) is implemented on `feat/phase-2a-technology-landscape` from `main` `93888e7`. Pause for human approval of this slice. Do not push, merge, or deploy until a later decision. Do not apply or drop `stash@{0}`.
+2. Phase 2B+ (remaining six landscapes, remaining named failures, TokenX overlay) stays out of scope until that approval. See [phase-2-architecture-reference.md](./phase-2-architecture-reference.md).
 
 ## Validation commands
 
