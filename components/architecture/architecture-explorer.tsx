@@ -8,8 +8,8 @@ type Props = { graph: ArchitectureGraph };
 
 function nodeVisible(node: GraphNode, primary: "postgres" | "dynamodb", showOptional: boolean) {
   if (node.alternativeGroup === "primary-store") {
-    if (primary === "postgres") return node.id !== "dynamodb";
-    return node.id === "dynamodb" || (node.id !== "postgres-primary" && node.id !== "postgres-replica");
+    if (primary === "postgres") return node.id === "postgres-primary" || node.id === "postgres-replica";
+    return node.id === "dynamodb";
   }
   if (node.optional && !showOptional) return false;
   return node.defaultSelected || !node.optional;
@@ -26,7 +26,7 @@ export function ArchitectureExplorer({ graph }: Props) {
     [graph.nodes, primary, showOptional],
   );
   const visibleIds = useMemo(() => new Set(visibleNodes.map((node) => node.id)), [visibleNodes]);
-  const selected = visibleNodes.find((node) => node.id === selectedId) ?? visibleNodes[0];
+  const selected = visibleNodes.find((node) => node.id === selectedId) ?? visibleNodes.find((node) => node.layerId === "primary") ?? visibleNodes[0];
 
   const visibleEdges = graph.edges.filter((edge) => {
     if (!visibleIds.has(edge.from) || !visibleIds.has(edge.to)) return false;
