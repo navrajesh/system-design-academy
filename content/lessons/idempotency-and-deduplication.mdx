@@ -28,21 +28,35 @@ TokenX uses a tenant-scoped idempotency key for transfer creation and stores the
 
 <UnderTheHood title="Claim and effect must be one decision">
 
-The unsafe pattern is “check key, perform effect, then store key.” Two requests can both pass the check, or the process can crash after the effect but before recording it. The key claim and authoritative local effect must commit atomically, typically under a unique constraint.
+The unsafe pattern is “check key, perform effect, then store key.” Two requests can both pass the check, or the process can crash after the effect but before recording it. Treat **local atomic commands** and **long-running workflows** as different patterns. An uncommitted intermediate claim is not durable progress: a crash rolls it back, and a duplicate must not observe it as `IN_PROGRESS` or `SUCCEEDED`.
 
 <ExecutionTimeline
-  title="TokenX command from first attempt through retry"
+  title="Local TokenX command: crash and duplicate"
   steps={[
     { title: "Receive", detail: "The client sends tenant T, key K, and a canonical request fingerprint for a 100-token transfer.", state: "K is scoped to T and one operation class.", failure: "Reusing K with different parameters must not replay the old result as if equivalent." },
-    { title: "Claim atomically", detail: "The ledger transaction inserts (T,K,fingerprint,IN_PROGRESS) under a unique constraint and performs the transfer.", state: "Key, balanced entries, balances, and outbox share one commit.", failure: "A concurrent duplicate loses the unique insert and reads the existing state." },
+    { title: "Claim and effect atomically", detail: "One ledger transaction inserts (T,K,fingerprint), applies the transfer, and stores SUCCEEDED plus result R.", state: "Key, balanced entries, balances, outcome, and outbox share one local commit. There is no durable IN_PROGRESS after that commit.", failure: "A crash before commit leaves ABSENT; the retry is a new first attempt, not a takeover of a ghost claim." },
     { title: "Lose response", detail: "The transaction commits result R, but the response is dropped before the client receives it.", state: "The transfer happened exactly once within the ledger boundary.", failure: "The client sees timeout and cannot infer outcome." },
     { title: "Replay result", detail: "The retry uses T and K; the service verifies the fingerprint and returns stored result R.", state: "No new ledger mutation occurs.", failure: "If the record expired too soon, the retry can become a new command." },
   ]}
 />
 
-### State machine and fingerprints
+### Two different idempotency patterns
 
-Store states such as `IN_PROGRESS`, `SUCCEEDED`, and a carefully classified terminal failure. A duplicate encountering `IN_PROGRESS` can wait, return a retryable status with the resource URL, or help recover an abandoned claim. Do not cache every transient 500 forever. Persist a canonical hash of semantically relevant parameters; the same key with a different amount or destination is a conflict.
+**Local atomic idempotency** covers a command whose effect fits in one database transaction. Insert the unique `(tenant, operation, key)` row, apply the mutation, and commit `SUCCEEDED` (or a classified terminal failure) together. After that commit there is no durable `IN_PROGRESS` for the local effect. A concurrent duplicate loses the unique insert and replays the stored result. Do not teach “leave IN_PROGRESS, then mutate, then succeed” for this case: a crash between those steps is the original race, and other requests must not treat an uncommitted row as progress.
+
+**Recoverable workflow idempotency** covers work that cannot finish in one local transaction, such as a provider call or saga step. Persist `IN_PROGRESS` with the request fingerprint, owner identity, and a lease or fencing epoch **before** the remote call. That claim is durable only after its insert commits. A duplicate that sees committed `IN_PROGRESS` should wait, return `202` with the operation URL, or attempt takeover. Takeover is allowed only after the new owner fences the old epoch and queries the remote effect; it must not assume `IN_PROGRESS` means the side effect never happened.
+
+<ExecutionTimeline
+  title="Workflow claim: crash during a provider call"
+  steps={[
+    { title: "Durable claim", detail: "The dispatcher commits IN_PROGRESS for key K with owner B, epoch 7, and fingerprint.", state: "Duplicates can now observe a real claim.", failure: "Crashing before this commit leaves ABSENT; the retry must insert, not hijack an uncommitted attempt." },
+    { title: "Remote call", detail: "B calls the provider with command ID K.", state: "Outcome is unknown if the RPC times out.", failure: "A duplicate arrives while IN_PROGRESS is committed." },
+    { title: "Safe duplicate", detail: "The duplicate sees IN_PROGRESS, returns 202, or waits on the operation URL.", state: "No second provider call yet.", failure: "Calling the provider again without K would mint a second charge." },
+    { title: "Takeover", detail: "If B's lease expires, C fences epoch 8, queries the provider for K, then records SUCCEEDED or retries the same command ID.", state: "At most one logical charge under K.", failure: "Takeover that skips the provider lookup can double-charge after B actually succeeded." },
+  ]}
+/>
+
+Do not cache every transient 500 forever. Persist a canonical hash of semantically relevant parameters; the same key with a different amount or destination is a conflict.
 
 The idempotency result should include the stable resource ID and enough response data to preserve API semantics. Large bodies may be regenerated from the authoritative resource if versioned. Scope keys by tenant and endpoint so two customers choosing `123` do not collide.
 
@@ -68,18 +82,18 @@ Retain: stable identity, correct scope, atomic claim-plus-effect, deterministic 
 
 <ArchitectureDiagram
   title="Atomic idempotency and replay-safe delivery"
-  chart={"flowchart LR\n  CLIENT[Client key K plus hash] --> API[Transfer API]\n  API --> TX[Ledger transaction]\n  TX --> IDEM[(Idempotency record)]\n  TX --> LEDGER[(Balances and entries)]\n  TX --> OUT[(Outbox event ID E)]\n  OUT --> BROKER[(Kafka)]\n  BROKER --> CONS[Consumer]\n  CONS --> INBOX[(Inbox plus projection)]\n  CLIENT -. retry K .-> API\n  IDEM -. replay result R .-> API\n  CONS -. crash before offset .-> BROKER\n  INBOX -. duplicate E no-op .-> CONS"}
+  chart={"flowchart LR\n  CLIENT[Client key K plus hash] --> API[Transfer API]\n  API --> LOCAL[Local atomic TX]\n  LOCAL --> IDEM[(Idempotency SUCCEEDED)]\n  LOCAL --> LEDGER[(Balances and entries)]\n  LOCAL --> OUT[(Outbox event ID E)]\n  API --> WF[Workflow claim TX]\n  WF --> PROG[(IN_PROGRESS owner plus epoch)]\n  PROG --> PROV[Provider call with K]\n  PROV --> DONE[SUCCEEDED after lookup]\n  CLIENT -. retry K .-> API\n  IDEM -. replay result R .-> API\n  PROG -. duplicate waits or takeovers .-> API"}
 >
 
-The ledger transaction owns command K, financial effect, outcome R, and event intent E. Kafka owns delivery after publish. The projection database owns inbox E and its local effect in one separate transaction. Each consistency boundary expects retries and closes its own ambiguity window with stable identity.
+Local TokenX transfers commit key, ledger effect, and `SUCCEEDED` in one transaction; an uncommitted insert is invisible and is not progress. Long-running provider work first commits `IN_PROGRESS` with owner and epoch, then calls the provider; duplicates wait or take over under a new fenced epoch after querying the remote outcome. Kafka and inbox paths remain separate at-least-once boundaries with their own identities.
 
 <ArchitectureWalkthrough
   title="Trace command and event identity"
   stages={[
-    { name: "Command", owner: "API client and ledger", state: "Tenant key, fingerprint, and result", boundary: "Atomic with authoritative mutation.", failure: "Response is lost after commit.", recovery: "Retry the same key and replay the stored outcome." },
+    { name: "Local command", owner: "API client and ledger", state: "Tenant key, fingerprint, and SUCCEEDED result", boundary: "Atomic with authoritative mutation.", failure: "Crash before commit, or response lost after commit.", recovery: "Retry the same key. ABSENT means start again; SUCCEEDED replays the stored outcome." },
+    { name: "Workflow claim", owner: "Dispatcher", state: "Committed IN_PROGRESS, owner, lease or epoch", boundary: "Durable before the remote call.", failure: "Crash during the provider RPC, or a duplicate arrives.", recovery: "Wait on the operation URL, or take over only after fencing and querying the provider for K." },
     { name: "Publication", owner: "Outbox relay", state: "Stable event ID and publish status", boundary: "At-least-once broker send.", failure: "Crash after send before acknowledgement.", recovery: "Republish E; downstream treats duplicate E as expected." },
     { name: "Consumption", owner: "Consumer database", state: "Inbox E plus derived mutation", boundary: "One local transaction.", failure: "Crash before broker offset commit.", recovery: "Redelivery conflicts with inbox E and performs no duplicate mutation." },
-    { name: "Expiry", owner: "Retention controller", state: "Oldest accepted command and replay horizon", boundary: "Protocol-declared dedupe window.", failure: "A valid old retry arrives after deletion.", recovery: "Reject expired commands explicitly or retain records through the supported horizon." },
   ]}
 />
 
@@ -100,6 +114,7 @@ The ledger transaction owns command K, financial effect, outcome R, and event in
     { label: "Check then insert", impact: "Concurrent requests both observe absence and execute the effect.", recovery: "Use a unique constraint and commit claim, mutation, and outcome atomically." },
     { label: "Key reused with new payload", impact: "Blind result replay can claim a different transfer succeeded.", recovery: "Compare canonical request fingerprints and reject mismatched reuse." },
     { label: "Record expired", impact: "A delayed replay is treated as new and repeats the effect.", recovery: "Align retention with the accepted replay horizon or reject expired request epochs." },
+    { label: "Uncommitted IN_PROGRESS", impact: "A crash rolls back the claim; treating it as durable progress lets a duplicate take over work that never committed, or skip a first attempt.", recovery: "Only committed rows are visible. Local commands commit SUCCEEDED with the effect; workflows commit IN_PROGRESS before the remote call." },
   ]}
 />
 
@@ -109,11 +124,13 @@ The ledger transaction owns command K, financial effect, outcome R, and event in
 
 1. **“The endpoint is idempotent because it uses PUT.”** HTTP method naming does not implement atomic identity or outcome replay.
 2. **“Store the key after success.”** A crash between effect and record leaves the exact ambiguity idempotency must solve.
-3. **“Deduplicate by payload.”** Two intentional equal purchases are distinct commands; identity must come from the caller or workflow.
-4. **“Keep keys for an hour.”** Derive retention from retry, queue, offline, and archival replay horizons.
-5. **“Kafka exactly-once covers our database.”** External state needs an inbox or a proven transactional connector boundary.
-6. **“Cache the 500 response.”** Distinguish terminal business failures from transient infrastructure failures and unknown outcomes.
-7. **“Bloom filter means seen.”** Probabilistic membership cannot be the authoritative rejection decision for money.
+3. **“Leave IN_PROGRESS, then mutate locally, then succeed.”** For a local command that is one transaction: an uncommitted claim is not progress, and splitting the steps reintroduces the race. Use `IN_PROGRESS` only for work that outlives one commit.
+4. **“Deduplicate by payload.”** Two intentional equal purchases are distinct commands; identity must come from the caller or workflow.
+5. **“Keep keys for an hour.”** Derive retention from retry, queue, offline, and archival replay horizons.
+6. **“Kafka exactly-once covers our database.”** External state needs an inbox or a proven transactional connector boundary.
+7. **“Cache the 500 response.”** Distinguish terminal business failures from transient infrastructure failures and unknown outcomes.
+8. **“Bloom filter means seen.”** Probabilistic membership cannot be the authoritative rejection decision for money.
+9. **“IN_PROGRESS means the provider was never called.”** After a timeout the remote effect is unknown; takeover must query or replay the same command ID.
 
 </InterviewTraps>
 
@@ -121,7 +138,7 @@ The ledger transaction owns command K, financial effect, outcome R, and event in
 
 - Long retention handles delayed retries but creates large hot indexes and privacy/retention obligations.
 - Storing full responses gives exact replay but costs space; storing resource references requires stable versioned reads.
-- Waiting on `IN_PROGRESS` reduces duplicate work but can tie up requests; returning an operation URL makes progress explicit.
+- Waiting on workflow `IN_PROGRESS` reduces duplicate remote calls but can tie up requests; returning an operation URL makes progress explicit. Local atomic commands should not linger in `IN_PROGRESS` after commit.
 - Client-generated keys preserve identity across network failure, but clients need correct scoping and persistence.
 - Natural business keys can be ideal when truly unique; forcing unrelated operations into one key can reject valid repeats.
 
@@ -132,6 +149,19 @@ The ledger transaction owns command K, financial effect, outcome R, and event in
   options={["Generate a new key", "Retry the same key and matching payload, then return the stored transfer result", "Check the cache and create another transfer if absent", "Assume failure after one second"]}
   correct={1}
   explanation="The original outcome is unknown to the client but durable at the authority. Stable identity turns the retry into result lookup rather than a new effect."
+/>
+
+<ScenarioCheck
+  scenario="A TokenX transfer handler inserts IN_PROGRESS, then crashes before committing the ledger mutation. A duplicate request arrives and sees no committed row."
+  question="What is the correct interpretation?"
+  options={[
+    { label: "The first attempt is in progress; wait or take over the uncommitted claim", feedback: "Uncommitted inserts are rolled back. There is no durable claim to wait on." },
+    { label: "Treat the key as ABSENT and run one local transaction that inserts the unique key, mutates the ledger, and commits SUCCEEDED", feedback: "Local commands must not split claim and effect across commits. The retry is a first durable attempt." },
+    { label: "Call the payment provider because IN_PROGRESS implies the funds already moved", feedback: "Nothing committed, so no remote call should be inferred." },
+    { label: "Generate a new idempotency key so the crash cannot collide", feedback: "A new key can apply the same user intent twice." },
+  ]}
+  correct={1}
+  explanation="Only committed idempotency rows are observable. For a local transfer, claim and effect are one transaction; a crash before commit leaves ABSENT."
 />
 
 <ScenarioCheck
@@ -149,7 +179,7 @@ The ledger transaction owns command K, financial effect, outcome R, and event in
 
 <InterviewAnswer>
 
-“Idempotency closes the unknown-outcome window with stable identity. For TokenX I scope the key by tenant and operation, hash the semantic request, and commit key, ledger mutation, result, and outbox intent together. A retry with the same payload returns the stored transfer; mismatched reuse is rejected.
+“Idempotency closes the unknown-outcome window with stable identity. For a local TokenX transfer I scope the key by tenant and operation, hash the semantic request, and commit key, ledger mutation, SUCCEEDED result, and outbox intent together—no durable IN_PROGRESS after that commit. An uncommitted claim is not progress. For a provider call I first commit IN_PROGRESS with owner and epoch, then call with that command ID; duplicates wait or take over only after fencing and a remote lookup.
 
 Every later boundary needs its own identity: outbox event ID, transactional consumer inbox, and provider idempotency key. Retention must cover the longest supported retry or replay horizon; otherwise old duplicates become new commands. See [transactions across boundaries](/learn/transactions-across-boundaries), [Kafka delivery](/learn/kafka-delivery-and-failure), and [distributed transactions](/learn/distributed-transactions).”
 
