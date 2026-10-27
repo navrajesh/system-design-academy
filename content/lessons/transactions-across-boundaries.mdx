@@ -61,7 +61,7 @@ Cross-shard TokenX is that saga with exclusive terminals, not a cache TTL. The i
 
 Shard B keys one durable row by stable `transfer_id`: `ABSENT → CREDITED | CANCELLED`. Credit and cancel race in one serializable destination transaction. The winner is terminal. Duplicates return the committed outcome. A delayed credit after `CANCELLED` is rejected. A delayed cancel after `CREDITED` cannot reverse the credit. Cancel of an unused id still writes a `CANCELLED` tombstone; otherwise a late credit still commits. This lesson does not use a provisional spendable destination credit.
 
-Shard A keys the reservation: `RESERVED → FINALIZED | RELEASED`, changed only by a conditional update from `RESERVED`. On timeout the coordinator persists `UNRESOLVED` and queries B. `CREDITED` drives finalize. `CANCELLED` drives release. `ABSENT` or an unknown query keeps `UNRESOLVED`. Never treat a lost response as cancellation.
+Shard A inserts the reservation uniquely on `transfer_id` (unique constraint or insert-if-absent) in one atomic transaction. Concurrent reserve attempts for the same id must not create two `RESERVED` rows. After that insert, `RESERVED → FINALIZED | RELEASED` is an exclusive fork: a conditional update from `RESERVED` can take only one branch. On timeout the coordinator persists `UNRESOLVED` and queries B. `CREDITED` drives finalize. `CANCELLED` drives release. `ABSENT` or an unknown query keeps `UNRESOLVED`. Never treat a lost response as cancellation.
 
 <ExecutionTimeline
   title="Cross-shard TokenX under delayed and reordered messages"
@@ -84,12 +84,14 @@ Retain: shrink the invariant boundary, commit state and intent together, make ev
 </MentalModel>
 
 <ArchitectureDiagram
-  title="Transactional authority and replay-safe external effects"
-  description="The ledger and outbox share one commit. Kafka and consumer databases are separate consistency boundaries joined by stable IDs and inboxes."
-  chart={"flowchart LR\n  API[Transfer API] --> TX[Serializable transaction]\n  TX --> LEDGER[(Ledger and balances)]\n  TX --> OUT[(Outbox)]\n  OUT --> RELAY[Retrying relay]\n  RELAY --> K[(Kafka)]\n  K --> CONS[History consumer]\n  CONS --> INBOX[(Inbox and projection DB)]\n  RELAY -. crash after send .-> RELAY\n  CONS -. crash after DB commit .-> K\n  INBOX -. duplicate event ID .-> DROP[No-op]\n  K -. rebuild .-> CONS"}
+  title="Transactional authority, replay-safe effects, and exclusive terminals"
+  description="The ledger and outbox share one commit. Kafka and consumer databases are separate consistency boundaries. Cross-shard TokenX then forks into mutually exclusive terminals on each ledger."
+  chart={"flowchart TB\n  subgraph local [Same-shard ledger and outbox share one commit]\n    API[Transfer API] --> TX[Serializable transaction]\n    TX --> LEDGER[(Ledger and balances)]\n    TX --> OUT[(Outbox)]\n    OUT --> RELAY[Retrying relay]\n    RELAY --> K[(Kafka)]\n    K --> CONS[History consumer]\n    CONS --> INBOX[(Inbox and projection DB)]\n    RELAY -. crash after send retry same event ID .-> RELAY\n    CONS -. crash after DB commit redelivery .-> K\n    INBOX -. rejected duplicate event ID .-> DROP[No-op]\n    K -. rebuild replay .-> CONS\n  end\n  subgraph cross [Cross-shard exclusive terminals]\n    BABS[B ABSENT]\n    BABS -->|credit wins| BCRED[B CREDITED]\n    BABS -->|cancel wins| BCANC[B CANCELLED]\n    ARES[A RESERVED]\n    ARES -->|from RESERVED only| AFIN[A FINALIZED]\n    ARES -->|from RESERVED only| AREL[A RELEASED]\n    BCRED -->|durable query| AFIN\n    BCANC -->|durable query| AREL\n  end"}
 >
 
-The ledger database owns balances and accepted transfers. Kafka owns durable event delivery after publish, not the ledger commit. The projection database owns only its local view and inbox. Dashed paths show the two ambiguity windows; retries cross them safely because command and event identities are stable.
+The ledger database owns balances and accepted transfers. Kafka owns durable event delivery after publish, not the ledger commit. The projection database owns only its local view and inbox. In the outbox subgraph, dashed edges are retries, rebuilds, or a rejected duplicate command—not ledger state transitions.
+
+The cross-shard subgraph is a pair of exclusive forks, not a chain. B is `ABSENT → CREDITED | CANCELLED`; A is a unique `RESERVED` insert, then `RESERVED → FINALIZED | RELEASED`. `CREDITED` and `CANCELLED` cannot both be reached for one `transfer_id`; neither can `FINALIZED` and `RELEASED`. A delayed credit after `CANCELLED` is a rejected command, not a transition to `CREDITED`. Timeout stays `UNRESOLVED` until B's committed row is known.
 
 </ArchitectureDiagram>
 
@@ -103,11 +105,20 @@ The ledger database owns balances and accepted transfers. Kafka owns durable eve
   ]}
 />
 
+<ArchitectureWalkthrough
+  title="Trace exclusive terminals after local atomicity"
+  stages={[
+    { name: "Unique reserve", owner: "Source ledger shard", state: "One RESERVED row per transfer_id", boundary: "Atomic insert-if-absent or unique constraint.", failure: "Two reserve attempts share the same id.", recovery: "Only one RESERVED row commits; the other observes it." },
+    { name: "Exclusive destination", owner: "Destination ledger shard", state: "CREDITED or CANCELLED, never both", boundary: "Serializable compare-and-set on transfer_id.", failure: "Delayed credit after a tombstone.", recovery: "Reject the credit command; keep CANCELLED." },
+    { name: "Exclusive source", owner: "Source ledger shard", state: "FINALIZED or RELEASED, never both", boundary: "Conditional update from RESERVED only.", failure: "Timeout with B still unknown.", recovery: "Stay UNRESOLVED; do not treat timeout as cancel." },
+  ]}
+/>
+
 <RealExamples>
 
 **TokenX same-shard transfer.** Co-locate accounts that transact together when possible. Use balanced immutable entries and a unique idempotency key. A derived history consumer may process an event twice, but its inbox prevents duplicate rows. It never changes the authoritative balance.
 
-**TokenX cross-shard transfer.** Use exclusive terminals: B `ABSENT → CREDITED | CANCELLED` and A `RESERVED → FINALIZED | RELEASED`, both via atomic conditional updates on `transfer_id`. Timeout is `UNRESOLVED`: query B's committed row. Finalize only on `CREDITED`; release only on a durable `CANCELLED` tombstone; retry while `ABSENT` or unknown. Coordinator epochs fence stale workers but do not replace the tombstone. If strict instantaneous conservation across shards is mandatory, distributed consensus or redesign may be required.
+**TokenX cross-shard transfer.** Use exclusive terminals: B `ABSENT → CREDITED | CANCELLED` and A unique `RESERVED` insert, then `RESERVED → FINALIZED | RELEASED`. The `RESERVED` insert is atomic and unique on `transfer_id`. Later terminals still require a conditional update from `RESERVED`. Timeout is `UNRESOLVED`: query B's committed row. Finalize only on `CREDITED`; release only on a durable `CANCELLED` tombstone; retry while `ABSENT` or unknown. Coordinator epochs fence stale workers but do not replace the tombstone. If strict instantaneous conservation across shards is mandatory, distributed consensus or redesign may be required.
 
 **Ad Click billing.** Click aggregation is replayable, but invoicing an advertiser is an external effect. Close a versioned billing period, create one invoice command per account under a unique key, and record provider request and result. Replaying raw clicks may produce a corrected invoice version; it must not charge the card twice.
 
@@ -189,6 +200,6 @@ IC6 answers state the invariant first, minimize its atomic scope, then describe 
 
 “I first state the invariant and place as much of it as possible inside one database transaction. TokenX commits balanced ledger entries, balances, idempotency result, and outbox intent together under an enforceable isolation strategy. A relay publishes at least once; consumers atomically combine an inbox key with their local update, so crashes around offset commits are replay-safe.
 
-When one transaction cannot span the workflow, I choose consciously between 2PC and a saga. Cross-shard TokenX uses exclusive terminals on each ledger: B `CREDITED` or `CANCELLED`, A `FINALIZED` or `RELEASED`, with `UNRESOLVED` until B's committed `transfer_id` row is known. Related lessons are [relational versus NoSQL](/learn/relational-vs-nosql-selection), [Kafka delivery](/learn/kafka-delivery-and-failure), and [replication](/learn/replication-and-failover).”
+When one transaction cannot span the workflow, I choose consciously between 2PC and a saga. Cross-shard TokenX uses exclusive terminals on each ledger: B `CREDITED` or `CANCELLED`, A one unique `RESERVED` insert then `FINALIZED` or `RELEASED`, with `UNRESOLVED` until B's committed `transfer_id` row is known. Related lessons are [relational versus NoSQL](/learn/relational-vs-nosql-selection), [Kafka delivery](/learn/kafka-delivery-and-failure), and [replication](/learn/replication-and-failover).”
 
 </InterviewAnswer>
