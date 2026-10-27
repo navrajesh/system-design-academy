@@ -44,7 +44,30 @@ Consensus safety does not require bounded network delay: two different values mu
 
 ### Commit is more than replica count
 
-A leader normally commits a current-term entry after a majority stores it; earlier entries then become committed through log ordering. Simply finding an old entry on a majority at different times can be unsafe if terms and election rules are ignored. Reads also need authority: a read-index round, valid lease under bounded clock assumptions, or a committed no-op can establish that the leader is current.
+A leader normally commits a current-term entry after a majority stores it; earlier entries then become committed through log ordering. Simply finding an old entry on a majority at different times can be unsafe if terms and election rules are ignored.
+
+Reads need separate authority. A committed no-op proves the leader held a majority at the moment that no-op committed; it is not a standing license to serve later local reads.
+
+A new leader first establishes **current-term commit knowledge**. Prior-term entries become committed through that current-term commit (often a no-op). That step makes `commitIndex` safe for this term; it does not authorize later reads by itself.
+
+Then a linearizable read proceeds as follows:
+
+1. Verify **current leader authority**: run ReadIndex by contacting a quorum that still recognizes this node as leader in the **current term**, or hold a still-valid leader lease under an explicit bounded-clock assumption and stop lease reads the instant renewal cannot be confirmed.
+2. Determine the required **read index** (the `commitIndex` recorded at ReadIndex time, or the lease-protected commit index being served).
+3. **Wait until `lastApplied >= readIndex`** so the state machine includes every committed entry the read is allowed to observe. The lease path skips the extra heartbeat, not this apply wait.
+4. Only then serve the read from applied state.
+
+<ExecutionTimeline
+  title="Linearizable read with delayed, duplicate, and lost messages"
+  steps={[
+    { title: "Current-term commit", detail: "The term-18 leader commits a no-op so prior-term suffix entries become committed.", state: "commitIndex is current-term knowledge.", failure: "Serving reads from a leftover local prefix can miss a newer leader's commits.", recovery: "Do not serve linearizable reads until this term has a committed entry and authority is rechecked." },
+    { title: "Authority check", detail: "ReadIndex heartbeats a quorum, or the leader confirms its lease has not expired.", state: "A majority still treats this node as leader for term 18.", failure: "A partition drops the heartbeats; an isolated leader still has old applied state.", recovery: "Refuse the read until quorum confirmation or a renewed lease exists." },
+    { title: "Wait for apply", detail: "The leader sets readIndex to the recorded commitIndex and waits until lastApplied is at least that index.", state: "The deterministic state machine includes the required prefix.", failure: "Returning a local buffer before apply serves a stale or partial view.", recovery: "Block the read; do not use the no-op commit time as proof that later applies finished." },
+    { title: "Lost or duplicate read RPC", detail: "The client retries the same read after a timeout.", state: "Each attempt repeats authority plus apply wait.", failure: "Caching the first no-op as perpetual read permission.", recovery: "Retries are new reads: they must pass current authority and lastApplied >= readIndex again." },
+  ]}
+/>
+
+Committing a current-term no-op is the Raft technique that allows committing prior-term entries. Do not treat that commit as ongoing read authority.
 
 At 10,000 commands/s with 500-byte encoded log entries, payload append is 5 MB/s per replica before protocol and storage overhead. A five-node cluster writes roughly 25 MB/s of replica payload. Consensus is not a substitute for partitioning: one group still has one ordered commit stream and one hot leader path.
 
@@ -63,18 +86,19 @@ Retain: election chooses an epoch-scoped proposer; quorum plus log rules chooses
 </MentalModel>
 
 <ArchitectureDiagram
-  title="Consensus log authority and stale-leader rejection"
-  chart={"flowchart LR\n  CLIENT[TokenX command] --> L[Leader term 18]\n  L --> A[(Follower A)]\n  L --> D[(Follower D)]\n  L --> B[(Follower B)]\n  L --> E[(Follower E)]\n  A --> Q[Majority commit]\n  D --> Q\n  L --> Q\n  Q --> SM[(Authoritative state machine)]\n  OLD[Old leader term 17] -. rejected lower term .-> A\n  OLD -. fenced side effect .-> SINK[External sink]\n  SNAP[(Snapshot)] -. restore plus log tail .-> A"}
+  title="Consensus log authority and linearizable read gate"
+  chart={"flowchart LR\n  CLIENT[TokenX command] --> L[Leader term 18]\n  L --> Q[Majority current-term commit]\n  Q --> SM[(Applied state machine)]\n  READ[Linearizable read] --> AUTH[ReadIndex quorum or lease]\n  AUTH --> IDX[readIndex]\n  IDX --> WAIT[Wait lastApplied]\n  WAIT --> SM\n  OLD[Old leader term 17] -. no current authority .-> AUTH\n  OLD -. fenced side effect .-> SINK[External sink]\n  SNAP[(Snapshot)] -. restore plus log tail .-> SM"}
 >
 
-The committed log and deterministic state machine own authoritative order. Followers own durable log prefixes, not independent truth. The external sink must validate a fencing epoch or consume an idempotent committed command; otherwise an isolated old leader can still damage resources outside the consensus group.
+The committed log and deterministic state machine own authoritative order. Followers own durable log prefixes, not independent truth. Linearizable reads are a separate consistency boundary: current-term commit knowledge, then ReadIndex quorum confirmation or a still-valid bounded-clock lease, then wait until `lastApplied >= readIndex`, and only then serve from applied state. A previously committed no-op is not that gate. The external sink must validate a fencing epoch or consume an idempotent committed command; otherwise an isolated old leader can still damage resources outside the consensus group.
 
 <ArchitectureWalkthrough
   title="Trace consensus ownership"
   stages={[
     { name: "Election", owner: "Voting members", state: "Persistent term and vote", boundary: "One vote per term and up-to-date-log rule.", failure: "Split votes repeat.", recovery: "Randomized timeouts and eventual message delivery permit one candidate to win." },
     { name: "Replication", owner: "Current leader", state: "Proposed log suffix", boundary: "Followers accept matching term and prefix.", failure: "Leader has an uncommitted divergent suffix.", recovery: "A later leader backs it up to a matching prefix and overwrites it." },
-    { name: "Commit", owner: "Consensus group", state: "Commit index and chosen entries", boundary: "Overlapping majority under valid membership.", failure: "Quorum is unavailable.", recovery: "Remain safe and stop commits until quorum returns or membership changes safely." },
+    { name: "Current-term commit", owner: "Consensus group", state: "commitIndex with a current-term entry", boundary: "Overlapping majority under valid membership.", failure: "Quorum is unavailable.", recovery: "Remain safe and stop commits until quorum returns." },
+    { name: "Linearizable read", owner: "Current-term leader", state: "readIndex and lastApplied", boundary: "Authority check then lastApplied >= readIndex.", failure: "Isolated former leader, expired lease, or apply lag.", recovery: "Refuse the read until quorum or lease proves authority and the state machine has applied readIndex." },
     { name: "Side effect", owner: "State-machine adapter", state: "Last applied index and epoch", boundary: "Committed entries only plus fencing.", failure: "Old leader reaches an external resource.", recovery: "Reject lower epochs and reconcile stable command IDs." },
   ]}
 />
@@ -104,7 +128,7 @@ The committed log and deterministic state machine own authoritative order. Follo
 1. **“Three replicas tolerate two failures.”** A three-member majority is two, so only one crash can be tolerated while making progress.
 2. **“The newest timestamp wins the election.”** Election safety uses terms and log freshness, not unsynchronized wall clocks.
 3. **“Replicated means committed.”** An entry may exist on followers yet remain overwriteable until the protocol's commit condition holds.
-4. **“The leader can serve local reads.”** It must establish current authority; an isolated former leader can be stale.
+4. **“A committed no-op lets the leader serve local reads indefinitely.”** The no-op establishes current-term commit knowledge only at that instant. Later linearizable reads need current authority (ReadIndex or a still-valid lease) **and** `lastApplied >= readIndex`.
 5. **“Consensus prevents split brain everywhere.”** It controls participating state. External stores need fencing tokens or idempotent committed commands.
 6. **“Add nodes for throughput.”** More members increase fault-domain options but add quorum latency and do not increase one log's ordered write capacity.
 7. **“Replace the cluster in parallel.”** Membership transition must preserve quorum intersection.
@@ -115,7 +139,7 @@ The committed log and deterministic state machine own authoritative order. Follo
 
 - Larger quorums tolerate more failures but add replication work and more slow-member exposure.
 - Odd-sized voter sets usually buy more fault tolerance per member; learners should calculate majority explicitly.
-- Leader leases can make reads faster but depend on bounded clock drift and lease enforcement; read-index protocols cost a round trip but use fewer clock assumptions.
+- Leader leases can make reads faster by skipping per-read quorum heartbeats, but they still wait for apply and they depend on bounded clock drift; ReadIndex costs a round trip and uses fewer clock assumptions.
 - Consensus gives strong ordering inside one group; globalizing unrelated keys creates latency and throughput bottlenecks.
 - Automatic reconfiguration helps operations but increases protocol risk; staged, observable membership changes are safer.
 
@@ -126,6 +150,26 @@ The committed log and deterministic state machine own authoritative order. Follo
   options={["Nothing; two copies are enough", "The entry lacks a three-member majority and may be overwritten", "The term must be even", "Followers should apply before writing the log"]}
   correct={1}
   explanation="A five-member majority is three. Without the protocol's commit condition, the entry is uncommitted and a later leader may replace it."
+/>
+
+<KnowledgeCheck
+  question="A Raft leader committed a current-term no-op, then a partition isolates it. Why must it stop serving linearizable local reads?"
+  options={["The no-op is uncommitted until every follower applies it", "The no-op proves majority only at that commit; a new leader may have committed later entries", "Linearizable reads are forbidden in Raft", "No-ops invalidate the log matching property"]}
+  correct={1}
+  explanation="A committed no-op is current-term commit knowledge at one instant. Later linearizable reads need a fresh ReadIndex or still-valid lease, then lastApplied >= readIndex."
+/>
+
+<ScenarioCheck
+  scenario="A term-18 leader has a valid bounded-clock lease and a committed no-op. lastApplied is 410 and commitIndex is 440. A client issues a linearizable balance read."
+  question="What must the leader do before returning the read?"
+  options={[
+    { label: "Return the local state machine immediately because the lease and no-op prove leadership", feedback: "The lease skips the heartbeat, not the apply wait. Index 411–440 may be committed but not applied." },
+    { label: "Wait until lastApplied >= the read index (here 440), then serve from applied state, and refuse reads if the lease cannot be confirmed", feedback: "Authority plus lastApplied >= readIndex is required on both the ReadIndex and lease paths." },
+    { label: "Ask any follower for its applied index because followers are always caught up", feedback: "Followers can lag; linearizable reads are served from a leader that has applied the required index." },
+    { label: "Commit another no-op and return without waiting because two no-ops imply freshness", feedback: "Extra no-ops still need authority checks and apply; they are not a standing read license." },
+  ]}
+  correct={1}
+  explanation="Determine readIndex from the protected commit index, wait until lastApplied >= readIndex, then serve. A lease or earlier no-op does not skip apply."
 />
 
 <ScenarioCheck
@@ -145,6 +189,6 @@ The committed log and deterministic state machine own authoritative order. Follo
 
 “Consensus selects one ordered history through persistent terms, restricted voting, log matching, and overlapping quorums. In a five-node group, three durable acknowledgements form a majority and two crashes can be tolerated while retaining progress. Safety survives arbitrary delay; liveness needs eventual connectivity and a stable leader long enough to communicate.
 
-I distinguish proposed, replicated, committed, and applied entries. Reads must prove current authority, membership changes must preserve old/new quorum intersection, and external resources must reject stale fencing epochs. Consensus scopes to one group; cross-shard invariants need another protocol. See [replication and failover](/learn/replication-and-failover), [CAP and practical consistency](/learn/cap-and-consistency-models), and [idempotency](/learn/idempotency-and-deduplication).”
+I distinguish proposed, replicated, committed, and applied entries. Linearizable reads need current-term commit knowledge, current authority via ReadIndex or a still-valid lease, a concrete readIndex, and `lastApplied >= readIndex` before serving. A one-time no-op is not that gate. Membership changes must preserve old/new quorum intersection, and external resources must reject stale fencing epochs. Consensus scopes to one group; cross-shard invariants need another protocol. See [replication and failover](/learn/replication-and-failover), [CAP and practical consistency](/learn/cap-and-consistency-models), and [idempotency](/learn/idempotency-and-deduplication).”
 
 </InterviewAnswer>

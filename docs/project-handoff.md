@@ -60,12 +60,12 @@ Modules 1 and 6 are complete in topic coverage and conform to the automated cont
 
 ## Outstanding technical audit findings
 
-The Modules 1 and 6 audit found **13 outstanding items**. Correctness defects and unstated protocol assumptions take priority over editorial improvements.
+The Modules 1 and 6 audit found **13 items**. The two High findings are remediating on `fix/distributed-systems-audit`; **11 Medium and Low items remain**. Correctness defects and unstated protocol assumptions take priority over editorial improvements.
 
 | Priority | Finding | Required remediation |
 | --- | --- | --- |
-| High | TokenX saga may release a reservation before a delayed destination credit commits | Add a durable unresolved state and destination-side cancellation, fencing, or provisional credit protocol |
-| High | A committed Raft no-op is presented as sufficient ongoing read authority | Require current-term commit knowledge plus per-read ReadIndex/quorum confirmation or a valid bounded-clock lease |
+| High (this branch) | TokenX saga may release a reservation before a delayed destination credit commits | Exclusive B `CREDITED`/`CANCELLED` and A `FINALIZED`/`RELEASED`; `UNRESOLVED` until B's committed row is known |
+| High (this branch) | A committed Raft no-op is presented as sufficient ongoing read authority | Current-term commit knowledge, ReadIndex or lease, then `lastApplied >= readIndex` before serving |
 | Medium | Kafka durability is described without the complete broker and producer assumptions | State replication factor, `acks=all`, `min.insync.replicas`, idempotence, leader-election, retention, and failure scope |
 | Medium | A protected resource may accept a stale fencing token before observing the new epoch | Establish and durably retain the new high-water token before protected work |
 | Medium | Local atomic idempotency and recoverable `IN_PROGRESS` workflow idempotency are conflated | Teach them as separate transaction patterns with explicit ownership and takeover rules |
@@ -80,7 +80,7 @@ The Modules 1 and 6 audit found **13 outstanding items**. Correctness defects an
 
 ## Next milestone
 
-1. Remediate the 13 audit findings, beginning with the unsafe TokenX saga and Raft read-authority claims.
+1. Review the two High remediations on `fix/distributed-systems-audit`, then address the remaining 11 Medium and Low findings.
 2. Re-run the complete validation suite and review the affected diagrams and exercises on desktop and mobile.
 3. Begin Module 3, **Kafka & Fault Tolerance**, with Kafka Internals, Consumer Groups and Rebalancing, and Ordering and Event Keys before progressing to stream processing and disaster scenarios.
 

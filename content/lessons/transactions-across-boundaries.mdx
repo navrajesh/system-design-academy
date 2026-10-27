@@ -57,6 +57,22 @@ Two-phase commit (2PC) asks participants to prepare, then commit. It can provide
 
 Compensation is not time travel. Refunding a card may incur fees; releasing inventory may fail; a delivered notification cannot be unsent. Reserve scarce resources before confirmation, give every step an idempotency key, use deadlines, and define manual-resolution states for exhausted retries.
 
+Cross-shard TokenX is that saga with exclusive terminals, not a cache TTL. The invariant is conservation of the transfer amount: it is reserved on the source, credited on the destination, or returned to the source—never both spent and credited. Authoritative state lives on each shard's ledger. The coordinator's RPC timeouts are not ledger facts.
+
+Shard B keys one durable row by stable `transfer_id`: `ABSENT → CREDITED | CANCELLED`. Credit and cancel race in one serializable destination transaction. The winner is terminal. Duplicates return the committed outcome. A delayed credit after `CANCELLED` is rejected. A delayed cancel after `CREDITED` cannot reverse the credit. Cancel of an unused id still writes a `CANCELLED` tombstone; otherwise a late credit still commits. This lesson does not use a provisional spendable destination credit.
+
+Shard A keys the reservation: `RESERVED → FINALIZED | RELEASED`, changed only by a conditional update from `RESERVED`. On timeout the coordinator persists `UNRESOLVED` and queries B. `CREDITED` drives finalize. `CANCELLED` drives release. `ABSENT` or an unknown query keeps `UNRESOLVED`. Never treat a lost response as cancellation.
+
+<ExecutionTimeline
+  title="Cross-shard TokenX under delayed and reordered messages"
+  steps={[
+    { title: "Lost CREDITED ack", detail: "B commits CREDITED for T; the coordinator sees a timeout.", state: "A is RESERVED; workflow is UNRESOLVED.", failure: "Releasing A would mint money beside B's credit.", recovery: "Query T; CREDITED authorizes RESERVED to FINALIZED only." },
+    { title: "Duplicate credit", detail: "The same transfer_id credit is retried.", state: "B already stored CREDITED.", failure: "A new id would create a second credit.", recovery: "Return the existing CREDITED row." },
+    { title: "Cancel then delayed credit", detail: "Cancel commits CANCELLED from ABSENT; a late credit arrives.", state: "Tombstone is the destination terminal.", failure: "Applying the late credit after A RELEASED mints money.", recovery: "Credit loses the compare-and-set and is rejected; then A RELEASED." },
+    { title: "Credit then delayed cancel", detail: "B is CREDITED; cancel is reordered after.", state: "Destination terminal stays CREDITED.", failure: "Reversing the credit would steal from the destination.", recovery: "Reject cancel; finalize A from RESERVED." },
+  ]}
+/>
+
 </UnderTheHood>
 
 <MentalModel>
@@ -91,7 +107,7 @@ The ledger database owns balances and accepted transfers. Kafka owns durable eve
 
 **TokenX same-shard transfer.** Co-locate accounts that transact together when possible. Use balanced immutable entries and a unique idempotency key. A derived history consumer may process an event twice, but its inbox prevents duplicate rows. It never changes the authoritative balance.
 
-**TokenX cross-shard transfer.** Introduce a durable transfer state machine and reservation entries: reserve debit, confirm credit, then finalize; on timeout, release the reservation if the credit was never committed. A globally queryable transfer ID and epochs prevent an old coordinator from finalizing after compensation. If strict instantaneous conservation across shards is mandatory, distributed consensus or redesign may be required.
+**TokenX cross-shard transfer.** Use exclusive terminals: B `ABSENT → CREDITED | CANCELLED` and A `RESERVED → FINALIZED | RELEASED`, both via atomic conditional updates on `transfer_id`. Timeout is `UNRESOLVED`: query B's committed row. Finalize only on `CREDITED`; release only on a durable `CANCELLED` tombstone; retry while `ABSENT` or unknown. Coordinator epochs fence stale workers but do not replace the tombstone. If strict instantaneous conservation across shards is mandatory, distributed consensus or redesign may be required.
 
 **Ad Click billing.** Click aggregation is replayable, but invoicing an advertiser is an external effect. Close a versioned billing period, create one invoice command per account under a unique key, and record provider request and result. Replaying raw clicks may produce a corrected invoice version; it must not charge the card twice.
 
@@ -113,7 +129,7 @@ The ledger database owns balances and accepted transfers. Kafka owns durable eve
 2. **“Read committed prevents double spend.”** It prevents dirty reads, not every lost update or write skew. Show the constraint, lock, or serializable transaction.
 3. **“Kafka exactly-once handles the database.”** Kafka can atomically coordinate Kafka records and offsets in supported flows; external database writes need inbox/idempotency or a connector with proven semantics.
 4. **“A saga rolls everything back.”** Compensation can be lossy or impossible. Name irreversible steps and manual resolution.
-5. **“Retry on timeout.”** A timeout means unknown outcome. Retry with the same identity and query the durable workflow state.
+5. **“Retry on timeout.”** A timeout means unknown outcome. Retry with the same identity and query the durable workflow state. For TokenX, do not release a source reservation until B has committed `CANCELLED`.
 6. **“2PC guarantees availability.”** Prepared transactions can hold locks while a coordinator is unavailable; discuss recovery tooling and participant support.
 
 IC6 answers state the invariant first, minimize its atomic scope, then describe every ambiguous crash point.
@@ -143,6 +159,20 @@ IC6 answers state the invariant first, minimize its atomic scope, then describe 
 />
 
 <ScenarioCheck
+  title="Timeout is not a destination cancel"
+  scenario="TokenX transfer T is RESERVED on shard A. The credit RPC to shard B timed out. No CANCELLED tombstone exists. A delayed credit for T is still in flight."
+  question="Which coordinator action preserves conservation?"
+  options={[
+    { label: "Release A because B did not confirm in time", feedback: "The delayed credit can still commit CREDITED, minting money if A is already spendable." },
+    { label: "Stay UNRESOLVED and query B: finalize A if CREDITED, write CANCELLED then release A only after that tombstone commits, otherwise retry", feedback: "Absence of an ack is not CANCELLED. Only B's durable terminal may drive FINALIZED or RELEASED." },
+    { label: "Credit a new transfer id so the user is not blocked", feedback: "A second identity can credit twice." },
+    { label: "Delete the reservation row without a destination tombstone", feedback: "ABSENT on B still allows the delayed credit to win." },
+  ]}
+  correct={1}
+  explanation="The source may leave RESERVED only after B's exclusive terminal is known: CREDITED → FINALIZED, CANCELLED → RELEASED, otherwise remain UNRESOLVED."
+/>
+
+<ScenarioCheck
   title="Snapshot isolation and an on-call invariant"
   scenario="Two doctors are on call. Two concurrent snapshot-isolated transactions each see both on call, then each removes a different doctor. Both commit because they update different rows."
   question="What is the correct diagnosis and remedy?"
@@ -159,6 +189,6 @@ IC6 answers state the invariant first, minimize its atomic scope, then describe 
 
 “I first state the invariant and place as much of it as possible inside one database transaction. TokenX commits balanced ledger entries, balances, idempotency result, and outbox intent together under an enforceable isolation strategy. A relay publishes at least once; consumers atomically combine an inbox key with their local update, so crashes around offset commits are replay-safe.
 
-When one transaction cannot span the workflow, I choose consciously between 2PC and a saga. A saga has durable states, reservations, idempotent steps, deadlines, compensations, and manual resolution for irreversible effects. Related lessons are [relational versus NoSQL](/learn/relational-vs-nosql-selection), [Kafka delivery](/learn/kafka-delivery-and-failure), and [replication](/learn/replication-and-failover).”
+When one transaction cannot span the workflow, I choose consciously between 2PC and a saga. Cross-shard TokenX uses exclusive terminals on each ledger: B `CREDITED` or `CANCELLED`, A `FINALIZED` or `RELEASED`, with `UNRESOLVED` until B's committed `transfer_id` row is known. Related lessons are [relational versus NoSQL](/learn/relational-vs-nosql-selection), [Kafka delivery](/learn/kafka-delivery-and-failure), and [replication](/learn/replication-and-failover).”
 
 </InterviewAnswer>
