@@ -1,0 +1,226 @@
+---
+title: "Backpressure and Overload"
+description: "Keep latency finite with push/pull flow control, bounded buffers, admission 429s, and fair priority—without treating rate limits as correctness."
+module: 4
+moduleTitle: "Performance"
+order: 7
+duration: 37
+difficulty: "Intermediate"
+tags:
+  - backpressure
+  - overload
+  - flow control
+  - rate limiting
+  - fairness
+objectives:
+  - Choose push versus pull flow control and bound every buffer with a reject or block timeout
+  - Shed with 429 (or equivalent) when the queue would break the latency SLO, rather than growing memory
+  - Apply priority and fairness so TokenX transfers and billed clicks outrank debug work
+  - Treat rate limits as admission control, not uniqueness, durability, or exactly-once
+---
+
+<BigPicture title="Overload is a queueing problem you either bound or you donate latency">
+
+When arrivals exceed service rate, **something** stores the difference: a client retrying, an unbounded LinkedBlockingQueue, a Kafka producer `buffer.memory`, consumer fetch, or the caller’s thread. [Latency, throughput, and queues](/learn/latency-throughput-and-queues) is the math: Little’s Law, utilization, and why tails explode. This lesson is the **mechanism**: **push versus pull** flow control, **bounded buffers**, **load shed (429) versus queue**, **priority and fairness**, Kafka **producer buffer + `max.block.ms`**, **consumer pause that still `poll()`s**, and **rate limits as admission**.
+
+[Graceful degradation](/learn/graceful-degradation) owns **what you stop first** (circuit breakers, bulkheads, fail-closed money, sampled dashboards). Do not re-derive breaker state machines here. Use that lesson for isolate-and-skip policy. Use this one for **how bytes stop moving** when a buffer is full.
+
+Authoritative TokenX money still commits only in the ledger plus `(tenant, transfer_id)`. Authoritative Ad Click invoices still live on the billed-fact log. Rate limiting a client to 100 req/s does **not** make those writes unique. Unbounded queues convert an SLO into a latency disaster: admitted work waits until deadlines expire, then retries refill the same queue.
+
+</BigPicture>
+
+<UnderTheHood title="Pull when you can, bound when you must, shed when the bound is full">
+
+### Push versus pull
+
+**Push:** the producer sends whenever it has data. The consumer’s receive buffer, thread pool, or disk is the shock absorber. TCP windowing is push with a bound (the receive window). Kafka clients that `send()` into `buffer.memory` are push into a local bound. An HTTP client that ignores 429 and keeps POSTing is unbounded push.
+
+**Pull:** the consumer asks for the next unit when it has capacity. Kafka fetch is pull: the member `poll()`s, the broker serves up to `max.partition.fetch.bytes`. A TokenX worker that only `take()`s from a bounded queue is pull. Pull does not magically cap the **log**: if producers keep appending, lag still grows until **produce** is shed.
+
+Flow control is “who is allowed to send the next byte.” It is not a commit. A blocked `send()` is **not** `acks=all`. See [Kafka delivery and failure](/learn/kafka-delivery-and-failure) for the ACK boundary.
+
+### Bounded queues versus unbounded (apply the latency lesson; do not re-derive it)
+
+Little’s Law still holds at whatever boundary you name. If you **do not** bound the queue, W grows without an SLO: surplus arrivals accumulate forever (until OOM). If you bound it to *K* permits, admitted W is capped and **excess must be rejected or the sender must block with a timeout**.
+
+Illustrative: TokenX transfer API sustainable μ = 2,000 commits/s (ledger hold 12 ms, enough owners). Offered λ = 3,000/s for 30 s. Surplus = 1,000/s. Unbounded queue depth after 30 s ≈ **30,000** transfers; wait for the last admitted ≈ 30,000 / 2,000 = **15 s** and still growing if the spike continues. A bound of 400 in-flight (from the latency lesson’s L = λW headroom) plus **429** keeps admitted p99 near service time; 1,000/s get a fast no.
+
+That is the same surplus-and-wait story as the queues lesson. The new rule: **name K, name the reject, name who is exempt.**
+
+<Calculation label="Bound K, then 429 the surplus">
+
+Planning assumptions (illustrative): TokenX 2,000 sustainable commits/s; target admitted W = 200 ms → K ≈ 2,000 × 0.2 = 400 in-flight. Kafka producer `buffer.memory` = 32 MiB, billed fact 800 B encoded → ~42,000 records in the client before block. `max.block.ms` = 60,000 ms would hold an API thread for a minute; `max.block.ms` = 100 ms plus a throw is admission.
+
+Ad Click: billed 20,000 facts/s, debug 40,000/s, apply 22,000/s. If you queue both classes together, surplus 38,000/s. After 10 s the mix queue holds ~380,000 records and billed facts sit behind debug. Priority isolation: cap debug in-flight at 2,000; 429 or drop debug first; billed keeps leftover apply.
+
+Autoscaling does not replace the bound: [Autoscaling and capacity planning](/learn/autoscaling-and-capacity-planning) adds replicas **after** a signal. During the warm-up window the queue still needs a K and a 429.
+
+</Calculation>
+
+### Load shed 429 versus queue
+
+| Move | What the caller sees | What capacity does | Honest use |
+| --- | --- | --- | --- |
+| Queue (bounded) | Latency up to the bound | Smooths **short** bursts | Burst shorter than K / surplus |
+| 429 / 503 + Retry-After | Fast failure | Protects admitted p99 | Surplus longer than the bound, or low-priority class |
+| Block `send()` until `max.block.ms` | Caller thread stuck | Converts broker stall into API latency | Only with a **short** timeout, then shed |
+
+Queueing a TokenX debit for 15 s while the client already timed out at 200 ms is orphan production. Prefer 429 on **debug** and on **excess transfers above K**. Do not 429 uniqueness checks to “save the ledger”—that is an integrity shed, forbidden the same way degradation fail-closed money.
+
+HTTP 429 is **proven non-accept** in the retries lesson: the server did not apply the debit. Timeout while queued is **UNKNOWN** if the handler might have started. Prefer reject **before** the uniqueness insert.
+
+### Priority and fairness
+
+**Priority** is which class is admitted when K is almost full. **Fairness** is whether one tenant, partition, or debug firehose can consume K alone.
+
+TokenX: **transfer / debit / credit** outranks metadata reads, which outrank **debug traces**. Under overload, shed debug first, then metadata, then delay extra transfers with 429—not the reverse. A noisy tenant still needs a **per-key or per-tenant** token bucket so celebrity account A cannot occupy every ledger permit (the row lock still serializes A; fairness stops A’s debug plus everyone else’s transfers sharing one HTTP pool).
+
+Ad Click: **billed clicks** outrank **debug clicks** and verbose payloads. Fairness: one viral `campaign_id` must not fill the collector queue so other campaigns’ billed facts 429. Isolate permits per class (and per hot key if needed). That isolation is a **queue policy**. Breaker open/closed lives in the degradation lesson.
+
+### Kafka: producer buffer, `max.block.ms`, pause still needs poll
+
+- **`buffer.memory`:** local push bound. Full buffer → `send()` **blocks** up to **`max.block.ms`**, then throws. The throw is **not** a broker ACK. The record may be nowhere.
+- **`max.block.ms` too large:** API threads become the queue. Same disaster as unbounded in-process queues, with extra steps.
+- **Consumer `pause()`:** stops **fetch** for those partitions. You must still **`poll()`** so `max.poll.interval.ms` does not expire. Heartbeats without poll still look dead to the processing-loop detector—same trap as [Consumer groups and rebalancing](/learn/consumer-groups-and-rebalancing). Pause is backpressure on **consume**. It does **not** drop already-acked produce and does **not** cap lag unless **producers** shed.
+
+<ExecutionTimeline
+  title="One TokenX produce and one Ad Click consume under overload"
+  steps={[
+    { title: "Admit", detail: "Rate limiter plus priority gate: transfer class takes a permit from K = 400. Debug 429s with Retry-After. No ledger write yet.", state: "Admission owns the bound. Ledger still authoritative and untouched.", failure: "Unlimited debug shares K; transfers wait in an unbounded HTTP queue." },
+    { title: "Commit or block", detail: "Handler inserts (tenant, transfer_id) and mutates the balance, then may analytics-produce. send() waits up to max.block.ms = 100 ms for buffer space.", state: "Ledger commit is the money ACK. Buffer occupancy is not durability.", failure: "max.block.ms = 60 s holds the worker; uniqueness is fine, p99 is not; treating the block as acks=all lies." },
+    { title: "Pull", detail: "Ad Click billed consumers poll, apply, then pause debug partitions when lag exceeds 100,000 records. They keep polling.", state: "Log is still the fact authority. Group lag is derived progress.", failure: "Pause without poll trips max.poll.interval.ms; a rebalance dual-owns the sink unless the sink is fenced." },
+    { title: "Shed produce", detail: "Debug collectors get 429 or producer exceptions. Billed collectors keep appending with click_id. Pause alone never stopped the firehose.", state: "Billed facts continue. Debug completeness is explicitly dropped.", failure: "Dropping billed appends to protect a dashboard, or pausing fetch while produce is unshed, grows unbounded lag." }
+  ]}
+/>
+
+### Rate limits are admission, not correctness
+
+A token bucket (100 req/s/key, burst 20) **shapes offered load**. It does not:
+
+- insert `(tenant, transfer_id)`
+- fsync billed facts
+- order account mutations
+- provide exactly-once processing
+- replace a unique constraint if the client retries with a new id
+
+Two TokenX clients can each be under their 100 req/s cap and still double-apply if they mint different `transfer_id`s for one user click. Rate limits **protect the pool**. Idempotency **protects the ledger**. You need both.
+
+<InteractiveCalculation mode="little-law" title="In-flight work when the queue is the system" />
+
+Use the calculator at the **queue boundary**, not the whole company: arrival rate into this buffer, time spent in this buffer. If utilization of K is already high, 429 is cheaper than raising K. The latency lesson owns the formula; this lesson owns the reject.
+
+</UnderTheHood>
+
+<MentalModel title="A loading dock with a painted line and a bouncer">
+
+Pull is the forklift driver asking for the next pallet when there is floor space. Push is the truck dumping pallets until the warehouse collapses. The **painted line** is K (bounded buffer). The **bouncer** is 429 / `max.block.ms` timeout: people at the door get a fast no so the people inside still ship. **Priority** lets ambulances (TokenX transfers, billed clicks) past tourists (debug). **Fairness** is one noisy truck not occupying every dock. Kafka’s producer buffer is a **small warehouse with a clock**; when the clock fires, you refuse—you do not stamp “delivered.” Pause is telling the forklift to stop fetching that aisle while still **checking in** with the coordinator (`poll`).
+
+Retain: **bound K, pull if you can, 429 surplus, rank money and billed facts above debug, treat rate limits as doors not ledgers, and keep polling while paused.**
+
+</MentalModel>
+
+<ArchitectureDiagram title="Rate limit, priority, bounded queue, Kafka buffer, and shed paths" chart={"flowchart LR\n  CLI[Clients] --> RL[Rate limiter]\n  RL --> PRI[Priority gate]\n  PRI --> Q[Bounded app queue]\n  Q --> API[Workers]\n  API --> LED[(Authoritative ledger plus transfer id)]\n  API --> BUF[Producer buffer]\n  BUF --> LOG[(Kafka log until retention)]\n  LOG --> CONS[Consumer poll]\n  CONS --> SINK[(Billed sink)]\n  RL -. reject 429 .-> CLI\n  PRI -. drop debug .-> CLI\n  BUF -. max.block.ms timeout .-> SHED[Shed produce]\n  CONS -. pause fetch keep poll .-> LOG"}>
+
+**Authoritative state:** TokenX ledger plus uniqueness, and the Ad Click billed-fact **log** until retention plus the billed sink. **Derived:** debug topics, dashboards, group lag, producer buffer contents (unacked). **Consistency boundary:** money is committed only at the ledger transaction; Kafka ACK is a different envelope ([Kafka delivery and failure](/learn/kafka-delivery-and-failure)). Rate limiter and priority gate are **admission**, not that boundary. Solid edges are admitted push-into-bound and pull-from-log. Dashed edges are 429, debug drop, `max.block.ms` produce shed, and pause (async stop-fetch while poll continues). Recovery: Retry-After with jitter on 429, drain the bounded queue, unpause when leftover apply rate is positive, never “recover” by ACKing money from a full buffer.
+
+<ArchitectureWalkthrough
+  title="What each flow-control gate is allowed to do"
+  stages={[
+    { name: "Limit", owner: "Token bucket / concurrency permit", state: "Offered QPS and in-flight K", boundary: "Admission only. Not uniqueness, not fsync.", failure: "Treating 100 req/s as exactly-once; shedding unique-id checks.", recovery: "Keep the fence; 429 debug and excess; Retry-After." },
+    { name: "Prioritize", owner: "Class and tenant weights", state: "Transfer vs debug; billed vs debug clicks", boundary: "Who may occupy K. Does not split a hot ledger row.", failure: "FIFO mix lets debug starve transfers; one campaign fills the collector.", recovery: "Separate permits; drop or delay the low class; isolate hot keys." },
+    { name: "Bound", owner: "App queue plus producer buffer.memory", state: "At most K items or buffer.memory bytes", boundary: "max.block.ms is a wait cap, not acks=all.", failure: "Unbounded LinkedBlockingQueue or 60 s block.", recovery: "Reject at K; short block timeout; throw to the caller." },
+    { name: "Pull", owner: "Consumer fetch loop", state: "Paused partitions vs poll liveness", boundary: "Pause stops fetch, not produce. poll keeps membership.", failure: "Pause without poll; assume lag is capped.", recovery: "Keep poll; shed produce on the low-priority path; fence the sink on rebalance." }
+  ]}
+/>
+
+</ArchitectureDiagram>
+
+<RealExamples title="TokenX 429s debug before money waits; ads pause debug fetch and keep billed pull">
+
+**TokenX.** Mesh and API share a concurrency bound K sized from admitted λ × target W (example: 2,000/s × 0.2 s = 400). **Transfer** class always competes for ledger permits; **debug** traces 429 at 80% of K. Per-tenant buckets stop one integration test from occupying K. `send()` of analytics uses a **separate** buffer and `max.block.ms` ≈ 100 ms; a throw skips analytics (degradation policy) and **must not** rewind the ledger. Rate limit 50 transfers/s/merchant is so a bug does not hot-loop the primary; the merchant still sends one `transfer_id` per user action. Fairness does not add a second writer on celebrity account A—the row remains one cashier.
+
+**Ad Click Aggregator.** Collectors use a bounded in-memory batch (for example 500 facts or 20 ms linger) then `send()`. If the buffer fills, billed path fails the SDK with 429/503 **after** not appending; the SDK retries the **same** `click_id`. Debug path drops. Consumers **pull** billed partitions first. When debug lag exceeds 100,000 records they `pause()` debug, **continue `poll()`**, and leave billed fetching. Pause does not stop collector produce—collectors must shed debug. Extra consumer members above partition count stay idle ([Consumer groups and rebalancing](/learn/consumer-groups-and-rebalancing)); they are not a flow-control valve.
+
+<FailureScenario
+  title="Pick the overload control that matches the bound"
+  prompt="Offered TokenX+debug is 3× sustainable. Ad Click debug produce is 2× billed apply. Analytics Kafka is slow. An engineer wants 'no 429s, just bigger queues.'"
+  choices={[
+    { label: "Unbounded HTTP queue and buffer.memory; max.block.ms = 5 minutes", impact: "W explodes. Clients time out and retry. Threads wait in send(). Money may still be unique, but p99 is a disaster and orphans pile up.", recovery: "Set K, short max.block.ms, 429 debug first. See the latency lesson for why W grew." },
+    { label: "429 debug and excess transfers at K; keep uniqueness; skip analytics on produce timeout; pause debug fetch and keep poll", impact: "Admitted transfers keep ~service-time latency. Dashboards lag. Debug completeness drops. Ledger stays fail-closed on money.", recovery: "Unpause when leftover apply exists; Retry-After with jitter; do not retry transfers with new ids." },
+    { label: "Rate-limit billed clicks to 0 and let debug through because dashboards are the SLO", impact: "Invoices starve. Debug is the wrong priority class.", recovery: "Invert: billed first, debug shed. Dashboards are derived." },
+    { label: "Pause all consumers and stop polling so the broker 'backs up' to collectors", impact: "max.poll.interval.ms expires, rebalance, dual-owner window at the sink. Collectors still produce; lag grows. Membership looks like death.", recovery: "Pause fetch on debug only; keep poll; shed produce; fence the sink." }
+  ]}
+/>
+
+</RealExamples>
+
+<InterviewTraps title="Overload slogans that fail at IC6">
+
+- **“The queue is our shock absorber.”** Unbounded queues absorb until OOM or until every deadline is already dead. Bound K.
+- **“Pull means the log cannot grow.”** Pull caps **fetch**. Produce still appends. Shed or 429 the producer.
+- **“429 means we lost the debit.”** 429 before the uniqueness insert is proven non-accept. A timeout after insert is UNKNOWN—same `transfer_id`.
+- **“max.block.ms is durability.”** It is how long **you** wait for local buffer space. `acks` is the broker envelope.
+- **“We paused, so those records were dropped.”** Pause stops fetch. Previously acked records remain until retention.
+- **“Paused consumers do not need poll; heartbeats are enough.”** `max.poll.interval.ms` is the processing-loop detector.
+- **“Rate limit = exactly-once.”** Admission is not a unique constraint.
+- **“FIFO is fair.”** FIFO lets debug starve transfers and one campaign starve others. Name classes and tenant weights.
+- **“HPA will catch the spike.”** Warm-up is not zero. K and 429 still apply during scale-out ([Autoscaling and capacity planning](/learn/autoscaling-and-capacity-planning)).
+- **“Open the circuit instead of bounding the queue.”** Breakers are the degradation lesson’s **dependency** policy. You still need K on the path that remains open.
+
+</InterviewTraps>
+
+<Tradeoffs title="What you spend to keep W finite">
+
+- **429 versus queue:** 429 spends availability of the **excess** class to buy latency for the admitted class. Queue spends latency to buy burst absorption up to K.
+- **Push versus pull:** push is simple and overruns the consumer; pull needs a live poll loop and still needs produce-side shed.
+- **Short `max.block.ms` versus long:** short throws sooner and can storm retries unless you 429 with Retry-After; long turns API threads into the buffer.
+- **Priority versus utilization:** strict transfer-first can idle debug forever (starvation). Weighted fairness spends some transfer latency to give debug a trickle.
+- **Per-tenant buckets versus global K:** tenant buckets stop noisy neighbors and add state and mis-configuration. Global K is simpler and unfair under skew.
+- **Rate limit tightness versus headroom:** a tight bucket protects the primary and rejects healthy bursts; a loose bucket is admission theater.
+
+Correctness of TokenX balances and billed-click identity is not a flow-control knob. Completeness of debug and dashboards is.
+
+</Tradeoffs>
+
+<KnowledgeCheck
+  question="Sustainable TokenX commit rate is 2,000/s. Offered load is 3,000/s for 30 s into an unbounded queue. What is the most defensible statement?"
+  options={[
+    "The queue absorbs the spike; mean service time is unchanged so p99 is unchanged",
+    "About 30,000 transfers are waiting after 30 s (~15 s for the last one at 2,000/s drain) and growing if the surplus continues; a bound K plus 429 protects admitted latency",
+    "Little’s Law does not apply because this is backpressure, not queueing",
+    "A 100 req/s rate limit on one client already made every transfer unique, so queue depth cannot matter"
+  ]}
+  correct={1}
+  explanation="Surplus 1,000/s × 30 s ≈ 30,000 queued; drain 2,000/s implies ~15 s for that backlog if arrivals stopped. Unbounded W is the latency disaster. Rate limits do not create uniqueness."
+/>
+
+<KnowledgeCheck
+  question="An Ad Click consumer pauses debug partitions because lag is 120,000 records, then stops calling poll to 'save CPU.' Collectors keep producing debug. What happens?"
+  options={[
+    "Pause dropped the debug records from the log, so lag cannot grow and poll is optional",
+    "Heartbeats keep the member alive forever; billed apply is automatically isolated",
+    "Pause stops fetch only; lag can keep growing; without poll, max.poll.interval.ms can expire and rebalance while a dual-owner window opens at the sink",
+    "max.block.ms on the consumer will 429 the collectors for you"
+  ]}
+  correct={2}
+  explanation="pause() is stop-fetch, not drop and not produce-shed. poll() is required for processing-loop liveness. max.block.ms is a producer-client wait cap, not a consumer-to-collector 429."
+/>
+
+<ScenarioCheck
+  scenario="Peak mix: 2,500 TokenX transfers/s plus 8,000 debug spans/s into one API process. Analytics Kafka is stalling. An engineer proposes: remove 429s, set buffer.memory unbounded, max.block.ms = 2 minutes, FIFO queue, and 'we already rate-limit each API key to 200/s so uniqueness is covered.' Billed Ad Click collectors share that FIFO with debug clicks."
+  question="What do you ship so money and invoices keep a finite latency bound?"
+  options={[
+    { label: "Ship the proposal: FIFO is fair, a 2-minute block is backpressure, and 200/s/key is the uniqueness fence.", feedback: "FIFO lets debug occupy K. Long block is an unbounded wait. Rate limit is admission, not (tenant, transfer_id)." },
+    { label: "Bound K from admitted λW. Priority: transfers and billed facts before debug. 429 debug and surplus. Short max.block.ms then skip analytics. Pause debug fetch and keep poll. Keep ledger uniqueness and click_id independent of the token bucket.", feedback: "Flow control bounds W and ranks classes. Correctness stays on the fence and the fact log." },
+    { label: "Open a circuit on the ledger so the FIFO can drain, and ACK transfers from the producer buffer.", feedback: "Fail-closed money is the degradation lesson. A buffer ACK is not a ledger commit." },
+    { label: "Autoscale to 50 API pods with the same unbounded FIFO and stop polling paused consumers.", feedback: "HPA during warm-up still needs K. More pods plus unbounded queues multiply orphans. Pause still needs poll." }
+  ]}
+  correct={1}
+  explanation="This lesson’s controls are bounds, 429, priority, short block timeouts, and poll-while-paused. Uniqueness and billed ids remain separate fences. Breakers and fail-closed policy stay in graceful degradation; HPA does not replace K."
+/>
+
+<InterviewAnswer>
+
+“I treat overload as surplus arrivals that must sit in a named, bounded place or be rejected. Pull when the consumer can ask—Kafka fetch, worker take—and remember pull does not cap the log. Push needs a bound: app queue depth K from admitted lambda times target W, and Kafka buffer.memory with a short max.block.ms so send() is admission, not a one-minute thread queue and not acks=all. If surplus would break the SLO I 429 or 503 with Retry-After, especially debug; I do not grow an unbounded FIFO until clients time out. Priority is TokenX transfers over debug, billed clicks over debug clicks, with per-tenant fairness so one firehose cannot occupy K. Pause stops fetch; I still poll so max.poll.interval.ms does not expire, and I shed produce or lag keeps growing. Rate limits are doors, not unique constraints: money still fails closed on (tenant, transfer_id), billed facts still need click_id. Circuit breakers and bulkhead policy live in graceful degradation; autoscaling cannot replace the bound during warm-up. I never call a full buffer exactly-once or lossless.”
+
+</InterviewAnswer>

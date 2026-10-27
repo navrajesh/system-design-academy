@@ -1,0 +1,240 @@
+---
+title: "Database Performance"
+description: "Size connection pools with Little's Law, separate lock wait from I/O wait, and cut N+1 and read amplification without treating the cache as the ledger."
+module: 4
+moduleTitle: "Performance"
+order: 5
+duration: 38
+difficulty: "Intermediate"
+tags:
+  - connection pools
+  - lock wait
+  - N+1
+  - query plans
+  - read amplification
+objectives:
+  - Size a pool from database arrival rate times connection hold time, not from API replica count
+  - Separate lock wait from I/O wait and from a sequential scan the planner chose
+  - Replace N+1 ORM access and unbounded secondary-index lookups with bounded plans
+  - Isolate TokenX ledger pools from analytics and keep Ad Click campaign caches derived
+---
+
+<BigPicture title="The database is a queue of connections, locks, and pages">
+
+Application CPU is rarely the first database bottleneck. The scarce resources are **connections**, **row locks**, **buffer-pool pages**, and **planner-chosen access paths**. Extra API replicas that share one primary add arrivals to those queues. They do not add cashiers.
+
+Index mechanics, composite keys, and write amplification of extra B-trees are taught in [Indexes and query execution](/learn/indexes-and-query-execution). This lesson stays operational: **pool sizing**, **lock wait versus I/O wait**, **EXPLAIN as a production habit**, **N+1**, **cache-aside versus the primary**, and **read amplification** from secondary indexes and log-structured merge (LSM) trees. Schemas still come from [Data modeling from access patterns](/learn/data-modeling-from-access-patterns). Cache fences live in [Caching patterns and invalidation](/learn/caching-patterns-and-invalidation). Read replicas as a scale-out pattern live in [Scaling read-heavy services](/learn/scaling-read-heavy-services). Hot-row ownership lives in [Write scaling](/learn/write-scaling). Queueing envelopes live in [Latency, throughput, and queues](/learn/latency-throughput-and-queues).
+
+**Authoritative state:** TokenX ledger plus unique `(tenant, transfer_id)`; Ad Click billed-fact log (facts may be queried via a warehouse, but invoices do not come from the ORM cache). **Derived state:** buffer cache, Redis campaign metadata, covering indexes, dashboard joins. **Consistency:** spendable reads use the ledger primary (or a named synchronous standby you are willing to block on). **Durability:** commit of the ledger transaction, not a pool checkout. **Availability:** a full pool that waits forever looks like a hang, not a 503.
+
+Planning assumptions (illustrative): TokenX **2,000** HTTP requests/s, **65%** hit the ledger, mean connection hold **12 ms** on the happy path, p95 hold **40 ms** when a celebrity account is locked. Ad Click aggregator **5,000** window-build requests/s against metadata, plus bursts of **500** click rows per task.
+
+</BigPicture>
+
+<UnderTheHood title="Pools, waits, plans, chatter, amplification">
+
+### Pool size is Little's Law on hold time, not “one per thread”
+
+Define the boundary: **connections busy in this pool**. Arrival rate is requests that **check out** a connection, not total HTTP QPS. Hold time is checkout-to-release, including SQL, client-side mapping, and idle-in-transaction.
+
+`L = λ × W`. Size ≈ `L_p95` plus headroom, capped by `max_connections` on the server **across every app, admin, and migrator**.
+
+<Calculation label="TokenX ledger pool versus whole-request in-flight">
+
+Whole path at 2,000 req/s × 80 ms end-to-end → **160** requests in flight. That is not the pool.
+
+Ledger-using rate λ = 2,000 × 0.65 = **1,300** checkouts/s.
+
+Mean hold 12 ms → L = 1,300 × 0.012 = **15.6** busy connections.
+
+If p95 hold is 40 ms and you provision for that as a sustained mean (conservative), L = 1,300 × 0.040 = **52**. A **70**-connection ledger pool has headroom; a **400**-connection pool matching in-flight HTTP will stampede `max_connections` and still wait on the same row locks.
+
+Celebrity account *A* at an offered 400 transfers/s with **15 ms** exclusive row-lock hold: service rate μ ≈ 1 / 0.015 ≈ **67** commits/s. Offered load is 400 / 67 ≈ **6×** cashier capacity, so utilization is not a stable ρ < 1. Little’s Law does not give a steady queue of `400 × 0.015 = 6` waiters; the lock queue grows until timeouts unless you shed or isolate the key. Throughput of *A* stays ~1/hold-time. Growing the pool from 70 to 200 adds places to wait, not lock throughput. See [Write scaling](/learn/write-scaling).
+
+</Calculation>
+
+**Isolate pools by workload class.** TokenX HTTP must not share the **ledger pool** with analytics `SELECT` that holds a snapshot for 800 ms. Ad Click window builders must not share the **billed-sink pool** with a debug reporter. One saturated class otherwise occupies every connection the debit path needs.
+
+Checkout must have a **timeout**. An unbounded wait converts a lock incident into a thread/async deadlock. On timeout, fail the request; do not start a second checkout for the same debit.
+
+<InteractiveCalculation mode="little-law" title="Busy connections from hold time, not from API fleet size" />
+
+### Lock wait versus I/O wait
+
+**Lock wait:** another transaction owns a row, tuple, or relation lock. CPU may be idle. `wait_event` in PostgreSQL looks like `Lock` / `tuple`. Throughput of that key is about `1 / hold time`.
+
+**I/O wait:** the engine needs pages not in the buffer pool (or a cloud volume is saturated). Same query plan, cold cache, different latency. `wait_event` looks like `DataFileRead`.
+
+They need different fixes. Lock wait: shorten transactions, index the predicate so you lock fewer rows, stop holding checkout while calling HTTP, isolate hot keys. I/O wait: buffer pool sizing, covering indexes, sequential-scan elimination, storage IOPS, vacuum/compaction. Raising `work_mem` does not unstick a row lock. Adding replicas does not unstick a write lock on the primary.
+
+Idle-in-transaction is a hybrid failure: the app checked out a connection, ran `BEGIN`, then waited on Redis or a teammate's debugger. Locks and snapshots stay open. Pool utilization looks “busy” while SQL is not running.
+
+### EXPLAIN: sequential scan versus index, estimated versus actual
+
+Treat `EXPLAIN` (and `EXPLAIN ANALYZE` in a safe environment) as an operational check, not a textbook exercise. Look at:
+
+- **Node type:** sequential scan on a 50 M-row `ledger_entries` for one `wallet_id` is a missing or unused access path.
+- **Estimated versus actual rows:** stale statistics send the planner into a nested loop that explodes.
+- **Heap fetches** after an index scan: not covering; each row may become another page read (**read amplification**).
+- **Sort / HashAggregate** spilling to disk: `work_mem` and batch shape, not “the index is broken.”
+
+Details of B-tree height and `INCLUDE` columns stay in the [indexes lesson](/learn/indexes-and-query-execution). Here the production move is: **the p99 query is the plan you have, not the index you intended.**
+
+<ExecutionTimeline
+  title="One TokenX debit checkout through lock, plan, and release"
+  steps={[
+    { title: "Checkout", detail: "The worker acquires a ledger-pool connection with a timeout. Analytics cannot steal this pool.", state: "Pool occupancy is Little's Law on hold time.", failure: "Unbounded wait; a second checkout for the same transfer; sharing the pool with a report that sequential-scans." },
+    { title: "Fence and lock", detail: "INSERT uniqueness (tenant, transfer_id) and UPDATE the account row in one transaction. Celebrity rows queue here.", state: "Authoritative mutation. Lock wait is not I/O wait.", failure: "SELECT then UPDATE without uniqueness; hold the row while calling Kafka." },
+    { title: "Plan the history read", detail: "A later wallet-history query should be an index range, not a sequential scan plus sort.", state: "Index is derived; heap and MVCC remain the row authority even on an index-only scan (visibility map).", failure: "ORM loads the whole wallet then filters in process—N+1 or a full table read." },
+    { title: "Release", detail: "COMMIT then return the connection before any extra HTTP. Idle-in-transaction ends here.", state: "Durability is the commit, not the checkout.", failure: "Leave the transaction open in a finally-less await; pool slots leak." }
+  ]}
+/>
+
+### N+1: chatty ORM, not a slow disk
+
+N+1 is one query for a parent list plus one query **per child**. The planner of each child query can be perfect. The round trips still dominate.
+
+Ad Click: load 500 billed clicks, then `GET /campaigns/{id}` or `SELECT * FROM campaigns WHERE id = ?` inside a loop. At 2 ms each, that is **1 s** of serial chatter before the window function runs. The fix is a bounded `WHERE campaign_id IN (...)` (chunked), a join, or a **cache-aside** of immutable campaign metadata with a version key—not 500 nested lazy loads.
+
+TokenX: listing 50 ledger lines then querying `users` per `actor_id` is the same bug. It is not “Postgres is slow.”
+
+### Covering indexes versus write amplification, cache-aside versus DB
+
+A **covering** index (or `INCLUDE`) removes heap fetches: **read amplification down**, **write amplification up** because every debit now maintains more bytes. That trade is worth it for wallet-history p99; it is not worth a low-selectivity boolean on every row. Do not re-teach index design here—measure whether the operational p99 is heap fetch or lock wait.
+
+**Cache-aside** belongs on **derived** reads: campaign name, creative URL, TokenX **token metadata**. Miss path is the database; stampede protection is singleflight, not a bigger pool ([Caching patterns and invalidation](/learn/caching-patterns-and-invalidation)). Spendable balances stay on the ledger checkout. A 99% hit rate that is wrong is still wrong, and a flush turns the pool into the origin.
+
+<Calculation label="Ad Click N+1 versus one indexed IN-list">
+
+500 clicks × 1 campaign lookup × 2 ms RTT = **1,000 ms** serial.
+
+One `SELECT ... WHERE id IN (…)` of 80 distinct campaign ids via primary key: a few milliseconds plus **80** buffer hits if hot.
+
+Cache-aside at 95% hit: origin rate = 5,000 window tasks/s × 0.05 = **250** metadata reads/s, not 5,000 × 80.
+
+If each miss does a nested-loop join that reads 12 LSM SSTables (illustrative read amp 12×), those 250 reads become **3,000** file touches/s. The cache did not make the LSM authoritative; it hid amplification until the flush.
+
+</Calculation>
+
+### Read amplification: secondary indexes and LSM
+
+**Secondary index in a heap table:** index leaf → heap tuple. One logical point read can be **two+ page reads**, more with MVCC visibility and wide rows.
+
+**LSM / clustered secondary:** a secondary key lookup may return a primary key, then a second search into the base SSTables. Compaction reduces future amp and costs write I/O now. Bloom filters bound negative lookups; they do not bound a hot campaign whose keys sit in many levels.
+
+Count amplification in **page reads or SSTable touches per user query**, not in “we have an index so it is O(1).”
+
+</UnderTheHood>
+
+<MentalModel title="A limited number of phone lines into a bank vault">
+
+The database is a vault with **few phone lines** (the pool). Callers who stay on the line while they chat with someone else (idle-in-transaction, N+1, HTTP inside a transaction) occupy a line. A second queue inside the vault is the **single cashier for account A** (row lock). A third delay is the clerk **walking to the archive room** (I/O wait / sequential scan / LSM levels). Photocopies of campaign posters (cache-aside) save trips for derived data; they are not the vault ledger.
+
+Retain: **size pools with λ × hold time, isolate money from reports, name lock wait versus I/O wait, fix N+1 before buying hardware, treat covering indexes and LSM levels as amplification, cache only derived reads.**
+
+</MentalModel>
+
+<ArchitectureDiagram title="Isolated pools, lock queue, plans, cache-aside, and reject paths" chart={"flowchart LR\n  APP[API workers] --> LEDP[Ledger pool]\n  APP --> ANP[Analytics pool]\n  LEDP --> LOCK[Row lock queue]\n  LOCK --> LED[(Ledger plus unique id)]\n  ANP --> PLAN[Query plan]\n  PLAN --> LED\n  APP --> ORM[ORM session]\n  ORM --> N1[N plus 1 lookups]\n  N1 --> META[(Campaign metadata)]\n  APP --> CACHE[Cache aside]\n  CACHE --> META\n  LOCK -. lock timeout reject .-> APP\n  PLAN -. async dashboard .-> DASH[Derived dashboard]\n  CACHE -. stampede miss herd .-> PLAN"}>
+
+**Authoritative state:** TokenX ledger plus uniqueness; campaign **configuration** rows for ads (not window sums). **Derived state:** analytics plans against replicas, covering indexes, Redis cache-aside, dashboard windows. **Consistency boundary:** debit checkout uses the ledger pool and commits uniqueness with the balance update; dashboard reads may be stale. Solid edges are sync checkout, lock, plan, ORM, and cache-aside fill. Dashed edges are **lock-timeout reject**, **async** dashboard projection, and a **stampede miss herd** into the planner. Recovery is fail the checkout, retry the same transfer id, rebuild dashboards from the billed-fact log, and never grow the ledger pool to absorb a sequential scan.
+
+<ArchitectureWalkthrough
+  title="Where database time actually goes"
+  stages={[
+    { name: "Pool", owner: "Per-class connection pool", state: "Checked-out sessions", boundary: "L = λ × hold time. Timeout on checkout. Isolate ledger from analytics.", failure: "One pool for HTTP, reports, and migrators; checkout wait with no deadline.", recovery: "Split pools; cap each; shed analytics first." },
+    { name: "Wait", owner: "Lock manager versus storage", state: "Row lock or page read", boundary: "Lock wait is ownership; I/O wait is cache/disk. Different fixes.", failure: "Add replicas for write lock wait; raise pool during a lock storm.", recovery: "Shorten transactions; measure wait_event; index the predicate." },
+    { name: "Plan", owner: "Optimizer plus statistics", state: "Seq scan, index, nested loop", boundary: "Estimated versus actual rows. Covering index cuts heap fetches and adds write amp.", failure: "Trust the index name; ignore EXPLAIN; N+1 lazy loads.", recovery: "Fix the access path; batch IN-lists; ANALYZE after skew." },
+    { name: "Cache", owner: "Application cache-aside", state: "Derived campaign or metadata copy", boundary: "Misses become pool load. Not spendable money.", failure: "Cache balances; flush without singleflight.", recovery: "Versioned derived keys; keep ledger reads on the ledger pool." }
+  ]}
+/>
+
+</ArchitectureDiagram>
+
+<RealExamples title="TokenX isolates the ledger pool; Ad Click kills campaign N+1">
+
+**TokenX.** Two pools: **ledger** (small, low timeout, no sequential scans allowed) and **replica-analytics** (larger hold time, admission-controlled). Debit: checkout ledger, insert `(tenant, transfer_id)`, update balance, commit, release—**then** produce outbox. History pagination uses the covering access path from the indexes lesson; if EXPLAIN shows a sequential scan, that is an incident, not a cache miss. Celebrity account lock wait is visible as `Lock` wait_event while CPU is idle; operators must not scale the API HPA on CPU. Cache token **metadata** only.
+
+**Ad Click Aggregator.** Window builders must not N+1 campaign rows for each click. Distinct `campaign_id` set → one indexed read or a cache-aside with TTL jitter. Billed facts remain the log; the aggregator database is a **sink** with its own pool, isolated from debug queries. A viral campaign that turns a nested-loop join into a sequential scan on facts is a plan problem plus skew, not a reason to cache invoice totals as authority. If the sink is LSM-backed, budget read amplification on the campaign-secondary index after compaction falls behind.
+
+<FailureScenario
+  title="Pick the database wait and name the fix"
+  prompt="p99 TokenX debit jumps from 25 ms to 900 ms. CPU on APIs is 20%. Choose the failure."
+  choices={[
+    { label: "Ledger pool 400, shared with a nightly report sequential-scanning ledger_entries", impact: "Debits wait for checkouts held 800 ms by the report. Little's Law on the shared pool, not missing indexes on the debit path.", recovery: "Split pools; kill the report's primary access; timeout checkout." },
+    { label: "Celebrity row lock 15 ms hold, 400 transfers/s, pool raised from 70 to 200", impact: "Lock waiters grow. Throughput of A stays ~1/hold. Extra connections pile on the same cashier.", recovery: "Keep the small pool; isolate the hot account; shorten the transaction; do not HPA the API." },
+    { label: "ORM lists 50 transfers then queries actor profiles once each, plus gzip on the JSON", impact: "N+1 round trips dominate. gzip is unrelated. Disk I/O wait may be low.", recovery: "Join or IN-list; cache derived profiles; leave the ledger query as one range scan." },
+    { label: "Cache-aside spendable balance with 50 ms TTL, then EXPLAIN was never checked", impact: "Wrong balances under retry; cache stampede on expiry still hits the primary. The missing sequential-scan diagnosis is still missing.", recovery: "Read spendable balances from the ledger; cache only metadata; fix the plan." }
+  ]}
+/>
+
+</RealExamples>
+
+<InterviewTraps title="Database-performance slogans that fail at IC6">
+
+- **“Set pool size to number of API threads.”** Size λ × hold time, then cap by server `max_connections`.
+- **“p99 is I/O, buy a bigger disk.”** Check `wait_event`. Lock wait and N+1 fake a storage story.
+- **“We have an index, so EXPLAIN is optional.”** The planner may still sequential-scan with stale stats or a non-leftmost predicate.
+- **“N+1 is fine in a VPC.”** 500 × 2 ms is still a second. Latency is not a bandwidth coupon.
+- **“Covering indexes are free reads.”** They tax every write. Count write amplification.
+- **“Cache the ledger; the pool is the problem.”** The pool is scarce because the working set and locks are. Spendable state stays authoritative.
+- **“LSM is O(1) point lookup.”** Amplification is SSTables and levels, especially on secondary keys.
+- **“Raise max_connections to 5,000.”** Each session has memory. You moved the queue into the engine.
+- **“Read replicas fix lock wait on UPDATE.”** Replicas do not take the primary's write lock.
+
+</InterviewTraps>
+
+<Tradeoffs title="What you spend to make the primary fast">
+
+- **Small isolated ledger pool versus convenience:** isolation protects debit checkout and forces analytics onto replicas or batch windows. Two pools are operational complexity.
+- **Checkout timeout versus patience:** timeouts shed work and surface incidents; too-tight timeouts retry-storm the lock they already lost.
+- **Covering index versus write amplification:** wallet-history p99 versus extra bytes on every debit.
+- **Cache-aside versus always hitting the DB:** origin offload for derived metadata versus stampede, skew, and forbidden balance caching.
+- **Batch IN-list / join versus ORM convenience:** fewer round trips versus loading graphs the product does not need.
+- **Buffer-pool / compaction spend versus replica-read offload:** I/O wait and LSM amp are storage-engine knobs; they do not replace access-path design.
+
+Correctness of TokenX balances is not a pool-size knob. Dashboard freshness is.
+
+</Tradeoffs>
+
+<KnowledgeCheck
+  question="TokenX runs 2,000 req/s, 65% use the ledger, mean hold 12 ms. Someone sets the ledger pool to 400 because 2,000 × 0.2 s end-to-end says 400 in flight. What is wrong?"
+  options={[
+    "Nothing; Little's Law always uses end-to-end latency for every pool",
+    "The pool boundary is checkout hold time: L ≈ 1,300 × 0.012 ≈ 16 busy connections; 400 sessions mostly increase engine memory and lock waiters",
+    "The pool should equal max_connections on the replica, not the primary",
+    "Hold time is TLS handshake, so the pool should be 2,000"
+  ]}
+  correct={1}
+  explanation="Apply Little's Law to the named boundary. Database concurrency is arrival-to-the-pool times checkout duration. End-to-end in-flight includes queues that do not hold a session."
+/>
+
+<KnowledgeCheck
+  question="An Ad Click window job loads 500 clicks then lazy-loads each campaign row. EXPLAIN on each child lookup is an index-only primary-key hit. p99 is still ~1 s. What should change first?"
+  options={[
+    "Raise the aggregator connection pool so 500 lookups can run at once",
+    "Switch the billed-fact log to gzip so each lookup returns fewer bytes",
+    "Replace the N+1 loop with a bounded IN-list or join (and optional cache-aside of derived campaign metadata); do not treat per-query EXPLAIN as the end-to-end plan",
+    "Cache spendable TokenX balances on the same Redis so the aggregator pool is free"
+  ]}
+  correct={2}
+  explanation="Each child plan can be optimal while round trips dominate. Pool fan-out turns N+1 into a connection storm. Codecs and TokenX caches are the wrong layer."
+/>
+
+<ScenarioCheck
+  scenario="Debit p99 is 900 ms. API CPU is 18%. The ledger pool is shared with a BI tool. wait_event on debit sessions is mostly Lock on one treasury account; the BI session shows DataFileRead on a sequential scan of ledger_entries. An aggregator task still N+1s campaign metadata. A proposal: set max_connections=4,000, cache balances in Redis for 50 ms, and add three read replicas for writes."
+  question="What is the defensible operational fix?"
+  options={[
+    { label: "Accept the proposal: replicas will take the UPDATE locks and Redis will hide the sequential scan.", feedback: "Replicas do not own primary write locks. Cached balances are not the ledger. The scan still occupies shared pool slots if BI stays on the primary." },
+    { label: "Split ledger versus analytics pools with checkout timeouts; keep celebrity-row ownership on the primary; fix BI off the primary; batch campaign lookups; never cache spendable balances.", feedback: "Isolated pools, named waits, N+1 fix, and authority stay in the right stores." },
+    { label: "Raise the shared pool to 4,000 so Little's Law is satisfied for 900 ms holds.", feedback: "That provisions waiters. It does not create lock capacity or stop the sequential scan." },
+    { label: "Disable EXPLAIN ANALYZE in production forever because it is dangerous, and rely on the cache hit rate as the only SLO.", feedback: "You still need plans from a safe environment and wait_event from production. Hit rate is not a debit SLO." }
+  ]}
+  correct={1}
+  explanation="Separate the wait types, isolate the money pool, move the sequential scan off the primary, and kill N+1. Replicas, giant pools, and balance caches do not unlock a hot row."
+/>
+
+<InterviewAnswer>
+
+“I size database pools with Little's Law on the checkout boundary: arrival rate of queries that actually hold a connection times hold time, plus headroom, capped by the server’s max_connections. TokenX keeps a small ledger pool isolated from analytics so a sequential scan cannot occupy debit slots, and checkout has a timeout. I split lock wait from I/O wait: a celebrity account is one cashier, so extra connections and extra API replicas only lengthen the lock queue; I/O wait wants plans, covering indexes, and buffer hits. I read EXPLAIN for the p99 query—estimated versus actual rows, seq scan versus index, heap fetches as read amplification. N+1 is a round-trip bug even when each child index looks perfect; Ad Click campaign metadata gets one IN-list or a derived cache-aside, never a loop. LSM and secondary indexes multiply page touches; I count them. I never cache spendable balances. Durability is the ledger commit with (tenant, transfer_id), not a pool checkout or a Redis TTL.”
+
+</InterviewAnswer>

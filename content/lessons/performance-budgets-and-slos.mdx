@@ -1,0 +1,246 @@
+---
+title: "Performance Budgets and SLOs"
+description: "Decompose latency across hops, choose percentiles over averages, and burn error budget on purpose instead of paging on CPU."
+module: 4
+moduleTitle: "Performance"
+order: 2
+duration: 38
+difficulty: "Intermediate"
+tags:
+  - SLOs
+  - error budgets
+  - percentiles
+  - latency budgets
+  - burn rate
+objectives:
+  - Separate SLI, SLO, and SLA, and pick availability versus latency targets from the invariant at risk
+  - Decompose a user-visible p99 budget across mesh, API, cache, ledger, and Kafka hops with named owners
+  - Size an error budget and multi-window burn-rate alert instead of paging on raw CPU
+  - Detect SLO gaming that hides tails, excludes the money path, or treats dashboards as billed facts
+---
+
+<BigPicture title="An SLO is a budget with an owner, not a dashboard average">
+
+A **service-level indicator (SLI)** is a measured ratio: good events over valid events in a named window. A **service-level objective (SLO)** is the target you are willing to miss some of the time. A **service-level agreement (SLA)** is the contractual consequence of missing a (usually looser) target: credits, penalties, a page to legal. Interviews collapse the three into “we are 99.9%.” IC6 names the event, the window, the percentile, and who spends the miss.
+
+Two SLOs that are not interchangeable:
+
+- **Availability SLO:** fraction of *valid* requests that succeed inside the contract (HTTP 2xx/4xx-as-client, or “billed fact appended”). TokenX fail-closed on the ledger is *allowed* to burn this budget; forging a 200 from cache is not.
+- **Latency SLO:** fraction of those successful (or all valid) requests whose end-to-end time is under a threshold, usually a **percentile**, not a mean. TokenX transfer **p99** is a latency budget. Ad Click **ingest availability** is “can the collector still ACK after the billed-fact log,” not “is the 1-minute dashboard fresh.”
+
+Queueing and utilization math live in [Latency, throughput, and queues](/learn/latency-throughput-and-queues). This lesson spends the leftover milliseconds and the leftover error budget. What you shed when the budget is gone is [Graceful degradation](/learn/graceful-degradation). What you scale when the budget is burning is [Autoscaling and capacity planning](/learn/autoscaling-and-capacity-planning). Extra hops and regions spend the same budget: [Fan-out architectures](/learn/fan-out-architectures), [Multi-region design](/learn/multi-region-design), [Networking for system design](/learn/networking-for-system-design).
+
+**Authoritative versus derived:** TokenX spendable money is the ledger plus unique `(tenant, transfer_id)`. Ad Click invoices reconstruct from the **billed-fact log**. Caches, traces, SLO burn charts, and campaign windows are **derived**. An SLO that only measures the cache hop is measuring a photocopy.
+
+</BigPicture>
+
+<UnderTheHood title="Percentiles, hop budgets, error budget, then who pages">
+
+### SLI, SLO, SLA on a named event
+
+Pick the **event** first. TokenX: “client received a transfer response after uniqueness plus ledger commit.” That excludes health checks, admin exports, and analytics produce. Ad Click: “SDK received ACK after the billed-fact batch was on the durable log.” Window sums and unique-user dashboards are out of that SLI.
+
+**Request-based** SLIs (good requests / valid requests) match APIs. **Time-based** SLIs (good minutes / minutes) match “the ledger primary was reachable.” Mixing them hides different incidents: a request-based SLI can hide a quiet 10-minute outage inside a high-QPS afternoon of successes; a time-based SLI can hide a high-QPS brownout inside a still-green minute.
+
+The SLA is looser than the SLO on purpose. If the product SLO is 99.9% and the customer contract is 99.5%, the gap is **internal** budget you can spend on deploys and experiments. Do not promise the SLO in a contract you cannot measure at the same hop.
+
+### Averages hide tails; p50 is not p99 is not p999
+
+Assumptions (illustrative, not a measured TokenX cluster): 2,000 transfer responses/s. In a 60 s window that is 120,000 samples.
+
+- **p50:** half of samples are faster. Planning a pool from p50 under-sizes lock wait.
+- **p95:** 1 in 20 is slower. A profile page that fans out to 8 backends, each independently at p95, sees at least one slow child on `1 - 0.95^8 ≈ 34%` of page loads.
+- **p99:** 1 in 100. At 2,000/s that is **20 slow transfers every second**.
+- **p999:** 1 in 1,000. Two slow transfers per second, often GC, a lock convoy, or a cross-AZ retry. Means still look green.
+
+A mean of 45 ms with p99 of 280 ms and p999 of 1.8 s is a tail problem. Reporting only the mean is how you pass a dashboard review and fail checkout.
+
+<Calculation label="p99 hop budget versus a sync Kafka hop">
+
+TokenX user-visible SLO (illustrative): p99 end-to-end ≤ 300 ms for committed transfers. Availability SLO: 99.9% of valid transfer attempts succeed (commit or a correct 4xx), rolling 30 days.
+
+Hop budgets that must sum **on the sync path** (owners in parentheses):
+
+- Mesh sidecar + LB: 15 ms (platform)
+- API parse, auth, business logic: 25 ms (transfer team)
+- Derived token-metadata cache: 10 ms on hit (cache owners). Misses must still fit the remainder or fail the cache hop closed for metadata only.
+- Uniqueness insert + ledger row: 80 ms p99 including lock wait (ledger owners)
+- Serialization and client RTT inside the region: 40 ms ([Networking for system design](/learn/networking-for-system-design))
+
+Sum so far: 15 + 25 + 10 + 80 + 40 = 170 ms. Slack to 300 ms: 130 ms for retries, GC, and one extra mesh hop. That slack is the **budget**, not free space for a new feature.
+
+If analytics `produce()` sits on the **sync** path with a 180 ms hop budget, allocated hop budgets sum to 350 ms and already exceed the 300 ms SLO **before** a real incident. (Summing hop p99s is a **budget** argument, not a statistical claim that path p99 equals the sum of child p99s.) Analytics Kafka is a **derived, asynchronous** hop. It does not get a slice of the 300 ms transfer budget. Ad Click collector ACK **does** include the billed-fact append; dashboard window apply does **not**.
+
+Fan-out: eight parallel metadata reads each budgeted 40 ms p99 still make the parent wait for the slowest child. Hedging and partial results belong in a later tail-latency lesson; here, **do not give eight children 40 ms each and claim the parent still has 40 ms**.
+
+</Calculation>
+
+### Error budget and burn rate
+
+**Error budget** is `1 - SLO` in the same units as the SLI.
+
+Time-based 99.9% over 30 days: allowed unavailability = `0.001 × 30 × 24 × 60 = 43.2 minutes`. That is not “43 minutes the ledger may lose money.” It is 43 minutes of **failed valid events** (timeouts, 5xx, fail-closed rejects). Fail-closed TokenX still burns availability budget; it must **not** burn correctness.
+
+Request-based at 2,000 valid transfers/s, 30-day window: `2,000 /s × 86,400 s/day × 30 days = 5.184 × 10^9` valid events. Budget at 99.9%: `0.001 × 5.184 × 10^9 ≈ 5.18 million` bad events. A 10-minute total outage at full QPS burns `2,000 × 600 = 1.2 million` events ≈ **23% of the monthly budget**.
+
+**Burn rate** is how fast you spend that budget relative to a perfectly even spend. Even spend of a 30-day budget is 1×. If the current error ratio is 1% against a 0.1% allowance, burn rate = `1% / 0.1% = 10×`. At 10× you exhaust a 30-day budget in 3 days.
+
+Page on **multi-window burn**, not on a raw counter:
+
+- Fast window: **2% of budget in 1 hour** ≈ 14× on a 30-day SLO (1 hour is `1/720` of 30 days; `0.02 / (1/720) = 14.4`). Page immediately. Something is on fire.
+- Slow window: **10% of budget in 6 hours** ≈ 12× sustained. Page with more evidence; a flap may already have recovered.
+
+Do **not** page on CPU at 70%. CPU is a **lagging** capacity signal ([Autoscaling and capacity planning](/learn/autoscaling-and-capacity-planning)). A JVM can sit at 35% CPU while p99 lock wait burns the 80 ms ledger hop and the error budget.
+
+<ExecutionTimeline
+  title="A TokenX p99 miss that should page on burn, not CPU"
+  steps={[
+    { title: "Measure", detail: "SLI is user-visible transfer time after ledger commit. Health checks and analytics produce are excluded. p50 is 40 ms; p99 is 310 ms against a 300 ms SLO.", state: "Derived dashboards still show mean 45 ms and CPU 32%.", failure: "Including health checks dilutes the SLI so the money path can miss while the ratio stays green." },
+    { title: "Decompose", detail: "Trace the 310 ms: mesh 12 ms, API 20 ms, cache hit 8 ms, ledger lock wait 190 ms, RTT 40 ms. Kafka produce is async and not on this trace.", state: "Authoritative hop owns the miss. Derived Kafka lag is a different SLO.", failure: "Blaming Kafka analytics and tightening produce timeouts on the debit path." },
+    { title: "Burn", detail: "For 70 minutes, 8% of valid transfers exceed 300 ms. Fast-window burn crosses 2% of monthly budget. The page fires.", state: "Error budget is a remaining quantity. CPU never crossed 50%.", failure: "Paging on CPU would have stayed silent; paging on 5xx only would miss latency-SLO burn." },
+    { title: "Spend or stop", detail: "If budget remains, freeze deploys and isolate the celebrity account. If budget is gone, shed derived work and fail closed on new optional features—not on uniqueness.", state: "Ledger plus (tenant, transfer_id) stays authoritative. Dashboards may go stale by policy.", failure: "Gaming the SLO by dropping slow clients or excluding the region that is on fire." }
+  ]}
+/>
+
+### Ownership of each hop
+
+A latency budget without an owner is a wish. Write the remaining milliseconds on the ticket:
+
+- **Product / API owner:** user-visible SLO and whether a miss is latency or availability.
+- **Mesh / platform:** sidecar, ingress, mTLS. They cannot “take” 80 ms of a 300 ms budget because a new filter is convenient.
+- **Ledger / DBA:** lock wait, fsync, connection-pool acquire. This is the TokenX money hop.
+- **Cache owners:** hit-path microseconds and **stampede** on miss. Metadata only; not spendable balances.
+- **Kafka owners:** produce/consume **if that hop is in the SLI**. For TokenX transfers it is not. For Ad Click **ingest ACK** the billed-fact append **is** in the SLI; window consumers are a separate freshness SLO.
+
+Cross-region: one extra RTT can be 60–80 ms in-region-pair and 150 ms+ across oceans. That hop must be in the budget **before** you draw a second region ([Multi-region design](/learn/multi-region-design)). Fan-out multiplies tail risk, not averages ([Fan-out architectures](/learn/fan-out-architectures)).
+
+### Goodharting: when the SLO becomes the enemy
+
+People optimize the number you page on:
+
+- **Exclude the slow class:** drop “known slow” celebrity-account transfers from the SLI.
+- **Success-only latency:** compute p99 only on HTTP 200 so timeouts disappear from the latency SLO (they should burn **availability** or a combined “good-and-fast” SLI).
+- **Health-check padding:** 1,000 fast `/health` probes per second drown 2,000 real transfers.
+- **Cache-only SLI:** measure gateway-to-cache, never gateway-to-ledger.
+- **Dashboard as ingest:** Ad Click “availability” measured as “window table updated in 60 s” while the billed-fact log is falling behind.
+- **Mean substitution:** replace p99 with average after a complaint that p99 is “noisy.”
+- **Retry amplification hidden:** client retries turn one slow call into three; you count one success and hide two timeouts if the SLI is not attempt-based.
+
+A **good-and-fast** SLI (proportion of valid events that both succeed **and** finish under the threshold) is harder to game than separate charts that you can trade against each other.
+
+</UnderTheHood>
+
+<MentalModel title="A monthly fuel tank, hop-sized fuel cans, a speed camera on the tail">
+
+Think of a ferry with a **monthly fuel tank** (error budget). The timetable is the SLO; the ticket refund policy is the SLA. Each engine room—mesh, API, ledger, billed-fact log—gets a **labeled fuel can**. If analytics wants a ride, it brings its **own** tank; it does not siphon the ledger can.
+
+The captain does not watch how hot the engine *feels* (CPU). They watch **how fast the tank is emptying** (burn rate) and **how late the slowest 1 in 100 passengers** is (p99), not the average boarding time. A photographer on the dock (derived dashboard) can be late without delaying the ferry. Forging a “departed” stamp when the vault is still closed is fraud, not availability.
+
+Retain: **name the event, give each sync hop a budget and an owner, page on burn of a percentile SLO, and never let a derived path spend the money hop.**
+
+</MentalModel>
+
+<ArchitectureDiagram title="Sync hop budgets, async derived hops, and burn-rate paging" chart={"flowchart LR\n  CLI[Clients] --> MESH[Mesh hop]\n  MESH --> API[API hop]\n  API --> CACHE[(Derived cache)]\n  API --> LED[(Authoritative ledger)]\n  COL[Collectors] --> FACT[(Billed fact log)]\n  LED --> SLO[User-visible SLO]\n  FACT --> SLO\n  SLO --> BUD[Error budget]\n  BUD --> ALR[Burn-rate page]\n  MESH -. deadline timeout .-> CLI\n  API -. analytics async .-> KFK[(Kafka analytics)]\n  FACT -. window async .-> DASH[(Derived dashboard)]\n  ALR -. shed optional hops .-> KFK"}>
+
+**Authoritative state:** TokenX uniqueness `(tenant, transfer_id)` plus ledger rows, and the Ad Click billed-fact log until retention. **Derived state:** token-metadata cache, Kafka analytics, window aggregators, dashboards, and the SLO burn chart itself. **Consistency boundary:** a transfer is good for the latency/availability SLI only after the ledger transaction commits; a collector ACK is good only after billed facts are on the log. Mesh, API, cache-hit, and ledger hops on the TokenX **sync** path share the p99 budget. Analytics produce and window apply are **async** and must not steal that budget. Solid edges are the success path that can pass the SLI. Dashed edges are deadline timeout (availability burn), async derived hops, and shedding optional Kafka work when burn-rate pages fire. Recovery is spend remaining budget on a freeze and a hop fix, rebuild dashboards from the fact log, and fail closed on money rather than game the SLI.
+
+<ArchitectureWalkthrough
+  title="Who may spend each millisecond and each failed event"
+  stages={[
+    { name: "Admit", owner: "Mesh plus product SLO", state: "Deadline, valid-event filter, hop timer start", boundary: "Health checks are not valid transfer events. Timeouts burn availability.", failure: "Padding the SLI with probes, or a mesh hop that silently consumes 80 ms.", recovery: "Exclude probes; cap the mesh can; 429 with retry-after under overload." },
+    { name: "Sync hops", owner: "API, cache, ledger", state: "Remaining p99 budget after mesh and RTT", boundary: "Cache is metadata. Ledger plus unique id is money. Owners cannot steal another hop's can.", failure: "Sync Kafka produce on the debit path; serving spendable balances from cache.", recovery: "Move analytics async; ACK money only after ledger commit." },
+    { name: "Ads ingest", owner: "Collector plus log", state: "Billed-fact append in the ACK SLI", boundary: "Window sums are a separate freshness SLO, not ingest availability.", failure: "Calling the dashboard lag the ingest SLO; ACK before the log.", recovery: "Keep ACK after durable append; page ingest burn separately from window delay." },
+    { name: "Burn", owner: "SRE plus service owner", state: "Error budget remaining, multi-window burn rate", boundary: "Pages fire on budget velocity, not CPU. SLA is the looser contract.", failure: "Goodharting: success-only p99, excluded regions, mean substitution.", recovery: "Use good-and-fast SLIs; restore excluded classes; freeze deploys when budget is gone." }
+  ]}
+/>
+
+</ArchitectureDiagram>
+
+<RealExamples title="TokenX spends a p99 can; Ad Click spends an ingest-availability can">
+
+**TokenX.** Illustrative SLO: 99.9% of valid transfers both **commit** (or correctly reject) **and** finish in 300 ms p99, 30-day request-based window. The uniqueness store and ledger primary are the money hops. Analytics produce, receipt email, and the public price ticker are derived: skip them under [Graceful degradation](/learn/graceful-degradation) when burn rate is high. A celebrity treasury account that holds a row 190 ms does not get excluded from the SLI; it **is** the incident. Adding API replicas because CPU is low is the wrong lever ([Write scaling](/learn/write-scaling) is ownership; this lesson is the budget those owners must fit). Cross-AZ failover that adds 70 ms RTT must be subtracted from slack **before** you call failover “safe”; the durability boundary is still the ledger commit, not the mesh retry.
+
+**Ad Click Aggregator.** Split the SLOs. **Ingest availability:** 99.95% of billed batches ACK after the fact log within 2 s (illustrative). Collectors may linger 20 ms; that linger is inside the 2 s can, not inside TokenX’s 300 ms can. **Freshness SLO** on the 1-minute window is looser (for example 99% of windows closed within 90 s) and **must not** be the number finance uses. If a viral campaign burns ingest budget, sample **debug** fields and pause debug partitions; do not drop billed facts to make a dashboard SLO look healthy. Window lag is derived delay. Lost unlogged clicks are an ingest-availability incident with a durability hole.
+
+<FailureScenario
+  title="Pick the SLO failure and name what burned"
+  prompt="TokenX p99 is 310 ms. Ad Click dashboards are 12 minutes late. API CPU is 28%. One engineer wants to exclude lock-wait transfers from the SLI."
+  choices={[
+    { label: "Page on CPU once it hits 70%, then add APIs", impact: "Nobody pages. Ledger lock wait keeps burning the 80 ms hop. Extra APIs lengthen the lock queue.", recovery: "Page on multi-window SLO burn. Fix the hop owner (hot key, query, pool). Do not HPA into a row lock." },
+    { label: "Exclude celebrity-account transfers so p99 returns to 120 ms", impact: "The SLO is gamed. Real checkout still misses. Error budget looks full while users fail.", recovery: "Keep the class in the SLI. Isolate the hot key. Spend budget on a freeze, not on a filter." },
+    { label: "Treat 12-minute window lag as ingest unavailability and drop billed produce to catch up", impact: "Dashboards recover. Invoice identity stops arriving. You burned the wrong SLO and the fact log.", recovery: "Separate freshness from ingest. ACK after the log. Rebuild windows from facts; sample debug only." },
+    { label: "Put Kafka analytics produce on the TokenX sync path so one trace owns all hops", impact: "p99 jumps by the produce tail. Transfers fail when Kafka is slow. Money and derived state are coupled.", recovery: "Outbox or async produce. Transfer SLI stops at ledger commit. Kafka gets its own derived SLO." }
+  ]}
+/>
+
+</RealExamples>
+
+<InterviewTraps title="SLO slogans that fail at IC6">
+
+- **“We are 99.9% available.”** Of what event, in what window, request-based or time-based, excluding which errors?
+- **“Average latency is 40 ms so we will hit p99 100 ms.”** Percentiles are not a fixed multiple of the mean. Tails are lock wait, GC, and fan-out.
+- **“p50 is the user experience.”** Half the users are slower than p50. Product pain is p95/p99, and fan-out makes it worse.
+- **“SLA and SLO are the same number.”** The SLA is the contract. The SLO is stricter so you have budget to spend.
+- **“Alert on CPU and disk; SLOs are for quarterly reviews.”** CPU does not spend the user-visible budget. Burn rate does.
+- **“If we time out at 280 ms, p99 stays under 300 ms.”** You converted a latency miss into an availability miss—or you dropped it from both if you measure success-only latency.
+- **“Exactly-once transfers because the SLO is 99.9%.”** An SLO is not a consistency protocol. Effect-once still needs the unique `(tenant, transfer_id)` boundary.
+- **“Multi-region makes failover free.”** Extra RTT and replication lag spend the latency budget. Failover is not linearizable unless you name the consensus boundary.
+- **“Dashboard lag means ingest is down.”** Derived windows can lag while the billed-fact log is healthy—or the reverse if you ACK from memory.
+
+</InterviewTraps>
+
+<Tradeoffs title="What you spend when you pick the number">
+
+- **Tight p99 versus cost:** 300 ms p99 needs headroom, shorter batches, and maybe extra AZ-local capacity. A 2 s Ad Click ACK is cheaper and still honest for ingest.
+- **Request-based versus time-based:** request-based weights busy hours; a quiet 3 a.m. outage barely burns it. Time-based treats every minute equally and can hide a high-QPS brownout.
+- **Separate latency and availability versus good-and-fast:** separate charts are easier to game; combined SLIs are noisier and more honest.
+- **Fast burn pages versus alert fatigue:** 2% in 1 hour catches fires and also catches a bad deploy you already reverted. Tune the slow window rather than deleting the fast one.
+- **Including retries in the SLI versus counting unique users:** attempt-based catches amplification; user-based hides client storms.
+- **Sync derived hops versus async:** putting Kafka on the money path simplifies tracing and couples failure domains.
+
+Do not trade TokenX uniqueness or billed-fact durability for a greener SLO tile. Trade dashboard freshness and debug completeness first.
+
+</Tradeoffs>
+
+<KnowledgeCheck
+  question="TokenX p99 is 300 ms. Mesh 15 ms, API 25 ms, cache 10 ms, ledger 80 ms, RTT 40 ms. An engineer adds a synchronous analytics produce with p99 180 ms. What happened to the budget?"
+  options={[
+    "Nothing: Kafka is always asynchronous by definition, so the 180 ms cannot land on the transfer SLI",
+    "Allocated hop budgets now sum to 350 ms, so the 300 ms SLO is already lost and analytics stole the ledger slack",
+    "p50 will absorb the produce time because averages hide tails, so the SLO is unchanged",
+    "The produce hop is fine if the billed-fact log is the TokenX money authority"
+  ]}
+  correct={1}
+  explanation="Budgets add on the synchronous path. 170 ms of existing hops plus 180 ms produce exceeds 300 ms. Kafka analytics is derived and must not sit on the debit ACK. The ledger remains the money authority, not the fact log."
+/>
+
+<KnowledgeCheck
+  question="A 30-day 99.9% SLO has a 43.2-minute time-based budget. In one hour you accumulate the equivalent of 2% of that budget as failed valid transfers. CPU is 30%. What should page?"
+  options={[
+    "Nothing until CPU exceeds 70%, because utilization is the leading SRE signal",
+    "A disk-full alert on the dashboard warehouse, because derived lag equals ingest failure",
+    "The fast burn-rate window: 2% of monthly budget in 1 hour is about 14× even spend and is a fire",
+    "A success-only p99 chart after dropping timed-out clients so the latency SLO stays green"
+  ]}
+  correct={2}
+  explanation="Burn rate is error-budget velocity. 2% in one hour of a 30-day budget is far above 1×. CPU can be idle while lock wait and timeouts spend the SLO. Dropping timeouts is Goodharting, not recovery."
+/>
+
+<ScenarioCheck
+  scenario="TokenX CPU is 28%, mean latency 45 ms, p99 310 ms on a 300 ms SLO. A celebrity account holds the ledger row. Ad Click 1-minute windows are 12 minutes late, but collectors still ACK after the billed-fact log. An engineer proposes: exclude lock-wait transfers from the SLI, page only on CPU, and declare ingest down because the dashboard is late."
+  question="What policy preserves money, invoices, and an honest budget?"
+  options={[
+    { label: "Ship the exclusions and CPU pages: the mean is healthy, and lock wait is an outlier class.", feedback: "Excluding the hot key games the SLO. CPU will not page. Checkout still misses." },
+    { label: "Keep lock-wait transfers in a good-and-fast SLI, page on multi-window burn, keep TokenX ACK on ledger commit, and treat window lag as a separate derived freshness SLO while ingest ACK stays on the fact log.", feedback: "Honest event, hop ownership, burn-rate paging, authoritative versus derived SLOs." },
+    { label: "Move TokenX ACK to the metadata cache so p99 drops below 50 ms, and drop billed produce until windows catch up.", feedback: "Cache ACK forges money. Dropping billed facts burns ingest durability to save a derived view." },
+    { label: "Tighten the SLA to 99.99% in the customer contract so the internal SLO has more slack.", feedback: "The SLA should be looser than the SLO, not tighter. A contract does not fix lock wait." }
+  ]}
+  correct={1}
+  explanation="The SLO event stays user-visible money and billed-fact ACK. Tails stay in the SLI. Burn rate pages. Dashboards are derived. CPU and SLA wording do not move the ledger or the log."
+/>
+
+<InterviewAnswer>
+
+“I start from the event, not the tile. An SLI is good over valid in a named window; the SLO is the target; the SLA is the looser contract. TokenX uses a good-and-fast transfer SLI after uniqueness plus ledger commit—illustrative 99.9% and p99 300 milliseconds. I decompose that 300 milliseconds across mesh, API, metadata cache, ledger lock wait, and RTT, each with an owner. Analytics Kafka is asynchronous and does not sit on the debit path. Ads split ingest availability—ACK after the billed-fact log—from dashboard freshness, which is derived. Averages hide tails; p99 and p999 are where lock wait and fan-out show up. Error budget is one minus the SLO. I page on burn rate, for example two percent of monthly budget in an hour, not on CPU. When budget is gone I freeze deploys and shed derived work; I do not exclude the slow account, drop timeouts from the chart, or fail-open money from a cache. Extra regions and fan-out spend the same hop cans. Exactly-once is still the unique transfer id, not the SLO percentage.”
+
+</InterviewAnswer>
