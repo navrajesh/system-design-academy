@@ -14,9 +14,9 @@ relatedSlugs:
 
 Amazon DynamoDB is a managed **partitioned item store**. On the explorer it is a **selectable alternative primary**, not a replica of PostgreSQL and not a cache. You model access patterns first: partition key, sort key, and GSIs. See <LessonCrossLink slug="data-modeling-from-access-patterns" />.
 
-**Default reads are eventually consistent.** They can return stale item versions after a write. **Strongly consistent reads** (`ConsistentRead=true`) are a same-region quorum read of the latest committed item on that replica set. They are **not** cluster-wide linearizability, **not** serializability of unrelated items, and **not** a global order across regions.
+**Default reads are eventually consistent.** They can return stale item versions after a write. **Strongly consistent reads** (`ConsistentRead=true`) return the latest committed version of that item in one region. They are **not** a Cassandra-style `R+W>N` quorum, **not** cluster-wide linearizability, **not** serializability of unrelated items, and **not** a global order across regions.
 
-Global tables replicate asynchronously and resolve with **last-writer-wins** (timestamp). That is a poor default for TokenX balances. Use DynamoDB when the product invariant fits a key-value item plus conditional writes. Use PostgreSQL when you need SQL constraints and multi-row transactions in one database. Selection lesson: <LessonCrossLink slug="relational-vs-nosql-selection" />. Consistency vocabulary: <LessonCrossLink slug="cap-and-consistency-models" />.
+Default **global tables** replicate asynchronously and resolve with **last-writer-wins** (timestamp). Multi-Region strong consistency is a named table setting, not the default, and is still not a TokenX design by itself. LWW global tables are a poor default for TokenX balances. Use DynamoDB when the product invariant fits a key-value item plus conditional writes. Use PostgreSQL when you need SQL constraints and multi-row transactions in one database. Selection lesson: <LessonCrossLink slug="relational-vs-nosql-selection" />. Consistency vocabulary: <LessonCrossLink slug="cap-and-consistency-models" />.
 
 </LibraryBigPicture>
 
@@ -31,7 +31,7 @@ Secondary indexes are **derived**. GSI writes are eventually consistent with the
 ### Reads
 
 - **Eventual (default):** may miss a write that already returned HTTP 200. Fine for many dashboards.
-- **Strongly consistent:** same region, current quorum; higher RCU cost; still not a transaction across items unless you use TransactGetItems. Multi-region strong reads are not this API.
+- **Strongly consistent:** same region, latest committed item; higher RCU cost; still not a transaction across items unless you use TransactGetItems. Multi-region strong reads are not this `GetItem` API.
 
 ### Writes
 
@@ -44,7 +44,7 @@ Streams/CDC are **async** derived logs of committed item changes.
   steps={[
     { title: "Condition write", detail: "PutItem reservation where attribute_not_exists(transfer_id). Occupancy is this condition, not a SQL UNIQUE across arbitrary rows.", state: "Authoritative item if the write is accepted.", failure: "Read then write without a condition; two regions LWW the balance." },
     { title: "Default read", detail: "GetItem without ConsistentRead can miss the reservation you just wrote.", state: "Eventual.", failure: "Treat a miss as 'never reserved' and insert again." },
-    { title: "Strong read", detail: "ConsistentRead in the same region sees the latest committed version of that item.", state: "Same-region quorum read, not global linearizability.", failure: "Calling this linearizable multi-region." },
+    { title: "Strong read", detail: "ConsistentRead in the same region sees the latest committed version of that item.", state: "Same-region latest committed item, not global linearizability.", failure: "Calling this linearizable multi-region." },
     { title: "Stream", detail: "Async worker updates search. Worker lag is not ledger lag you can spend.", state: "Derived.", failure: "Credit a wallet from a stream event without the item remaining reserved." }
   ]}
 />
@@ -94,7 +94,7 @@ Substitutes:
 <LibraryInterviewTraps>
 
 - “DynamoDB is linearizable” — **false by default.** Eventual reads are not. Strongly consistent reads are a same-region guarantee on that item, not a global linearizable log. Do not say linearizable unless you name the API, region, and what is excluded.
-- “Global tables give us multi-region active-active consistency” — they give LWW replication. Fine for profiles, not for money.
+- “Global tables give us multi-region active-active consistency” — **default** global tables give LWW replication. Fine for profiles, not for money. Multi-Region strong consistency is a separate named mode, not the default.
 - “Transactions make it Postgres” — item count limits, no joins, no arbitrary SQL isolation story.
 - “DAX makes reads strongly consistent” — DAX is a cache; check the current DAX consistency mode and treat it as derived.
 - Follow-up: how do you prevent two reservations for one `transfer_id`? Condition expression / transact occupancy, not a cache lock.
@@ -105,6 +105,6 @@ Substitutes:
 
 DynamoDB is a **set of numbered lockers** (partitions). Opening locker 17 strongly is not watching every locker in every building. Default reads can show you yesterday’s contents of locker 17. Global tables are two buildings that keep the **last sticky note**, not a court transcript.
 
-Remember: **eventual by default, strong means same-region item quorum, global tables are LWW — never call that linearizable without the boundary.**
+Remember: **eventual by default, strong means same-region latest committed item, default global tables are LWW — never call that linearizable without the boundary.**
 
 </LibraryMentalModel>

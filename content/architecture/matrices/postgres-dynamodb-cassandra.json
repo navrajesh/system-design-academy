@@ -31,7 +31,7 @@
       "product": "DynamoDB",
       "cells": {
         "workload": "Partition-key + optional sort-key item access, designed from queries first. Sparse indexes. Not SQL joins.",
-        "consistency": "Eventually consistent reads by default. Strongly consistent reads are same-region quorum reads, not global linearizability. Global tables are last-writer-wins.",
+        "consistency": "Eventually consistent reads by default. Strongly consistent GetItem is a same-region latest-committed item read (ConsistentRead), not Cassandra-style quorum and not global linearizability. Default global tables are last-writer-wins; multi-Region strong consistency is a named setting, not the default.",
         "latency": "Single-digit ms typical for in-region item ops when the partition is healthy. Hot keys and GSI backfill create tails.",
         "scaling": "Partitions split with storage/throughput. You still own the partition key. Transactions are bounded (transact items), not arbitrary SQL.",
         "failure": "Hot partition throttling, regional impairment, conflicting multi-region writes. No user-operated WAL promote.",

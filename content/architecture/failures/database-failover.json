@@ -5,8 +5,8 @@
   "relatedSlugs": ["replication-and-failover", "failure-detection-and-recovery", "idempotency-and-deduplication", "transactions-across-boundaries"],
   "assumptions": [
     "One writable PostgreSQL primary, one or more streaming replicas, WAL on disk, application connection pool.",
-    "synchronous_commit is on for the primary's local flush; replica apply is asynchronous unless a step says otherwise. Acknowledged commits can still be missing on the promoted replica.",
-    "A quorum membership service (Patroni/etcd-class, RDS multi-AZ, or equivalent) is allowed to revoke the writer lease. Client timeouts alone do not authorize promotion.",
+    "synchronous_commit is on for the primary's local flush; replica apply on this walkthrough is asynchronous unless a step says otherwise. Acknowledged commits can still be missing on the promoted replica. That RPO>0 story is not RDS Multi-AZ (managed synchronous standby + DNS/CNAME cutover).",
+    "A membership/fencing service (Patroni/etcd-class, STONITH, or equivalent) is allowed to revoke the writer lease. Client timeouts alone do not authorize promotion. Managed sync-standby products still need fencing and UNKNOWN handling; they are not an async-loss path.",
     "Clients retry writes only with idempotency keys. Timeouts are UNKNOWN, not rollback.",
     "Observability is derived. Missing metrics do not prove a commit was lost or succeeded."
   ],
@@ -16,7 +16,7 @@
       "title": "Healthy primary",
       "timeline": "t0: primary holds the writer lease/epoch. WAL flushes locally. Replicas apply behind by measured lag (example: 40–200 ms under 15 MB/s WAL).",
       "inFlight": "In-flight commits wait on WAL fsync and client round trip. Pool connections are checked out.",
-      "consistency": "Primary reads see the session snapshot. Replica reads may miss the last commit unless the client carries a {timeline, LSN} token and waits.",
+      "consistency": "Primary reads under default READ COMMITTED see a per-statement snapshot, not session snapshot isolation. Replica reads may miss the last commit unless the client carries a {timeline, LSN} token and waits.",
       "durability": "A commit the primary acknowledged is on the primary's WAL. It is on a replica only if that replica flushed that LSN.",
       "userVisible": "p99 is pool wait + SQL + fsync. No failover UX.",
       "recovery": "Not in this step. Keep lag and lease metrics on a dashboard; they are detection inputs later."
@@ -46,7 +46,7 @@
       "title": "Fence and promote",
       "timeline": "t2: coordinator fences the old writer (revoke lease, block writes at storage/VIP, increment epoch). Then it promotes the replica with the latest eligible flushed WAL.",
       "inFlight": "Old primary, if it heals, must be rejected: fenced epoch, STONITH, or rewind. Unfenced heal is split-brain.",
-      "consistency": "After promotion, the new timeline is not an ancestor of unreplicated old-primary WAL. Equal LSN numbers on the old timeline are invalid.",
+      "consistency": "After promotion, the new timeline is not an ancestor of unreplicated old-primary WAL. Do not compare LSN numbers across timelines; carry {timeline, LSN}.",
       "durability": "Any WAL only on the fenced primary and not on the promotee is unreadable unless you rewind/merge by hand. That is data loss relative to a client who heard OK.",
       "userVisible": "A window of errors while VIP/DNS/pool move. Connection reset, not a seamless swap.",
       "recovery": "Write a no-op or timeline history on the new primary. Routers must require the new epoch. Do not claim the cutover was lossless."
@@ -84,7 +84,7 @@
     {
       "id": "user-visible",
       "title": "What users should be told",
-      "timeline": "Whole incident: detection delay + fence + promote + reconnect is typically seconds to minutes, not a single RTT.",
+      "timeline": "Whole incident RTO: detection delay + fence + promote + pool/DNS reconnect is typically seconds to minutes, not a single RTT. RPO is separate: last WAL on the promotee vs an ACK the old primary already sent.",
       "inFlight": "Some users saw success, some saw error, some saw retry success. Support must not promise all three match.",
       "consistency": "After recovery, the ledger is the new primary. Disputes are UNKNOWN until the idempotency row is read there.",
       "durability": "If a user got OK and that WAL was only on the fenced disk, the honest answer is possible acknowledged loss under async replica policy.",

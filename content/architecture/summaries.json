@@ -61,7 +61,7 @@
     "product": "S3",
     "landscape": "storage",
     "workload": "Immutable or versioned blobs, backups, data lake files. Metadata catalog usually lives in a database.",
-    "consistency": "New PUTs are typically read-after-write in a region; listings and overwrite/delete can lag. Not a row store.",
+    "consistency": "Same-region object CRUD and LIST are strongly consistent. Cross-region replication still lags. Not a row store.",
     "durability": "Storage class and cross-region replication settings. 'Eleven nines' marketing is not a restore time.",
     "latency": "PUT/GET in tens to hundreds of ms plus TTFB for large objects. Multipart for large files.",
     "failure": "Slow PUT, incomplete multipart, Glacier restore delay, or permission/KMS outages.",

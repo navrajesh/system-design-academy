@@ -196,7 +196,7 @@
       "href": "/reference/technologies/postgresql",
       "summary": "Default relational primary. Durability is WAL fsync plus replica acknowledgement policy. Failover needs fencing.",
       "detail": {
-        "consistency": "Single-primary reads are the commit snapshot the session sees. Replicas lag.",
+        "consistency": "Default isolation is READ COMMITTED (per-statement snapshots, not session SI). Replicas lag.",
         "durability": "Defined by synchronous_commit and whether a standby acknowledged the WAL flush.",
         "failure": "Primary crash, disk full, or split-brain if two writers exist.",
         "recovery": "Fence the old writer, promote a replica with the latest eligible WAL, increment timeline; in-flight commits may be UNKNOWN."
@@ -209,7 +209,7 @@
       "product": "PostgreSQL streaming replica",
       "ownership": "derived",
       "optional": true,
-      "alternativeGroup": "primary-store",
+      "alternativeGroup": null,
       "defaultSelected": true,
       "paths": ["read"],
       "relatedSlugs": ["replication-and-failover", "scaling-read-heavy-services"],
@@ -236,8 +236,8 @@
       "href": "/reference/technologies/dynamodb",
       "summary": "Alternative item primary. Default reads are eventually consistent. Strongly consistent reads are same-region and are not cluster-wide linearizability.",
       "detail": {
-        "consistency": "Eventual by default. ConsistentRead is a quorum read in one region, not global linearizability. Global tables are last-writer-wins.",
-        "durability": "Replicated storage class of the table; not a user-visible WAL you can replay yourself.",
+        "consistency": "Eventual by default. ConsistentRead returns the same-region latest committed item, not a Cassandra-style quorum and not global linearizability. Default global tables are last-writer-wins; multi-Region strong consistency is a named table setting, not the default.",
+        "durability": "Acknowledged writes are replicated across Availability Zones; there is no user-replayable WAL.",
         "failure": "Hot partition, region impairment, or conflicting multi-region writes.",
         "recovery": "Conditional writes / transactions for occupancy; do not LWW TokenX balances across regions."
       }
@@ -296,7 +296,7 @@
       "href": null,
       "summary": "Authoritative for immutable object bytes once PUT is acknowledged. Ledger rows stay in the primary DB.",
       "detail": {
-        "consistency": "New objects typically read-after-write in a region; listings and overwrite can lag.",
+        "consistency": "Same-region object CRUD and LIST are strongly consistent. Cross-region replication is still asynchronous.",
         "durability": "Storage class / replication configuration, not infinite.",
         "failure": "Slow PUT, partial multipart, or restore delay from Glacier-class.",
         "recovery": "Checksum and retry multipart; metadata in the DB is the catalog."

@@ -8,9 +8,9 @@ type Props = { graph: ArchitectureGraph };
 
 function nodeVisible(node: GraphNode, primary: "postgres" | "dynamodb", showOptional: boolean) {
   if (node.alternativeGroup === "primary-store") {
-    if (primary === "postgres") return node.id === "postgres-primary" || node.id === "postgres-replica";
-    return node.id === "dynamodb";
+    return primary === "postgres" ? node.id === "postgres-primary" : node.id === "dynamodb";
   }
+  if (node.id === "postgres-replica" && primary !== "postgres") return false;
   if (node.optional && !showOptional) return false;
   return node.defaultSelected || !node.optional;
 }
@@ -56,7 +56,7 @@ export function ArchitectureExplorer({ graph }: Props) {
 
   return (
     <div className="space-y-6">
-      <div className="grid gap-3 rounded-2xl border border-slate-200 bg-white p-4 sm:grid-cols-3">
+      <div className="grid scroll-mt-20 gap-3 rounded-2xl border border-slate-200 bg-white p-4 sm:grid-cols-3">
         <fieldset className="text-sm font-semibold text-slate-700">
           <legend className="mb-2">Primary store</legend>
           <div className="flex flex-col gap-2 font-normal">
