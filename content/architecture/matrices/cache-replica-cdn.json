@@ -1,0 +1,62 @@
+{
+  "id": "cache-replica-cdn",
+  "title": "Redis cache vs DB read replica vs CDN caching",
+  "description": "Three derived-read options. None of them is the TokenX ledger. Freshness, key, and failure behavior decide which hop is legal.",
+  "relatedSlugs": ["caching-patterns-and-invalidation", "replication-and-failover", "cdns-and-edge-architecture"],
+  "columns": [
+    { "id": "workload", "label": "Workload" },
+    { "id": "consistency", "label": "Consistency" },
+    { "id": "latency", "label": "Latency" },
+    { "id": "scaling", "label": "Scaling" },
+    { "id": "failure", "label": "Failure" },
+    { "id": "costOps", "label": "Cost / ops" },
+    { "id": "whenNot", "label": "When not to choose" }
+  ],
+  "rows": [
+    {
+      "id": "redis-cache",
+      "product": "Redis cache-aside",
+      "cells": {
+        "workload": "Hot derived keys: session, feature flags, campaign metadata, rate-limit counters. Application owns fill and invalidation.",
+        "consistency": "Stale until TTL or explicit delete. No replica-apply position. A hit can be wrong after a primary write.",
+        "latency": "Sub-ms to low-ms in-region for GET. Stampede on miss if uncoordinated.",
+        "scaling": "Shard by key. Memory-bound. Replicas are async and optional.",
+        "failure": "Flush, eviction, or process restart can empty the cache. Persistence does not make it a system of record. Sentinel/cluster split-brain is an ops failure, not a feature.",
+        "costOps": "Memory is expensive. You operate eviction policy, key design, and stampede control (singleflight).",
+        "whenNot": "Spendable balances, unique allocation, or any read that must match the latest committed primary without a version token."
+      }
+    },
+    {
+      "id": "db-replica",
+      "product": "Database read replica",
+      "cells": {
+        "workload": "Same SQL model as the primary, offloading stale-tolerant queries and reports. Still relational/item-shaped like the primary.",
+        "consistency": "Applied WAL/LSN on a named timeline. Read-your-writes needs a position token; equal numeric LSNs on different timelines are not comparable.",
+        "latency": "Similar to primary for indexed reads plus replication lag (ms to seconds under load).",
+        "scaling": "Add replicas until WAL apply, connections, or lag saturate. Does not scale writes.",
+        "failure": "Lag, WAL recycle forcing rebuild, or accidental dual-primary if promoted without fencing.",
+        "costOps": "Extra instances plus replication bandwidth. You still vacuum and monitor apply lag.",
+        "whenNot": "When you needed write scale, or when the session requires linearizable/read-your-writes and you will not wait for apply or go to the primary."
+      }
+    },
+    {
+      "id": "cdn",
+      "product": "CDN caching",
+      "cells": {
+        "workload": "Public or versioned GET bytes: images, immutable API responses, CSS/JS, downloadable objects. Close to the user.",
+        "consistency": "TTL, cache-control, and surrogate keys. No per-user read-your-writes unless you bypass. Shared caches can leak if Vary/auth is wrong.",
+        "latency": "Tens of ms at edge on hit. Origin miss adds the full origin path.",
+        "scaling": "Edge fan-out. Origin shield protects the primary. Purge is eventually consistent across POPs.",
+        "failure": "Poisoned content until purge, origin outage (stale-if-error is a choice), or TLS/cert issues.",
+        "costOps": "Egress and request billing. Cache-key design is the operator burden.",
+        "whenNot": "Authenticated ledger reads, per-user private data without a correct cache key, or writes. Do not put TokenX transfers on a CDN."
+      }
+    }
+  ],
+  "assumptions": [
+    "Cache-aside: app reads Redis, on miss reads primary, then SET. No write-through claimed unless you add it.",
+    "Replica: PostgreSQL-class streaming replication, asynchronous unless a cell says synchronous commit.",
+    "CDN: HTTP GET with explicit Cache-Control. Authenticated content is opt-in and easy to get wrong.",
+    "All three hops are derived relative to the primary store for that resource."
+  ]
+}

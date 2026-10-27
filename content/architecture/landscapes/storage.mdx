@@ -1,0 +1,26 @@
+---
+kind: landscape
+id: storage
+title: "Storage & Data landscape"
+description: "Where Module 1 products sit on a production path, which state they own, and which lessons teach the mechanism."
+landscape: storage
+relatedSlugs:
+  - relational-vs-nosql-selection
+  - indexes-and-query-execution
+  - caching-patterns-and-invalidation
+  - replication-and-failover
+  - transactions-across-boundaries
+---
+
+This landscape is a **catalog of products**, not a 65th lesson. PostgreSQL is the default primary on the explorer. DynamoDB is a selectable alternative primary. Redis is the default derived cache hop. MySQL, MongoDB, Cassandra, OpenSearch, and S3 appear as property summaries until later phases add deep dives.
+
+Authoritative vs derived:
+
+- **Authoritative:** PostgreSQL (or DynamoDB if selected), S3 object bytes once PUT is acknowledged.
+- **Derived:** Redis, read replicas, CDN, OpenSearch, observability, outbox/Kafka copies of already-committed rows.
+
+Synchronous edges wait. Asynchronous edges (WAL ship, outbox, workers, telemetry) return before the sink commits. Failover of the primary is a named walkthrough: not instantaneous, not lossless under async replicas, not transparent to clients.
+
+Start with the [layered explorer](/reference/architecture), then the [PostgreSQL](/reference/technologies/postgresql), [Redis](/reference/technologies/redis), and [DynamoDB](/reference/technologies/dynamodb) deep dives, the two matrices on this page, and the [database failover walkthrough](/reference/failures/database-failover).
+
+Mechanism lessons: <LessonCrossLink slug="relational-vs-nosql-selection" />, <LessonCrossLink slug="indexes-and-query-execution" />, <LessonCrossLink slug="caching-patterns-and-invalidation" />, <LessonCrossLink slug="replication-and-failover" />, <LessonCrossLink slug="transactions-across-boundaries" />.

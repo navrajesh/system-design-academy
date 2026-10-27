@@ -1,0 +1,110 @@
+---
+kind: deep-dive
+id: dynamodb
+title: "DynamoDB"
+description: "Item primary alternative: partitions, eventual vs strongly consistent reads, and why default DynamoDB is not linearizable."
+landscape: storage
+relatedSlugs:
+  - relational-vs-nosql-selection
+  - cap-and-consistency-models
+  - data-modeling-from-access-patterns
+---
+
+<LibraryBigPicture>
+
+Amazon DynamoDB is a managed **partitioned item store**. On the explorer it is a **selectable alternative primary**, not a replica of PostgreSQL and not a cache. You model access patterns first: partition key, sort key, and GSIs. See <LessonCrossLink slug="data-modeling-from-access-patterns" />.
+
+**Default reads are eventually consistent.** They can return stale item versions after a write. **Strongly consistent reads** (`ConsistentRead=true`) return the latest committed version of that item in one region. They are **not** a Cassandra-style `R+W>N` quorum, **not** cluster-wide linearizability, **not** serializability of unrelated items, and **not** a global order across regions.
+
+Default **global tables** replicate asynchronously and resolve with **last-writer-wins** (timestamp). Multi-Region strong consistency is a named table setting, not the default, and is still not a TokenX design by itself. LWW global tables are a poor default for TokenX balances. Use DynamoDB when the product invariant fits a key-value item plus conditional writes. Use PostgreSQL when you need SQL constraints and multi-row transactions in one database. Selection lesson: <LessonCrossLink slug="relational-vs-nosql-selection" />. Consistency vocabulary: <LessonCrossLink slug="cap-and-consistency-models" />.
+
+</LibraryBigPicture>
+
+<LibraryUnderTheHood>
+
+### Partitions and units
+
+Items live in partitions by hash of the partition key. Capacity is metered in WCU/RCU (or on-demand). A hot partition throttles even if the table has spare aggregate capacity. Adaptive capacity helps slowly; it does not fix a single celebrity key.
+
+Secondary indexes are **derived**. GSI writes are eventually consistent with the base table. Querying a GSI for “the latest committed ledger” is a category error.
+
+### Reads
+
+- **Eventual (default):** may miss a write that already returned HTTP 200. Fine for many dashboards.
+- **Strongly consistent:** same region, latest committed item; higher RCU cost; still not a transaction across items unless you use TransactGetItems. Multi-region strong reads are not this `GetItem` API.
+
+### Writes
+
+PutItem/UpdateItem can use a **condition** (optimistic occupancy). TransactWriteItems all-or-nothing up to the documented item limit — it is not SQL, and it is not a distributed saga with Kafka.
+
+Streams/CDC are **async** derived logs of committed item changes.
+
+<ExecutionTimeline
+  title="Conditional TokenX reservation item"
+  steps={[
+    { title: "Condition write", detail: "PutItem reservation where attribute_not_exists(transfer_id). Occupancy is this condition, not a SQL UNIQUE across arbitrary rows.", state: "Authoritative item if the write is accepted.", failure: "Read then write without a condition; two regions LWW the balance." },
+    { title: "Default read", detail: "GetItem without ConsistentRead can miss the reservation you just wrote.", state: "Eventual.", failure: "Treat a miss as 'never reserved' and insert again." },
+    { title: "Strong read", detail: "ConsistentRead in the same region sees the latest committed version of that item.", state: "Same-region latest committed item, not global linearizability.", failure: "Calling this linearizable multi-region." },
+    { title: "Stream", detail: "Async worker updates search. Worker lag is not ledger lag you can spend.", state: "Derived.", failure: "Credit a wallet from a stream event without the item remaining reserved." }
+  ]}
+/>
+
+</LibraryUnderTheHood>
+
+<ArchitectureAndDataFlow>
+
+App → DynamoDB is **sync**. Streams → workers are **async**. DAX, if used, is another **derived cache** with its own consistency story — default DAX reads are not strongly consistent with the table.
+
+<MermaidDiagram
+  title="DynamoDB item primary with eventual GSI and stream"
+  chart={"flowchart LR\n  APP[App service] -->|sync item API| DDB[(DynamoDB table authoritative)]\n  DDB -->|derived eventual| GSI[(GSI)]\n  DDB -.->|async stream| W[Workers]\n  APP -->|optional| DAX[(DAX derived cache)]"}
+/>
+
+Failure: throttling is 429-class overload on a partition, not a Postgres lock wait. Recovery: split keys, backoff, and do not dual-write the same invariant to Postgres “for safety” without an outbox/saga design.
+
+</ArchitectureAndDataFlow>
+
+<SelectionCriteria>
+
+Choose DynamoDB when:
+
+- Access is item/key based and you can name every query.
+- You want a managed replica set and operational load on data modeling rather than vacuum.
+- Conditional writes or small transactions are enough.
+
+Substitutes:
+
+1. **PostgreSQL** — SQL, constraints, ad-hoc query, fenced self-managed or managed failover.
+2. **Cassandra** — operator-run tunable quorum, high ingest, repair burden.
+3. **MongoDB replica set with majority writes** — documents instead of items; still not global linearizability.
+
+</SelectionCriteria>
+
+<FailureModes>
+
+- **Hot key / throttle:** user-visible latency and errors while the rest of the table is idle.
+- **Eventual read after write:** duplicate submits if you “insert if missing” on a stale miss.
+- **GSI lag:** query results skip or repeat items.
+- **Global table conflict:** LWW overwrites; unacceptable for exclusive terminals (CREDITED vs CANCELLED).
+- **Region impairment:** failover is a **product** decision (reject writes vs LWW). It is not a silent lossless cutover.
+- **Cost:** WCU on large items and GSIs; on-demand surprise bills; still cheaper than a mis-staffed C* cluster for many item workloads.
+
+</FailureModes>
+
+<LibraryInterviewTraps>
+
+- “DynamoDB is linearizable” — **false by default.** Eventual reads are not. Strongly consistent reads are a same-region guarantee on that item, not a global linearizable log. Do not say linearizable unless you name the API, region, and what is excluded.
+- “Global tables give us multi-region active-active consistency” — **default** global tables give LWW replication. Fine for profiles, not for money. Multi-Region strong consistency is a separate named mode, not the default.
+- “Transactions make it Postgres” — item count limits, no joins, no arbitrary SQL isolation story.
+- “DAX makes reads strongly consistent” — DAX is a cache; check the current DAX consistency mode and treat it as derived.
+- Follow-up: how do you prevent two reservations for one `transfer_id`? Condition expression / transact occupancy, not a cache lock.
+
+</LibraryInterviewTraps>
+
+<LibraryMentalModel>
+
+DynamoDB is a **set of numbered lockers** (partitions). Opening locker 17 strongly is not watching every locker in every building. Default reads can show you yesterday’s contents of locker 17. Global tables are two buildings that keep the **last sticky note**, not a court transcript.
+
+Remember: **eventual by default, strong means same-region latest committed item, default global tables are LWW — never call that linearizable without the boundary.**
+
+</LibraryMentalModel>

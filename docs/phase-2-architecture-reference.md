@@ -1,6 +1,10 @@
 # Phase 2 — Architecture Reference Library
 
-**Status:** Future, not implemented. Documentation only.
+**Status:** Phase 2A in progress on `feat/phase-2a-technology-landscape`. This slice is Storage & Data only. It does **not** complete all seven landscapes, TokenX overlay, or the remaining named failures.
+
+Phase 2A ships `/reference` hub, layered explorer, PostgreSQL / Redis / DynamoDB deep dives, two storage matrices, Module 1 summary cards, and a database-failover walkthrough. Curriculum remains **64/64**. Library state must not be written to `sda:completed-lessons:v1`.
+
+This document remains the authoritative full-product plan. Acceptance criteria below for the **full** library are still future work.
 
 This document is the authoritative Phase 2 architecture plan. It preserves the original Architecture Reference Library and scopes a first feature inside it: **Technology Landscape & Architecture Reference**.
 
@@ -225,7 +229,8 @@ The feature is complete only when all of the following hold:
 
 ## Out of scope until a later decision
 
-- Implementing any component, route, or navigation item described here
+- Phase B+: remaining six landscapes, remaining named failures, TokenX overlay, library search chrome
 - Rewriting existing lessons to embed matrices
 - Push, merge, or deploy
 - Applying or dropping `stash@{0}`
+- Claiming the seven-landscape product is complete while only Phase 2A exists
