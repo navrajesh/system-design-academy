@@ -43,7 +43,7 @@ export default function ReferenceHubPage() {
         <ul className="mt-4 space-y-3">
           {deepDives.map((page) => (
             <li key={page.slug}>
-              <Link href={`/reference/technologies/${page.slug}`} className="block rounded-xl border border-slate-200 bg-white px-4 py-3 hover:border-cobalt">
+              <Link href={`/reference/technologies/${page.slug}`} className="block rounded-xl border border-slate-200 bg-white px-4 py-3 hover:border-cobalt focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cobalt focus-visible:ring-offset-2">
                 <span className="font-semibold text-ink">{page.title}</span>
                 <span className="mt-1 block text-sm text-slate-600">{page.description}</span>
               </Link>
@@ -84,7 +84,7 @@ export default function ReferenceHubPage() {
 
 function HubCard({ href, title, body }: { href: string; title: string; body: string }) {
   return (
-    <Link href={href} className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm transition hover:border-cobalt">
+    <Link href={href} className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm transition hover:border-cobalt focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cobalt focus-visible:ring-offset-2">
       <h2 className="font-sans text-lg font-semibold text-ink">{title}</h2>
       <p className="mt-2 text-sm leading-6 text-slate-600">{body}</p>
     </Link>

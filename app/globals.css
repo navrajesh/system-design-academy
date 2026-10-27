@@ -23,9 +23,33 @@ body { margin: 0; background: var(--paper); color: var(--ink); font-family: Inte
   padding: .75rem 1rem;
   font-size: .875rem;
   font-weight: 700;
+  color: var(--ink);
   box-shadow: 0 10px 30px rgba(0,0,0,.18);
+  outline: 3px solid transparent;
+  outline-offset: 2px;
 }
-.skip-link:focus { top: 1rem; }
+.skip-link:focus,
+.skip-link:focus-visible {
+  top: 1rem;
+  outline: 3px solid #3157d5;
+  outline-offset: 2px;
+}
+
+:focus-visible {
+  outline: 3px solid #3157d5;
+  outline-offset: 2px;
+}
+
+input[type="radio"]:focus-visible,
+input[type="checkbox"]:focus-visible {
+  outline: 3px solid #3157d5;
+  outline-offset: 3px;
+}
+
+#main-content:focus,
+#main-content:focus-visible {
+  outline: none;
+}
 
 kbd { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; }
 

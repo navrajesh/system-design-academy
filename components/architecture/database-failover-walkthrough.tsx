@@ -23,7 +23,7 @@ export function DatabaseFailoverWalkthroughView({ walkthrough }: { walkthrough: 
               aria-pressed={active === index}
               aria-controls={`${id}-panel`}
               onClick={() => setActive(index)}
-              className={`flex h-full w-full items-start gap-3 rounded-xl border p-3 text-left text-sm ${
+              className={`flex h-full w-full items-start gap-3 rounded-xl border p-3 text-left text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cobalt focus-visible:ring-offset-2 ${
                 active === index ? "border-red-300 bg-red-50 text-red-950" : "border-slate-200 text-slate-600 hover:border-slate-300"
               }`}
             >

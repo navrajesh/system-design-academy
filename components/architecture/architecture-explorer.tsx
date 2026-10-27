@@ -64,6 +64,7 @@ export function ArchitectureExplorer({ graph }: Props) {
               <input
                 type="radio"
                 name="primary-store"
+                className="accent-cobalt focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-cobalt"
                 checked={primary === "postgres"}
                 onChange={() => {
                   setPrimary("postgres");
@@ -76,6 +77,7 @@ export function ArchitectureExplorer({ graph }: Props) {
               <input
                 type="radio"
                 name="primary-store"
+                className="accent-cobalt focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-cobalt"
                 checked={primary === "dynamodb"}
                 onChange={() => {
                   setPrimary("dynamodb");
@@ -97,14 +99,25 @@ export function ArchitectureExplorer({ graph }: Props) {
               ] as const
             ).map(([value, label]) => (
               <label key={value} className="flex items-center gap-2">
-                <input type="radio" name="path-filter" checked={path === value} onChange={() => setPath(value)} />
+                <input
+                  type="radio"
+                  name="path-filter"
+                  className="accent-cobalt focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-cobalt"
+                  checked={path === value}
+                  onChange={() => setPath(value)}
+                />
                 {label}
               </label>
             ))}
           </div>
         </fieldset>
         <label className="flex items-center gap-2 pt-6 text-sm font-semibold text-slate-700">
-          <input type="checkbox" checked={showOptional} onChange={(event) => setShowOptional(event.target.checked)} />
+          <input
+            type="checkbox"
+            className="accent-cobalt focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-cobalt"
+            checked={showOptional}
+            onChange={(event) => setShowOptional(event.target.checked)}
+          />
           Show optional hops (replica, outbox)
         </label>
       </div>
@@ -197,7 +210,7 @@ function NodeButton({
       onKeyDown={onKeyDown}
       aria-pressed={selected}
       aria-label={`${node.title}. ${badges.join(". ")}. ${node.summary}`}
-      className={`min-w-[10.5rem] flex-1 rounded-xl border px-3 py-2 text-left transition ${
+      className={`min-w-[10.5rem] flex-1 rounded-xl border px-3 py-2 text-left transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cobalt focus-visible:ring-offset-2 ${
         selected ? "border-cobalt bg-blue-50 ring-2 ring-cobalt" : "border-slate-200 bg-slate-50 hover:border-slate-400"
       } ${dimmed ? "opacity-50" : ""}`}
     >
@@ -259,7 +272,7 @@ function DetailPanel({ node }: { node: GraphNode }) {
         </div>
       </dl>
       {node.href ? (
-        <Link href={node.href} className="mt-4 inline-block text-sm font-semibold text-cobalt">
+        <Link href={node.href} className="mt-4 inline-block text-sm font-semibold text-cobalt focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cobalt focus-visible:ring-offset-2">
           Open reference for {node.product}
         </Link>
       ) : null}
@@ -290,7 +303,7 @@ function MobileExplorer({
       <div className="flex items-center justify-between gap-3">
         <button
           type="button"
-          className="rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm font-semibold disabled:opacity-40"
+          className="rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm font-semibold focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cobalt disabled:opacity-40"
           disabled={step === 0}
           onClick={() => setStep((value) => Math.max(0, value - 1))}
         >
@@ -301,7 +314,7 @@ function MobileExplorer({
         </p>
         <button
           type="button"
-          className="rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm font-semibold disabled:opacity-40"
+          className="rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm font-semibold focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cobalt disabled:opacity-40"
           disabled={step >= orderedLayers.length - 1}
           onClick={() => setStep((value) => Math.min(orderedLayers.length - 1, value + 1))}
         >

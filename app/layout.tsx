@@ -24,7 +24,7 @@ export default function RootLayout({ children }: Readonly<{ children: React.Reac
       <body>
         <a href="#main-content" className="skip-link">Skip to content</a>
         <AppShell modules={modules} searchRecords={searchRecords}>
-          <div id="main-content">{children}</div>
+          {children}
         </AppShell>
       </body>
     </html>
