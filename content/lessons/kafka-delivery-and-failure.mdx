@@ -26,6 +26,8 @@ Durability begins before consumption. With replication factor three, <code>acks=
 
 Producer idempotence assigns producer IDs and sequence numbers so broker retries do not append the same producer batch twice within the producer session. It does not deduplicate two business commands with different event IDs, and it does not make an external database side effect exactly once.
 
+Name the rest of the durability envelope. Broker leader election must stay inside the in-sync replica set. **Unclean leader election** can promote a lagging replica and drop records that producers already treated as acknowledged. Retention by time or size bounds how long that durable log can be replayed: an acknowledged record is still gone after retention expiry or a delete. The failure scope of `acks=all` plus `min.insync.replicas=2` on RF=3 is loss of one in-sync broker, **not** disk-correlated loss of the whole ISR, **not** `acks=1` acknowledgements, and **not** history older than retention.
+
 </BigPicture>
 
 <UnderTheHood title="The offset is part of your correctness protocol">
@@ -56,13 +58,13 @@ For every consumer, imagine the process dying before and after each operation: r
 
 Think of a coat-check ticket. Kafka's offset says which ticket number the attendant reached; it does not prove the coat reached the correct owner. The sink needs its own claim check—the event ID—and both the claim check and the handoff must be recorded together.
 
-Partitions provide order only within that partition. Consumer groups provide parallel ownership, not global order.
+A partition preserves **broker append order** (offset order) for records that land in it. That is not event-time order: producer clocks skew, and concurrent producers for the same key can still race. It is not causal order unless a single producer serializes on that key and waits for acknowledgements. Consumer groups provide parallel ownership, not global order.
 
 </MentalModel>
 
-<ArchitectureDiagram title="Replay-safe order consumer and durability boundaries" chart={"flowchart LR\n  P[Idempotent producer] -->|acks=all| L[Partition leader]\n  L -->|replicate; min ISR=2| F1[In-sync follower]\n  L -->|replicate| F2[In-sync follower]\n  L --> K[(Authoritative Kafka log)]\n  K -->|partition ownership| C[Consumer group member]\n  C --> T{One sink DB transaction}\n  T --> O[(Orders + processed event IDs)]\n  T --> X[(Outbox)]\n  X --> R[Relay]\n  R --> N[Notifications]\n  C -->|after DB commit| OF[(Consumer offset)]\n  C -->|permanent failure + metadata| Q[(Quarantine topic)]\n  OF -. rebalance / replay .-> C"}>
+<ArchitectureDiagram title="Replay-safe order consumer and durability boundaries" chart={"flowchart LR\n  P[Idempotent producer] -->|acks=all minISR=2| L[Partition leader]\n  L -->|ISR replicate| F1[In-sync follower]\n  L -->|ISR replicate| F2[In-sync follower]\n  L --> K[(Authoritative Kafka log until retention)]\n  K -->|append order in one partition| C[Consumer group member]\n  C --> T{One sink DB transaction}\n  T --> O[(Orders + processed event IDs)]\n  T --> X[(Outbox)]\n  X --> R[Relay]\n  R --> N[Notifications]\n  C -->|after DB commit| OF[(Consumer offset)]\n  C -->|permanent failure + metadata| Q[(Quarantine topic)]\n  OF -. rebalance / replay .-> C\n  UNC[Unclean election] -. can drop acked offsets .-> K"}>
 
-Kafka owns replicated log durability and group offsets. The sink database owns the business effect, dedupe marker, and outbox in one local transaction. The boundary between the sink commit and Kafka offset commit is deliberately at-least-once; replay safety closes the gap.
+Kafka owns replicated log durability only inside the named envelope: RF=3, `acks=all`, `min.insync.replicas=2`, producer idempotence, ISR-only leader election, and finite retention. The log is authoritative until retention expiry; unclean leader election can drop already-acked offsets. Consumers see **partition append order**, not event-time or cross-producer causal order. The sink database owns the business effect, dedupe marker, and outbox in one local transaction. The sink-commit versus offset-commit gap is at-least-once; replay safety closes it.
 
 </ArchitectureDiagram>
 
@@ -78,7 +80,8 @@ TokenX settlement instructions need an idempotency key at the ledger boundary. E
   choices={[
     { label: "min ISR = 2", impact: "acks=all writes pause or fail once fewer than two replicas are in sync; acknowledged writes retain the intended replica floor.", recovery: "Restore a follower or explicitly accept a weaker policy through an operator-controlled change." },
     { label: "min ISR = 1", impact: "The leader can keep acknowledging alone, improving availability but exposing acknowledged data to loss if that broker fails before replication catches up.", recovery: "Recover the leader and validate log divergence before reopening normal traffic." },
-    { label: "Blind producer retries", impact: "Without producer idempotence, an ambiguous acknowledgment can append duplicate batches.", recovery: "Enable idempotence and keep a stable business event ID for end-to-end dedupe." }
+    { label: "Blind producer retries", impact: "Without producer idempotence, an ambiguous acknowledgment can append duplicate batches.", recovery: "Enable idempotence and keep a stable business event ID for end-to-end dedupe." },
+    { label: "Unclean leader election after correlated disk loss", impact: "A lagging replica can become leader and truncate offsets that producers already treated as durable.", recovery: "Keep unclean.leader.election.enable=false; restore from remaining ISR members or a backup; treat missing offsets as unknown, not as never-produced." }
   ]}
 />
 
@@ -91,18 +94,32 @@ TokenX settlement instructions need an idempotency key at the ledger boundary. E
 - Retrying a poison record forever and blocking later records in the partition.
 - Adding partitions while assuming global ordering remains.
 - Ignoring consumer rebalance time and state restoration.
+- Treating `acks=all` as immortal durability without naming ISR membership, unclean leader election, and retention.
+- Equating partition offset order with event-time or causal order across producers.
 
 </InterviewTraps>
 
 <Tradeoffs title="Ordering, parallelism, and recovery speed">
 
-More partitions increase parallelism but weaken the practical scope of ordering and raise coordination overhead. Long retention improves replay and debugging but costs storage. A dead-letter topic preserves throughput but creates an operational queue that needs ownership, alerts, and safe replay tooling.
+More partitions increase parallelism but weaken the practical scope of ordering (append order is per partition) and raise coordination overhead. Long retention improves replay and debugging but costs storage and still expires. A dead-letter topic preserves throughput but creates an operational queue that needs ownership, alerts, and safe replay tooling. `acks=all` with a high min ISR reduces acknowledged-data loss at the cost of write availability when replicas fall behind.
 
 Quarantining a record can violate per-key order because later records may proceed without the missing transition. For state machines, park the entire key, route it to a repair stream, or make later records conditional on a sequence number. A dead-letter topic is inappropriate when skipping one event makes following state uninterpretable.
 
 </Tradeoffs>
 
 <KnowledgeCheck question="When can a consumer safely commit an offset before writing its database change?" options={["When losing the change is acceptable", "Whenever the broker has three replicas", "Only for keyed topics", "Whenever the consumer uses batching"]} correct={0} explanation="A crash after the early commit prevents Kafka from redelivering the record. That is at-most-once processing and is valid only when occasional loss is explicitly acceptable." />
+
+<KnowledgeCheck
+  question="A TokenX topic uses RF=3, acks=all, and min.insync.replicas=2. Why is an acknowledged settlement event still not immortal?"
+  options={[
+    "acks=all already copies the record to every broker in the cluster",
+    "Unclean leader election, correlated ISR disk loss, or retention expiry can still drop or hide an acknowledged offset",
+    "Producer idempotence expires after one second so the broker forgets the record",
+    "min.insync.replicas=2 means only memory copies are required"
+  ]}
+  correct={1}
+  explanation="The named envelope survives one in-sync broker loss. It does not survive promoting a lagging replica, losing the whole ISR, or retaining the log past its time/size bound."
+/>
 
 <ScenarioCheck
   scenario="A transfer consumer commits TokenX ledger rows, crashes before committing its Kafka offset, and is replaced during a rebalance. The replacement receives the same event."
@@ -119,6 +136,6 @@ Quarantining a record can violate per-key order because later records may procee
 
 <InterviewAnswer>
 
-“I define the guarantee across the source and each side effect. I usually choose at-least-once consumption, then make the database mutation idempotent by storing the event ID in the same transaction. Outbound work uses an outbox. I commit the Kafka offset only after durable success, quarantine permanent failures, and retain enough history for replay. This accepts duplicate delivery while preventing duplicate business effects.”
+“I define the guarantee across the source and each side effect. For the log I name RF=3, acks=all, min.insync.replicas=2, producer idempotence, ISR-only leader election, and retention: that envelope survives one in-sync broker loss, not unclean election or correlated disk failure. Partition keys give append order, not event-time or causal order. I usually choose at-least-once consumption, then make the database mutation idempotent by storing the event ID in the same transaction. Outbound work uses an outbox. I commit the Kafka offset only after durable success, quarantine permanent failures, and retain enough history for replay. This accepts duplicate delivery while preventing duplicate business effects.”
 
 </InterviewAnswer>

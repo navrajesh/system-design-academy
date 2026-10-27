@@ -22,7 +22,7 @@ objectives:
 
 An index is a maintained, ordered copy of selected columns plus a way to find the base row. It is not free acceleration: every indexed write adds CPU, random I/O, WAL, cache pressure, and recovery work. The useful question is therefore not “which columns are queried?” but “which access path must be bounded at the target cardinality?”
 
-TokenX must answer two very different queries: enforce a globally unique idempotency key during a transfer, and page through one wallet's history in reverse sequence order. The first needs a unique lookup; the second needs an ordered range. A single-column index on `wallet_id` does not satisfy the ordering and may still sort millions of rows.
+TokenX must answer two very different queries: enforce a unique idempotency key **within tenant and operation scope** during a transfer, and page through one wallet's history in reverse sequence order. The first needs the composite constraint `UNIQUE (tenant_id, operation, idempotency_key)`, not a cluster-wide singleton; the second needs an ordered range. A single-column index on `wallet_id` does not satisfy the ordering and may still sort millions of rows. `UNIQUE (idempotency_key)` collides unrelated tenants. `UNIQUE (tenant_id, idempotency_key)` still collides `create-transfer` and `create-payout` when both reuse key `K`.
 
 </BigPicture>
 
@@ -30,7 +30,11 @@ TokenX must answer two very different queries: enforce a globally unique idempot
 
 ### B-tree mechanics and cost
 
-A B-tree stores sorted keys in fixed-size pages. Internal pages route to child pages; leaf pages hold keys and row locators, or table rows in a clustered organization. If an 8 KiB internal page can hold roughly 250 separators and pointers, four levels address about `250^4 = 3.9 billion` entries. A point lookup is therefore a handful of page visits—not a scan of 100 million rows—but cache misses and heap fetches still matter.
+A B-tree stores sorted keys in fixed-size pages. Internal pages route to child pages; leaf pages hold keys and row locators, or table rows in a clustered organization.
+
+Define height carefully. **Height** here is the number of page visits on a root-to-leaf path, **including the leaf**. Height 4 means a point lookup visits the root, two internal pages, and one leaf—four tree pages—**before** any heap fetch. That bounds tree pages, not disk I/O: a buffer-pool hit is still a page visit and is not a disk read. **Fanout** is the number of child pointers per internal page. As a **planning example**, an 8 KiB internal page can hold about 250 separators and pointers at **100% occupancy**; a height-4 tree then has about `250^3` leaf pages. If each leaf also holds about 250 keys, capacity is about `250^4 = 3.9 billion` entries **only at that occupancy**. Do not treat `250^4` as a measured row count or as an I/O count.
+
+Production pages are rarely full. After splits, a **fill factor** around 70% is a common **planning** assumption, so effective fanout is about `250 × 0.7 ≈ 175` and capacity is closer to `175^4 ≈ 0.94 billion` keys. State occupancy when quoting height arithmetic. Heap fetches, visibility checks, and WAL writes can still cause I/O after the tree walk.
 
 For TokenX history, a useful index is:
 
@@ -51,7 +55,7 @@ The optimizer estimates row counts from statistics, compares sequential scan, in
   steps={[
     { title: "Bind a stable cursor", detail: "Use wallet_id plus the last account_sequence and entry_id; do not use OFFSET over a growing table." },
     { title: "Plan from statistics", detail: "The optimizer estimates selectivity and chooses the composite index because it satisfies filtering and ordering." },
-    { title: "Descend the B-tree", detail: "Internal pages locate the first leaf page in roughly the tree height." },
+    { title: "Descend the B-tree", detail: "Height includes the leaf: a height-4 lookup visits four tree pages, then maybe the heap. Cached pages are visits, not disk I/O." },
     { title: "Scan a bounded range", detail: "Read the next 51 entries to return 50 and determine whether another page exists." },
     { title: "Fetch or verify visibility", detail: "An MVCC engine checks tuple visibility; missing covered columns require heap reads." },
   ]}
@@ -86,7 +90,7 @@ The consistency boundary is the primary commit: its rows, uniqueness constraints
 <ArchitectureWalkthrough
   title="Walk the ownership boundaries"
   stages={[
-    { name: "Primary transaction", owner: "Ledger database", state: "Transfer rows and idempotency", boundary: "One authoritative commit.", failure: "A constraint or transaction aborts.", recovery: "Retry the whole command with the same idempotency key." },
+    { name: "Primary transaction", owner: "Ledger database", state: "Transfer rows and idempotency", boundary: "One authoritative commit.", failure: "A constraint or transaction aborts.", recovery: "Retry the same tenant, operation, and idempotency key; uniqueness is not global." },
     { name: "B-tree", owner: "Database storage engine", state: "Sorted keys and row locators", boundary: "Maintained atomically with table changes.", failure: "Bloat or a failed concurrent build.", recovery: "Clean invalid artifacts, vacuum or reindex with I/O headroom." },
     { name: "WAL", owner: "Primary durability layer", state: "Ordered row and index mutations", boundary: "Durable commit position.", failure: "Log corruption or retention gap.", recovery: "Restore a verified snapshot and replay contiguous WAL." },
     { name: "Replica", owner: "Read-routing tier", state: "Applied log position", boundary: "Declared lag and session policy.", failure: "The replica falls behind.", recovery: "Remove it from eligible reads, catch up, or reseed." },
@@ -95,7 +99,13 @@ The consistency boundary is the primary commit: its rows, uniqueness constraints
 
 <RealExamples>
 
-**TokenX idempotency.** A unique index on `(tenant_id, idempotency_key)` turns concurrent duplicate requests into one winner. An application-side “check then insert” races. Store the request fingerprint too: reusing a key with different transfer parameters must be rejected, not replayed as success.
+**TokenX idempotency.** Duplicate **create-transfer** requests for one tenant serialize on this constraint:
+
+```sql
+UNIQUE (tenant_id, operation, idempotency_key)
+```
+
+Tenant A and tenant B may both use key `123`. The same tenant may use key `K` for `create-transfer` and again for `create-payout`; those rows must both insert. `UNIQUE (idempotency_key)` or `UNIQUE (tenant_id, idempotency_key)` would reject one of them. An application-side “check then insert” races. Store the request fingerprint too: reusing a scoped key with different parameters must be rejected, not replayed as success. The unique insert is the local at-most-once claim; clients still retry, so this is not an exactly-once network guarantee.
 
 **Ad Click Aggregator.** A dashboard query by `(campaign_id, bucket_start)` benefits from an ordered aggregate key. Indexing raw `user_agent` or a high-churn JSON payload makes ingestion more expensive while serving no bounded query. For time-correlated append tables, a compact block-range index can outperform a huge B-tree for broad time scans, but it is poor for isolated point lookups.
 
@@ -116,10 +126,11 @@ The consistency boundary is the primary commit: its rows, uniqueness constraints
 <InterviewTraps>
 
 1. **“Add indexes to every filter.”** Ask for cardinality, read frequency, sort order, write rate, and storage budget. An unused index is a recurring tax.
-2. **“The index makes the query O(log n).”** The seek may be logarithmic, but returning `k` rows is at least `O(k)`, heap reads may be random, and sorting or joins can dominate.
-3. **“A covering index never touches the table.”** MVCC visibility checks or missing columns can still require heap access; engine details matter.
-4. **“OFFSET is fine because pages are small.”** The engine often scans and discards earlier rows. Use a unique, immutable keyset cursor and define snapshot semantics.
-5. **“Build the index in production now.”** Discuss lock behavior, I/O headroom, replica lag, cancellation, invalid-index cleanup, and rollback.
+2. **“The index makes the query O(log n).”** Height is root-to-leaf page visits **including the leaf**, not a disk I/O count. Cache hits skip disk, heap fetches and WAL still happen, and returning `k` rows is at least `O(k)`. Fanout ~250 on 8 KiB pages is a 100% occupancy planning example; ~70% fill factor changes capacity, not the height definition.
+3. **“Idempotency keys are globally unique.”** The constraint is `UNIQUE (tenant_id, operation, idempotency_key)`. A global unique, or unique-per-tenant only, collides unrelated customers or `create-transfer` versus `create-payout` sharing `K`.
+4. **“A covering index never touches the table.”** MVCC visibility checks or missing columns can still require heap access; engine details matter.
+5. **“OFFSET is fine because pages are small.”** The engine often scans and discards earlier rows. Use a unique, immutable keyset cursor and define snapshot semantics.
+6. **“Build the index in production now.”** Discuss lock behavior, I/O headroom, replica lag, cancellation, invalid-index cleanup, and rollback.
 
 A defensible IC6 answer connects an index to a named query and validates it with observed plans under production-like distributions.
 
@@ -147,6 +158,30 @@ A defensible IC6 answer connects an index to a named query and validates it with
   explanation="The equality key leads, followed by the ordered range and stable tie-breaker. Separate indexes generally cannot preserve this compound ordering."
 />
 
+<KnowledgeCheck
+  question="A B-tree has height 4 including the leaf and fanout about 250 at 100% occupancy. A point lookup then fetches the heap row. Which claim is accurate?"
+  options={[
+    "The lookup costs exactly 4 disk I/Os because height is 4",
+    "The lookup visits 4 tree pages including the leaf, plus a possible heap read; cache hits skip disk I/O, WAL is separate, and ~70% fill factor changes capacity not height",
+    "The engine performs 250^4 disk I/Os",
+    "Height excludes the leaf, so only three pages can be read"
+  ]}
+  correct={1}
+  explanation="Height counts root-to-leaf page visits including the leaf. That is not a disk I/O count: cache hits, heap fetches, and WAL change what hits disk. Fill factor is a planning occupancy assumption, so 250^4 is not exact capacity."
+/>
+
+<KnowledgeCheck
+  question="Tenant A sends create-transfer and create-payout with the same key K. Tenant B also sends create-transfer with K. All three must succeed. Which unique constraint is correct?"
+  options={[
+    "UNIQUE (idempotency_key)",
+    "UNIQUE (tenant_id, idempotency_key)",
+    "UNIQUE (tenant_id, operation, idempotency_key)",
+    "No unique index; the application checks then inserts"
+  ]}
+  correct={2}
+  explanation="Uniqueness is scoped to tenant and operation. UNIQUE (idempotency_key) rejects B. UNIQUE (tenant_id, idempotency_key) rejects A's second operation. Check-then-insert races under concurrency."
+/>
+
 <ScenarioCheck
   title="Index budget under sustained writes"
   scenario="A proposed index speeds a weekly report from 80 seconds to 4 seconds but adds 20 GB/day of logical index writes to a latency-sensitive TokenX primary. The report can be 15 minutes stale."
@@ -162,7 +197,7 @@ A defensible IC6 answer connects an index to a named query and validates it with
 
 <InterviewAnswer>
 
-“I begin with a concrete predicate, ordering, result size, and latency SLO. For TokenX history I use a composite keyset index on wallet and account sequence, include only stable display fields, and keep balance authorization on the primary. I validate estimated versus actual rows and test skew, cache-cold behavior, and pagination under concurrent inserts.
+“I begin with a concrete predicate, ordering, result size, and latency SLO. For TokenX history I use a composite keyset index on wallet and account sequence. For idempotency I enforce `UNIQUE (tenant_id, operation, idempotency_key)` so two tenants, or create-transfer versus create-payout, can share key K. Tree height is root-to-leaf visits including the leaf; fanout ~250 at 100% occupancy on 8 KiB pages is a planning example, fill factor ~70% changes capacity, and cache, heap, and WAL mean height is not an exact I/O count. I validate estimated versus actual rows and test skew, cache-cold behavior, and pagination under concurrent inserts.
 
 Every index has a write, WAL, storage, vacuum, and restore cost, so I calculate amplification before adding it. Low-frequency analytical access paths belong in replayable projections when possible. Related lessons are [data modeling](/learn/data-modeling-from-access-patterns), [replication and failover](/learn/replication-and-failover), and [time-series storage](/learn/time-series-and-append-only-storage).”
 

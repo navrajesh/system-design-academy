@@ -56,7 +56,9 @@ The average is almost never the sizing number. Ad traffic follows time zones, ca
 
 ### Partition the event log
 
-Hashing by <code>campaign_id</code> keeps a campaign's events ordered within one Kafka partition and makes campaign-local aggregation simple. It also creates a risk: a viral campaign becomes a hot partition. Hashing by <code>event_id</code> spreads writes evenly but destroys per-campaign ordering and requires a shuffle before aggregation.
+Hashing by <code>campaign_id</code> sends a campaign's records to one Kafka partition, which preserves **broker append order** (offset order) for that partition and makes campaign-local aggregation simple. Append order is not event-time order: device clocks can be skewed, and a later click can receive an earlier offset than an earlier click if producers race. It is also not causal order unless producers serialize on that key and wait for acknowledgements. Salting a campaign across partitions destroys even append order for the campaign as a whole. Hashing by <code>event_id</code> spreads writes evenly but requires a shuffle before aggregation.
+
+A viral campaign still becomes a hot partition under unsalted <code>campaign_id</code> keys.
 
 A practical key is <code>campaign_id + salt</code>, where the salt is deterministic from stable event data and has 8–32 buckets for large campaigns. This produces partial counters that a second stage merges.
 
@@ -109,15 +111,15 @@ In map/reduce terms, partitioning is the map-side routing decision, aggregation 
 
 <ArchitectureDiagram
   title="Salted, two-stage click aggregation"
-  chart={"flowchart LR\n  C[Stateless click collectors] -->|acks=all after ISR replication| K[(Kafka: authoritative event log)]\n  K --> P1[Partition consumer A]\n  K --> P2[Partition consumer B]\n  P1 -->|event + policy version| T1{DB transaction}\n  P2 -->|event + policy version| T2{DB transaction}\n  T1 --> S[(Dedupe IDs + partial counters)]\n  T2 --> S\n  S --> M[Window merge owner]\n  M -->|versioned idempotent upsert| D[(Derived serving DB)]\n  D --> A[Reporting API]\n  K -. replay after crash .-> P1\n  K -. full replay rebuilds derived state .-> S"}
+  chart={"flowchart LR\n  C[Stateless click collectors] -->|acks=all after ISR replication| K[(Kafka: append-ordered event log)]\n  K -->|one partition append order| P1[Partition consumer A]\n  K -->|other partition append order| P2[Partition consumer B]\n  P1 -->|event + policy version| T1{DB transaction}\n  P2 -->|event + policy version| T2{DB transaction}\n  T1 --> S[(Dedupe IDs + partial counters)]\n  T2 --> S\n  S --> M[Window merge owner]\n  M -->|versioned idempotent upsert| D[(Derived serving DB)]\n  D --> A[Reporting API]\n  K -. replay after crash .-> P1\n  K -. full replay rebuilds derived state .-> S"}
 >
 
-Collectors acknowledge a click only after Kafka satisfies the configured durability acknowledgment. Kafka owns the immutable event history. The database transaction owns both the dedupe marker and partial mutation; the Kafka offset is committed afterward. The serving database is derived and rebuildable. The merge stage emits finalized counters after a watermark, while late events update a correction version.
+Collectors acknowledge a click only after Kafka satisfies the configured durability acknowledgment. Kafka owns the immutable event history in **per-partition append order**, not event-time or causal order. Late or skewed click timestamps are handled at the merge watermark, not by offset order. The database transaction owns both the dedupe marker and partial mutation; the Kafka offset is committed afterward. The serving database is derived and rebuildable. The merge stage emits finalized counters after a watermark, while late events update a correction version.
 
 <ArchitectureWalkthrough
   title="Follow ownership and recovery across the aggregation path"
   stages={[
-    { name: "Durable ingest", owner: "Kafka partition leader + replicas", state: "Raw event and ordering within one partition", boundary: "Collector success means the configured replica condition was met.", failure: "Leader fails before durable acknowledgment.", recovery: "Collector retries with the same event ID; downstream dedupe absorbs duplicates." },
+    { name: "Durable ingest", owner: "Kafka partition leader + replicas", state: "Raw event and broker append order in one partition", boundary: "Collector success means the configured replica condition was met.", failure: "Leader fails before durable acknowledgment, or event time disagrees with offset order.", recovery: "Collector retries with the same event ID; downstream dedupe absorbs duplicates; watermarks handle late event time." },
     { name: "Partial update", owner: "Consumer plus external DB", state: "Dedupe marker and salted counter", boundary: "One local DB transaction; Kafka offset remains outside it.", failure: "DB commits but offset commit fails.", recovery: "Kafka redelivers; unique event_id makes the second DB mutation a no-op." },
     { name: "Window merge", owner: "Merge worker", state: "All salt-policy versions for one campaign window", boundary: "Watermark decides provisional versus finalized output.", failure: "A salt policy changes during an open window.", recovery: "Read both versioned policies, then compact after finalization." },
     { name: "Serve", owner: "Sharded counters DB", state: "Versioned materialized campaign totals", boundary: "Derived state, not the audit source of truth.", failure: "Serving shard loses data.", recovery: "Replay Kafka and rebuild partials and merged windows." }
@@ -150,6 +152,7 @@ For a whale wallet that receives enormous fan-out, salted event processing can s
 - **Using modulo hashing without discussing resharding.** Changing from N to N+1 shards remaps most keys. Consistent hashing or virtual shards reduce movement.
 - **Claiming exactly-once end to end.** Kafka transactions cover a defined boundary. External side effects still need idempotency keys, deduplication, or an outbox.
 - **Ignoring skew.** Uniform hashing spreads many distinct keys; it does not split one extremely popular key.
+- **Equating partition order with campaign event-time order.** Kafka orders appends in one partition; event time and causal dependencies need explicit fields.
 - **Aggregating away auditability.** Derived counters cannot explain a discrepancy unless raw events or a durable change log are retained.
 - **Forgetting query scatter.** Sharding by campaign makes campaign reads cheap but cross-campaign reporting fans out. Precompute common rollups or accept bounded scatter.
 - **Moving shards with no transition protocol.** During migration, define who owns writes, how old data copies, and how reads behave before cutover.
@@ -187,6 +190,18 @@ Use many more virtual buckets than physical shards. Route <code>hash(campaign_id
 />
 
 <KnowledgeCheck
+  question="Two collectors hash clicks by campaign_id into one Kafka partition. Click A has event time 12:00:01 and is appended at offset 10; click B has event time 12:00:00 and is appended at offset 11. What order did Kafka preserve?"
+  options={[
+    "Event-time order, so B must appear before A",
+    "Causal order among all campaign producers",
+    "Broker append order: A then B at offsets 10 then 11",
+    "Global order across every campaign partition"
+  ]}
+  correct={2}
+  explanation="A single partition orders records by append offset. Event time can disagree when producers race or clocks skew. Causal order needs a single serial producer or explicit sequence fields; other partitions are unordered relative to this one."
+/>
+
+<KnowledgeCheck
   question="Which TokenX value should remain authoritative rather than being served from an eventually consistent analytics aggregate?"
   options={[
     "Daily transfer volume",
@@ -202,7 +217,7 @@ Use many more virtual buckets than physical shards. Route <code>hash(campaign_id
 
 “I separate the concepts first. Partitioning is the logical routing function, sharding is the physical distribution of those partitions, and aggregation combines partial values. For 100 million clicks per day I get roughly 1.2 thousand events per second on average; I would design for an explicit 10× peak, around 12 thousand per second, and validate event size and retention.
 
-I would durably append clicks to Kafka, initially partitioned by campaign for local ordering. Because a major campaign can dominate traffic, heavy keys use a deterministic salt. Consumers deduplicate on event ID and produce per-minute, per-salt counters; a second stage merges those into campaign totals and performs idempotent upserts to a database sharded by campaign ID. Raw events remain replayable, aggregates are rebuildable, and late data creates corrections after the watermark.
+I would durably append clicks to Kafka, initially keyed by campaign so one partition preserves broker append order for that key—not event-time or causal order. Because a major campaign can dominate traffic, heavy keys use a deterministic salt, which splits even append order until a merge stage. Consumers deduplicate on event ID and produce per-minute, per-salt counters; a second stage merges those into campaign totals and performs idempotent upserts to a database sharded by campaign ID. Raw events remain replayable, aggregates are rebuildable, and late data creates corrections after the watermark.
 
 The trade-off is that salting improves write parallelism but adds merge and read amplification. For TokenX I would apply the same pattern to analytics, not to the authoritative spendable balance, because that invariant needs strong coordination across any shards touched by a transfer.”
 

@@ -22,7 +22,9 @@ objectives:
 
 A distributed lock service can grant one owner at a time according to its own state. It cannot pause a process, retract a message already in flight, or force an external database to ignore an expired owner. Garbage-collection pauses, network partitions, scheduler suspension, and delayed packets can let an old holder continue after a lease expires.
 
-The usual defense is a fencing token: every successful acquisition receives a monotonically increasing epoch, and the protected resource rejects operations with a token lower than the highest it has accepted. Without enforcement at the resource, a lease is coordination advice—not proof of exclusive side effects.
+The usual defense is a fencing token: every successful acquisition receives a monotonically increasing epoch, and the protected resource rejects operations with a token lower than the highest it has **durably** accepted. Lease expiry at the lock service does **not** notify the resource of a newer epoch. Until the new owner persists that high-water token at the resource, a delayed write from the old holder can still be accepted.
+
+Fencing already-observed epochs is not the same as strict immediate exclusion at expiry. The lock service can reassign at time T; the resource only excludes token 42 after it has committed `max_token >= 43`. Without that durable retain-before-work step, and if the high-water mark is only in memory, a restarted resource can forget 43 and accept 42 again. Without enforcement at the resource, a lease is coordination advice—not proof of exclusive side effects.
 
 </BigPicture>
 
@@ -35,8 +37,8 @@ A lease is time-bounded ownership recorded by a linearizable authority. The clie
   steps={[
     { title: "Acquire 42", detail: "Worker A obtains a 30-second lease and fencing token 42 from the lock authority.", state: "The resource has accepted no token above 42.", failure: "A may pause after acquisition without knowing time passed." },
     { title: "Pause", detail: "A stops for 45 seconds during a runtime pause; its local task resumes with token 42.", state: "The lease expired at the authority.", failure: "A still believes it owns the work based on stale memory." },
-    { title: "Acquire 43", detail: "Worker B obtains the next lease and token 43, then writes to the protected store.", state: "The store records highest token 43.", failure: "Without token enforcement, A and B can both write." },
-    { title: "Reject stale A", detail: "A resumes and sends token 42; the store atomically compares and rejects it.", state: "Only epoch 43 can advance protected state.", failure: "If one side-effect destination ignores tokens, split brain remains there." },
+    { title: "Fence 43 first", detail: "Worker B obtains token 43, then durably stores that token as the resource high-water mark before any protected work.", state: "The store's accepted token is 43 even if B has not yet mutated business state.", failure: "If B starts work before the resource retains 43, a delayed token-42 write can still be accepted. Lease expiry alone did not tell the store about 43." },
+    { title: "Reject stale A", detail: "A resumes and sends token 42; the store atomically compares against the retained high-water mark and rejects it.", state: "Only epoch 43 can advance protected state.", failure: "If the store restarts and loses a volatile max token, 42 can be accepted again." },
   ]}
 />
 
@@ -64,17 +66,18 @@ Retain: leases expire, processes pause, messages arrive late, and only the prote
 
 <ArchitectureDiagram
   title="Lease authority and fenced resource"
-  chart={"flowchart LR\n  A[Worker A token 42] --> LOCK[(Linearizable lease service)]\n  B[Worker B] --> LOCK\n  LOCK --> T43[Lease token 43]\n  T43 --> B\n  B --> STORE[(Protected store max token 43)]\n  A -. delayed write token 42 .-> STORE\n  STORE -. reject stale epoch .-> A\n  B --> EFFECT[Idempotent external effect]\n  LOCK -. renewal unavailable .-> STOP[Client stops work]\n  STORE --> AUDIT[(Ownership audit log)]"}
+  chart={"flowchart LR\n  A[Worker A token 42] --> LOCK[(Linearizable lease service)]\n  B[Worker B] --> LOCK\n  LOCK --> T43[Lease token 43]\n  T43 --> B\n  B -->|retain high-water first| STORE[(Durable store max token 43)]\n  A -. delayed write token 42 .-> STORE\n  STORE -. reject stale epoch .-> A\n  RST[Store restart] -->|reload durable max token| STORE\n  B --> EFFECT[Idempotent external effect]\n  LOCK -. expiry does not notify store .-> STORE"}
 >
 
-The lease service owns current holder, expiry, and next token. The store owns enforcement by atomically comparing the request token with its maximum accepted token. External effects require the same fencing or stable idempotency record; protecting only the database while sending an unfenced payment still leaves a split-brain path.
+The lease service owns current holder, expiry, and next token. It does not push expiry to the store. The store owns enforcement by durably retaining the highest accepted token **before** protected work, then atomically comparing each request. A restart must reload that high-water mark; a volatile max token reopens the stale-holder window. External effects need the same fencing or a stable idempotency record.
 
 <ArchitectureWalkthrough
   title="Trace authority to the side effect"
   stages={[
     { name: "Acquire", owner: "Lease consensus group", state: "Owner, expiry, token 43", boundary: "Linearizable conditional grant.", failure: "Authority has no quorum.", recovery: "Do not grant; clients stop or remain idle until quorum returns." },
     { name: "Renew", owner: "Current worker", state: "Last confirmed lease version", boundary: "Renew before a conservative local deadline.", failure: "Pause or partition hides renewal outcome.", recovery: "Stop work and reacquire; never assume renewal succeeded." },
-    { name: "Write", owner: "Protected store", state: "Highest accepted fencing token", boundary: "Atomic token compare with mutation.", failure: "Old worker resumes.", recovery: "Reject its lower token before changing state." },
+    { name: "Fence", owner: "Protected store", state: "Durably retained high-water token", boundary: "Compare-and-set the new epoch before protected work.", failure: "New owner starts work while the store still has the old token, or the store restarts without a durable max.", recovery: "Reject work until the resource has accepted and persisted the new high-water mark." },
+    { name: "Write", owner: "Protected store", state: "Highest accepted fencing token plus business mutation", boundary: "Atomic token compare with mutation.", failure: "Old worker resumes after pause.", recovery: "Reject its lower token before changing state." },
     { name: "Side effect", owner: "Effect adapter", state: "Command ID and token", boundary: "Fenced or idempotent invocation.", failure: "Provider cannot compare tokens.", recovery: "Use one durable dispatcher and provider idempotency key, then reconcile unknown outcomes." },
   ]}
 />
@@ -96,6 +99,7 @@ The lease service owns current holder, expiry, and next token. The store owns en
     { label: "Process pause", impact: "The worker resumes after expiry with obsolete in-memory ownership.", recovery: "Require a fencing token on every protected mutation and reject stale generations." },
     { label: "Renewal timeout", impact: "The renewal may have succeeded or failed; the worker cannot know current ownership.", recovery: "Stop before the conservative deadline, query or reacquire, and make repeated work idempotent." },
     { label: "Lock service partition", impact: "A minority cannot safely grant a new lease, reducing availability.", recovery: "Preserve safety by denying grants; restore quorum rather than creating an independent authority." },
+    { label: "Paused holder plus resource restart", impact: "A expires; B acquires 43; the store restarts and loads a volatile or empty max token; A's delayed token-42 write can be accepted.", recovery: "Persist max_token durably, reload it before serving, and have B retain 43 before any protected mutation." },
   ]}
 />
 
@@ -105,11 +109,12 @@ The lease service owns current holder, expiry, and next token. The store owns en
 
 1. **“The TTL prevents two owners.”** It permits reassignment; it does not stop a paused old process.
 2. **“Use NTP-synchronized clocks.”** Clock synchronization reduces error but does not eliminate pauses, message delay, or clock steps.
-3. **“The lock server says I own it.”** The mutation destination must enforce the token atomically.
-4. **“Renew after expiry if no one else acquired.”** The old epoch is over; reacquire a new token and revalidate work.
-5. **“Lock the whole tenant.”** Calculate contention and choose the smallest key that contains the invariant.
-6. **“A distributed lock makes a remote API atomic.”** Use provider idempotency and durable outcome reconciliation.
-7. **“Release in finally.”** Release is useful but cannot be required for safety because crashed clients never run it.
+3. **“The lock server says I own it.”** The mutation destination must enforce the token atomically, and the new owner must persist that high-water token before protected work.
+4. **“Expiry immediately excludes the old holder.”** Expiry reassigns at the lease service; the resource excludes a stale token only after it has observed a higher durable epoch.
+5. **“Renew after expiry if no one else acquired.”** The old epoch is over; reacquire a new token and revalidate work.
+6. **“Lock the whole tenant.”** Calculate contention and choose the smallest key that contains the invariant.
+7. **“A distributed lock makes a remote API atomic.”** Use provider idempotency and durable outcome reconciliation.
+8. **“Release in finally.”** Release is useful but cannot be required for safety because crashed clients never run it.
 
 </InterviewTraps>
 
@@ -127,7 +132,20 @@ The lease service owns current holder, expiry, and next token. The store owns en
   question="Worker A's lease expires during a 45-second pause. Worker B acquires token 43. What makes A's later token-42 write safe to reject?"
   options={["A's local wall clock", "The protected store's atomic highest-token check", "A best-effort release call", "A shorter DNS TTL"]}
   correct={1}
-  explanation="The resource must remember the highest accepted fencing token and atomically reject lower epochs with the mutation."
+  explanation="The resource must durably remember the highest accepted fencing token and atomically reject lower epochs with the mutation. Lease expiry at the lock service is not that memory."
+/>
+
+<ScenarioCheck
+  scenario="Worker A pauses with token 42. Its lease expires. Worker B acquires token 43 but has not yet written to the store. The store process restarts with an empty in-memory max token. A's delayed write with token 42 arrives first."
+  question="What must be true for the store to reject A?"
+  options={[
+    { label: "Nothing: lease expiry at the lock service already invalidates token 42 everywhere", feedback: "The store is not notified by expiry. Until it has a durable max_token >= 43, it can still accept 42." },
+    { label: "B must persist max_token=43 before protected work, and the restarted store must reload that durable high-water mark before accepting writes", feedback: "Fencing excludes already-observed lower epochs only after the new epoch is retained across restart." },
+    { label: "A shorter lease TTL so B always wins the race", feedback: "TTL changes reassignment speed; it does not install 43 at the resource." },
+    { label: "A should delete token 42 from its memory on pause", feedback: "A paused process cannot be trusted to forget; the resource must reject." },
+  ]}
+  correct={1}
+  explanation="Immediate exclusion at expiry is not available. Safety is retain-then-work plus a durable high-water mark that survives restart."
 />
 
 <ScenarioCheck
@@ -145,7 +163,7 @@ The lease service owns current holder, expiry, and next token. The store owns en
 
 <InterviewAnswer>
 
-“A lease is not enough because an old holder can pause and resume after expiry. I acquire from a linearizable authority, stop work when renewal cannot be confirmed, and attach a monotonically increasing fencing token to every protected mutation. The resource atomically rejects tokens below its highest accepted generation.
+“A lease is not enough because an old holder can pause and resume after expiry. I acquire from a linearizable authority, stop work when renewal cannot be confirmed, and attach a monotonically increasing fencing token to every protected mutation. The new owner durably retains that high-water token at the resource before protected work; the resource reloads it after restart and rejects lower epochs. Expiry at the lock service does not itself inform the store.
 
 I size TTL and renewal from measured pause and network budgets, but fencing—not clocks—is the final safety boundary. I prefer constraints, compare-and-set, or idempotency when they express the invariant more directly. See [consensus and leader election](/learn/consensus-and-leader-election), [replication and failover](/learn/replication-and-failover), and [idempotency](/learn/idempotency-and-deduplication).”
 

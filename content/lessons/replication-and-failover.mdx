@@ -22,7 +22,7 @@ objectives:
 
 Replication creates additional copies for availability, read scale, and disaster recovery, but it does not make every copy equally current or authoritative. The design must name who may accept writes, which acknowledgements make a commit durable, how stale reads may be, and how an old primary is prevented from returning after failover.
 
-For TokenX, a balance check immediately after a transfer needs read-your-writes behavior and usually routes to the leader or waits for a replica to reach the commit log position. An Ad Click Aggregator dashboard can often tolerate seconds of lag. Applying one routing rule to both either violates correctness or wastes capacity.
+For TokenX, a balance check immediately after a transfer needs read-your-writes behavior. The session carries a **read-position token** `{shard, epoch or timeline, commit_position}`, not a bare LSN. The router validates lineage, waits until that commit is applied on that timeline, or sends the read to an authoritative replica that can prove current leadership. An Ad Click Aggregator dashboard can often tolerate seconds of lag. Applying one routing rule to both either violates correctness or wastes capacity.
 
 </BigPicture>
 
@@ -54,9 +54,11 @@ Lag is not just wall-clock time. Compare log positions and retained log availabi
 ### Read guarantees
 
 - **Eventual reads:** route freely and tolerate bounded or measured staleness.
-- **Read-your-writes:** attach the commit position to the session, then read from a replica only after it has applied that position, with a leader fallback.
-- **Monotonic reads:** pin the session or carry a minimum position so it never observes an older snapshot.
-- **Linearizable reads:** read through the current leader or use a quorum protocol that proves leadership and ordering.
+- **Read-your-writes:** attach a token `{shard or log id, epoch or timeline, commit_position}`, then read from a replica only after lineage matches and that position is applied, with a currently authoritative fallback.
+- **Monotonic reads:** pin the session or carry a minimum token so it never observes an older snapshot on that timeline.
+- **Linearizable reads:** do not treat “the node titled leader” as sufficient. Prove current authority (lease, ReadIndex/quorum, or equivalent) and wait until the required index is applied, as in [consensus](/learn/consensus-and-leader-election).
+
+A position number alone is not a token. After failover, promotion, PITR rollback, or shard movement, **equal numeric offsets from different log histories do not imply the same committed data**. Position 884 on epoch 41 of `wallet-7` is not comparable to position 884—or even 50—on epoch 42. The router must reject a token whose shard does not match, whose epoch is not an ancestor of the replica's current timeline, or whose writer has been fenced. If lineage cannot be validated, wait within deadline or fall back to a replica that proves current authority; never compare bare offsets across unrelated timelines.
 
 Replication also multiplies bad state. An accidental delete, corrupt application write, or compromised credential is faithfully copied; backups and point-in-time recovery solve a different problem.
 
@@ -66,33 +68,33 @@ Replication also multiplies bad state. An accidental delete, corrupt application
 
 Imagine a court reporter producing an official transcript while assistants copy it. A copy may be behind, and promoting an assistant requires proving the original reporter can no longer add pages. Replication is copying plus authority control—not merely extra disks.
 
-Remember: acknowledge policy defines possible data loss, applied log position defines freshness, and fencing defines whether failover is safe.
+Remember: acknowledge policy defines possible data loss, applied position **on a named timeline** defines freshness, and fencing defines whether failover is safe.
 
 </MentalModel>
 
 <ArchitectureDiagram
   title="Replication authority, consistency boundary, and split-brain defense"
-  description="A quorum grants one epoch-scoped writer. WAL crosses the replication boundary; reads are routed according to the required log position."
-  chart={"flowchart LR\n  CLIENT[TokenX client] --> ROUTER[Consistency-aware router]\n  ROUTER --> LEADER[(Leader epoch 42)]\n  LEADER --> WAL[(Durable WAL)]\n  WAL --> R1[(Replica A applied LSN)]\n  WAL --> R2[(Replica B applied LSN)]\n  QUORUM[Quorum and lease] --> LEADER\n  QUORUM --> FENCE[Fencing token]\n  FENCE -. rejects old epoch .-> OLD[(Old leader epoch 41)]\n  ROUTER --> R1\n  R1 -. lag exceeds token .-> LEADER\n  R2 -. WAL gap .-> SEED[Snapshot reseed]"}
+  description="A quorum grants one epoch-scoped writer. WAL crosses the replication boundary; session reads carry shard, epoch, and commit position."
+  chart={"flowchart LR\n  CLIENT[TokenX client] --> ROUTER[Token-aware router]\n  ROUTER --> LEADER[(Leader shard S epoch 42)]\n  LEADER --> WAL[(Durable WAL)]\n  WAL --> R1[(Replica A epoch 42 pos 884)]\n  WAL --> R2[(Replica B epoch 41 pos 884)]\n  QUORUM[Quorum and lease] --> LEADER\n  QUORUM --> FENCE[Fencing token]\n  FENCE -. rejects old epoch .-> OLD[(Old leader epoch 41)]\n  ROUTER --> R1\n  ROUTER -. same offset wrong timeline .-> R2\n  R1 -. apply lag .-> LEADER"}
 >
 
-The leader is the write authority only while its current epoch is valid. WAL is the ordered durability and recovery boundary. Followers own local replay state, not independent truth. The dashed paths make degraded behavior explicit: stale reads fall back to the leader, an obsolete leader is rejected, and an unrecoverable log gap triggers reseeding.
-
-</ArchitectureDiagram>
+The leader is the write authority only while its current epoch is valid and current-authority checks still pass. WAL is the ordered durability and recovery boundary **for one shard timeline**. Followers own local replay state, not independent truth. Replica B at numeric position 884 on epoch 41 is not eligible for a token `{S, 42, 884}`. Stale or deposed leaders are rejected; apply lag falls back to a currently authoritative replica.
 
 <ArchitectureWalkthrough
   title="Read and failure paths"
   stages={[
-    { name: "Commit", owner: "Current leader", state: "Committed WAL position", boundary: "Configured durability acknowledgement.", failure: "Leader fails before follower persistence.", recovery: "Honor the documented RPO and resolve requests by idempotency key." },
-    { name: "Replicate", owner: "Follower", state: "Received, durable, and applied positions", boundary: "Ordered WAL replay.", failure: "Replay stalls or required WAL expires.", recovery: "Remove from routing, catch up, or reseed from a snapshot." },
-    { name: "Route", owner: "Consistency-aware router", state: "Session minimum position", boundary: "Per-operation staleness policy.", failure: "No replica satisfies the token.", recovery: "Wait within deadline or fall back to the leader." },
-    { name: "Recover", owner: "Quorum coordinator", state: "Membership, lease, and epoch", boundary: "One fenced writer.", failure: "Old leader returns after promotion.", recovery: "Reject its stale epoch and reconcile ambiguous commits." },
+    { name: "Commit", owner: "Current leader", state: "Committed WAL on shard S, epoch 42", boundary: "Configured durability acknowledgement.", failure: "Leader fails before follower persistence.", recovery: "Honor the documented RPO and resolve requests by idempotency key." },
+    { name: "Replicate", owner: "Follower", state: "Received, durable, and applied positions on that epoch", boundary: "Ordered WAL replay of one timeline.", failure: "Replay stalls, WAL expires, or the replica still serves a fenced epoch.", recovery: "Remove from routing, catch up, reseed, or wait for a successor timeline." },
+    { name: "Route", owner: "Consistency-aware router", state: "Session token {shard, epoch, position}", boundary: "Lineage plus applied index.", failure: "Replica has the same number on a different history, or a titled leader cannot prove current authority.", recovery: "Wait within deadline or fall back to a replica that proves current leadership and has applied the required commit." },
+    { name: "Recover", owner: "Quorum coordinator", state: "Membership, lease, and new epoch", boundary: "One fenced writer.", failure: "Old leader returns after promotion.", recovery: "Reject its stale epoch and treat tokens from the old timeline as non-comparable until ancestry is proven." },
   ]}
 />
 
+</ArchitectureDiagram>
+
 <RealExamples>
 
-**TokenX transfer.** The POST response includes a transfer ID and commit position. A subsequent balance GET carries that position. A local replica may serve it only after applying the position; otherwise the router waits briefly or uses the leader. An idempotency key resolves a timeout where the client cannot tell whether commit occurred.
+**TokenX transfer.** The POST response includes a transfer ID and token `{shard, epoch, commit_position}`. A subsequent balance GET carries that token. A replica may serve it only after lineage matches and the position is applied; otherwise the router waits briefly or uses a replica that proves **current** authority (not merely a leader title). An idempotency key resolves a timeout where the client cannot tell whether commit occurred.
 
 **Ad Click Aggregator.** Campaign dashboards read followers with a 10-second freshness SLO. If lag exceeds the threshold, show “data delayed” or route to another replica rather than silently presenting old totals as current. Raw events remain in the durable log so projections can be rebuilt.
 
@@ -105,6 +107,7 @@ The leader is the write authority only while its current epoch is valid. WAL is 
     { label: "Old leader accepts writes", impact: "Two histories diverge even if most clients route to the promoted node.", recovery: "Reject the old epoch at storage or database enforcement and quarantine its divergent writes." },
     { label: "Replica lacks recent WAL", impact: "Promotion can lose acknowledged asynchronous commits.", recovery: "Select by durable log position, publish the true RPO, and reconcile ambiguous requests by idempotency key." },
     { label: "Clients cache the old route", impact: "Some requests keep reaching an obsolete endpoint after cutover.", recovery: "Combine routing changes with server-side epoch rejection; DNS alone is not fencing." },
+    { label: "Same numeric offset, new timeline", impact: "A replica reports applied position 884 on epoch 41 while the session token is epoch 42 position 884; the numbers match and the read looks fresh.", recovery: "Reject the replica until it serves a successor of epoch 41 and has applied the token's commit on that lineage." },
   ]}
 />
 
@@ -115,8 +118,10 @@ The leader is the write authority only while its current epoch is valid. WAL is 
 1. **“Replicas guarantee no data loss.”** Ask when success is returned and how many failure-independent copies have persisted the commit.
 2. **“Promote when health checks fail.”** A slow node and a partition look alike. Promotion requires quorum and fencing, not a single observer's timeout.
 3. **“Replica lag is two seconds.”** Specify received, durable, and applied positions; clock-based lag can hide a stalled stream with no new traffic.
-4. **“Read replicas are transparent.”** State which endpoints tolerate stale data and how read-your-writes or monotonic sessions are enforced.
-5. **“Replication is our backup.”** Replication propagates logical corruption and deletion. Tested, isolated recovery points are still necessary.
+4. **“Read replicas are transparent.”** State which endpoints tolerate stale data and how tokens of shard, epoch, and position enforce read-your-writes.
+5. **“Position 884 is 884.”** Offsets are comparable only on one shard timeline. Failover, rollback, and resharding start new histories.
+6. **“Send it to the leader for freshness.”** A deposed or partitioned leader can serve an old prefix unless the read proves current authority and apply.
+7. **“Replication is our backup.”** Replication propagates logical corruption and deletion. Tested, isolated recovery points are still necessary.
 
 A strong IC6 answer includes the ambiguity window: after a leader dies, clients retry with stable idempotency keys while operators reconcile commits near the last durable position.
 
@@ -133,10 +138,29 @@ A strong IC6 answer includes the ambiguity window: after a leader dies, clients 
 </Tradeoffs>
 
 <KnowledgeCheck
-  question="A follower has 1.8 GB of WAL backlog. It receives 45 MB/s while the leader continues producing 15 MB/s. Ignoring overhead, how long until it catches up?"
-  options={["40 seconds", "60 seconds", "120 seconds", "It can never catch up"]}
+  question="A client holds read token {shard: wallet-7, epoch: 41, position: 884}. Failover promotes a replica as epoch 42 on the same shard. A follower reports applied position 884. What is the safest read-your-writes behavior?"
+  options={[
+    "Serve from any replica whose applied position is at least 884, ignoring epoch",
+    "Validate that the replica's timeline is a successor of epoch 41, then require the corresponding applied position, otherwise use a currently authoritative replica",
+    "Drop the token because a new leader starts positions at zero",
+    "Compare replica wall-clock lag with the client's commit time"
+  ]}
   correct={1}
-  explanation="Only 30 MB/s is available to reduce backlog, so 1,800 MB divided by 30 MB/s is 60 seconds."
+  explanation="Positions are comparable only on a named log and failover lineage. After a new epoch, ancestry must be proven; a bare offset can match the wrong history."
+/>
+
+<ScenarioCheck
+  title="Same offset, different timeline"
+  scenario="After promotion, replica B still has epoch 41 WAL. Its applied LSN is 884. The client's token is {wallet-7, epoch 42, position 884} from a transfer committed by the new leader. Replica B's 884 is a different record than the new leader's 884."
+  question="Why must the router refuse B for this session read?"
+  options={[
+    { label: "B is behind because 884 is less than 885", feedback: "The numbers are equal. The defect is mismatched history, not a smaller integer." },
+    { label: "Equal numeric offsets from different epochs do not imply the same committed data; B is not on a successor of the token's timeline", feedback: "Lineage validation is required after failover. Wait for B to join epoch 42 and apply the new 884, or read from current authority." },
+    { label: "The leader title on any node is enough, so send the read to B if it was a leader recently", feedback: "A former leader can serve a stale prefix without current-authority proof." },
+    { label: "Tokens should be discarded at failover so all replicas become eligible", feedback: "Discarding the dependency silently loses read-your-writes." },
+  ]}
+  correct={1}
+  explanation="Failover starts a new log history. Compare shard, epoch ancestry, then applied position—never the integer alone."
 />
 
 <ScenarioCheck
@@ -154,7 +178,7 @@ A strong IC6 answer includes the ambiguity window: after a leader dies, clients 
 
 <InterviewAnswer>
 
-“I define replication with positions and authority. The leader acknowledges according to a quantified durability policy, followers publish durable and applied positions, and the router enforces eventual, read-your-writes, or linearizable behavior per operation. I calculate backlog and catch-up headroom rather than calling a replica healthy because it is connected.
+“I define replication with tokens and authority. The leader acknowledges according to a quantified durability policy, followers publish durable and applied positions on a named shard epoch, and the router enforces eventual, read-your-writes, or linearizable behavior per operation. A session token is shard, timeline, and commit position; equal offsets on different histories are not the same data. Linearizable reads still prove current leadership rather than trusting a leader title. I calculate backlog and catch-up headroom rather than calling a replica healthy because it is connected.
 
 Failover requires quorum, fencing, a new epoch, idempotent retries, and reconciliation of ambiguous commits. Cross-region asynchronous copies imply nonzero RPO; synchronous copies add WAN latency and can reduce availability. Replication is not backup. See [indexes and query execution](/learn/indexes-and-query-execution), [transactions across boundaries](/learn/transactions-across-boundaries), and [backup and recovery](/learn/backup-restore-and-disaster-recovery).”
 

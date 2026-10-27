@@ -114,6 +114,7 @@ The publish boundary is the conditional metadata transition to `AVAILABLE` for a
 3. **“ETag is the MD5.”** Multipart and encrypted objects may use different semantics. Request and verify a defined checksum.
 4. **“Rename the object atomically.”** Many object stores use copy-plus-delete or lack filesystem rename. Publish by switching a metadata pointer to an immutable key.
 5. **“Delete means gone.”** Account for versions, replicas, CDN caches, archives, backups, legal holds, and encryption keys.
+6. **“Bytes in the bucket are live.”** Assembled parts are still quarantined while metadata is `UPLOADING`. The CDN must not serve until a conditional control-plane commit marks the exact version `AVAILABLE`.
 
 An IC6 answer names the incomplete states and cleanup owners rather than describing only the happy path.
 
@@ -130,10 +131,15 @@ An IC6 answer names the incomplete states and cleanup owners rather than describ
 </Tradeoffs>
 
 <KnowledgeCheck
-  question="How many 64 MiB parts are required for a 5 GiB object?"
-  options={["64", "80", "100", "5120"]}
+  question="A client uploaded every part, object storage assembled the bytes, and the worker crashed while the metadata row is still UPLOADING. Which assumption is false?"
+  options={[
+    "A later reconciler may verify checksums and conditionally publish the same object version as AVAILABLE",
+    "The CDN may start serving the object key because the bytes now exist",
+    "An operator may retry complete-multipart with the stored part list and checksum",
+    "Orphan cleanup may delete abandoned uploads after the record's expiry"
+  ]}
   correct={1}
-  explanation="Five GiB is 5 × 1024 MiB; dividing by 64 MiB gives 80 parts."
+  explanation="The false assumption is that data-plane existence equals publication. Bytes assembled under UPLOADING stay quarantined. Readers and the CDN must wait for a conditional control-plane commit to AVAILABLE; otherwise they can observe unvalidated or unauthorized content."
 />
 
 <ScenarioCheck

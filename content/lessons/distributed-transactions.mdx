@@ -48,7 +48,25 @@ In phase one, a coordinator asks each participant to prepare. A prepared partici
 
 A saga persists a state machine before issuing each idempotent step. If a later step fails, it executes compensations in a defined order. Compensation is not rollback: shipping cannot be unshipped, exchange rates change, and refunds can fail. Put irreversible actions late and include terminal states such as `MANUAL_REVIEW`.
 
-For a cross-shard TokenX transfer of 100 units, shard A can append a 100-unit reservation that reduces available balance without finalizing the debit. Shard B accepts one credit command keyed by transfer ID. After the credit is durably confirmed, A converts the reservation to a final debit. If the deadline expires before credit, A releases it. A fencing epoch prevents an old coordinator from finalizing after release.
+For a cross-shard TokenX transfer of 100 units, the invariant is conservation plus uniqueness: those 100 units are reserved on A, credited on B, or returned to A—never both spent on A and credited on B, and never credited twice. Each shard's ledger is authoritative for its own rows. The coordinator is not. Durability means a state is committed in that shard's log or database; an RPC response is not a source of truth.
+
+Use one stable `transfer_id` on every message. Shard B stores one row keyed by `transfer_id` with durable states `ABSENT → CREDITED | CANCELLED`. `CREDITED` and `CANCELLED` are mutually exclusive terminals. Credit and cancel compete in **one serializable destination transaction**: compare-and-set from `ABSENT`, or insert under a unique constraint, then return the committed row. Duplicates return that same outcome. A delayed credit after `CANCELLED` is rejected. A delayed cancel after `CREDITED` cannot reverse the credit. Cancel of an `ABSENT` id still writes a durable `CANCELLED` tombstone so a later credit cannot sneak in.
+
+Do not use a provisional, spendable destination credit unless you specify a second exclusive protocol (held funds, reverse journal, and a total order with finalize). This lesson uses the simpler terminal-credit model: B either commits a final credit or a cancel tombstone.
+
+Shard A creates the reservation with an atomic insert unique on `transfer_id` (a unique constraint or insert-if-absent). Concurrent reserve attempts for the same id must not create two `RESERVED` rows; losers see the existing reservation. After that insert, the row is `RESERVED → FINALIZED | RELEASED`. Those terminals are mutually exclusive: there is no path that can reach both. Each change is an atomic conditional update (`UPDATE ... WHERE transfer_id = ? AND state = 'RESERVED'`). Finalize consumes the reservation into a debit. Release returns the 100 units to available balance.
+
+A deadline does not prove that B failed. If confirmation is missing, the coordinator persists `UNRESOLVED` and queries B for the committed `transfer_id` row. If B is `CREDITED`, finalize A. If B is `CANCELLED`, release A. If B is still `ABSENT` or the query times out, remain `UNRESOLVED` and retry. Never treat an RPC timeout, a cache miss, or “no credit seen yet” as cancellation. Coordinator epochs still fence stale workers, but they do not replace B's tombstone: a late credit after A has `RELEASED` mints money.
+
+<ExecutionTimeline
+  title="Delayed, duplicate, reordered, and lost transfer messages"
+  steps={[
+    { title: "Lost confirmation", detail: "B commits CREDITED for transfer T, then the response is dropped.", state: "A remains RESERVED; coordinator becomes UNRESOLVED.", failure: "Treating the timeout as abort would leave B credited and A spendable.", recovery: "Query T on B; CREDITED drives a conditional RESERVED to FINALIZED." },
+    { title: "Duplicate credit", detail: "A retried credit arrives after B already stored CREDITED.", state: "B's unique transfer_id row is unchanged.", failure: "A new identity would mint a second credit.", recovery: "The second command returns the existing CREDITED outcome." },
+    { title: "Reorder: cancel then credit", detail: "Timeout cancel commits CANCELLED while ABSENT; a delayed credit arrives later.", state: "Tombstone is durable before the late credit is applied.", failure: "Applying credit after release on A would mint money.", recovery: "The credit loses the compare-and-set from ABSENT and is rejected." },
+    { title: "Reorder: credit then cancel", detail: "B already committed CREDITED; a delayed cancel arrives.", state: "Destination terminal is CREDITED.", failure: "Reversing a spendable credit would steal from the destination.", recovery: "Cancel is a no-op failure; coordinator finalizes A, never releases." },
+  ]}
+/>
 
 Escrow allocates bounded rights: if a global inventory has 10,000 units, region West may receive 4,000 sale rights and East 6,000. Each can sell locally without coordination until its allocation is exhausted. Rebalancing rights needs coordination, and the sum of outstanding rights plus sold units must preserve the invariant.
 
@@ -65,19 +83,20 @@ Retain: keep invariants local first; otherwise choose atomic blocking, visible i
 </MentalModel>
 
 <ArchitectureDiagram
-  title="Cross-shard TokenX reservation saga"
-  chart={"flowchart LR\n  API[Transfer API] --> ORCH[(Durable saga state)]\n  ORCH --> A[(Shard A reserve debit)]\n  ORCH --> B[(Shard B idempotent credit)]\n  B --> CONF[Credit confirmation]\n  CONF --> A\n  A --> DONE[Finalize transfer]\n  ORCH -. deadline .-> RELEASE[Release reservation]\n  RELEASE --> A\n  OLD[Old coordinator epoch] -. fenced .-> A\n  A --> OUT[(Outbox audit events)]\n  OUT -. replay .-> RECON[Reconciliation]"}
+  title="Cross-shard TokenX exclusive terminals"
+  chart={"flowchart LR\n  UNRES[Coordinator UNRESOLVED]\n  subgraph dest [B exclusive terminals]\n    BABS[B ABSENT]\n    BABS -->|credit wins| BCRED[B CREDITED]\n    BABS -->|cancel wins| BCANC[B CANCELLED]\n  end\n  subgraph src [A exclusive terminals]\n    ARES[A RESERVED]\n    ARES -->|from RESERVED| AFIN[A FINALIZED]\n    ARES -->|from RESERVED| AREL[A RELEASED]\n  end\n  UNRES -->|query transfer_id row| BABS\n  BCRED -->|durable query| AFIN\n  BCANC -->|durable query| AREL\n  DLYC[Delayed credit command] -. rejected delayed credit .-> BCANC\n  DLYX[Delayed cancel command] -. rejected delayed cancel .-> BCRED"}
 >
 
-Shard A owns the spendable-balance reservation; shard B owns the credited entry after its local commit. The saga store owns workflow state, deadlines, and epochs, but it cannot overwrite either ledger. Stable transfer IDs make messages replay-safe. Reconciliation compares saga state with both immutable ledgers and escalates unexplained divergence.
+Shard A owns one reservation row per `transfer_id`, inserted uniquely, then `RESERVED → FINALIZED | RELEASED`. Shard B owns `ABSENT → CREDITED | CANCELLED`. Each pair is a fork, not a chain: the two terminals cannot both be reached. Each change is one local serializable transaction on that shard. The coordinator owns only workflow state, including `UNRESOLVED`; it cannot write balances. Timeout is unknown: query B's committed `transfer_id` row. `CREDITED` authorizes finalize; `CANCELLED` (a tombstone, even if no credit ever existed) authorizes release. `ABSENT` or a lost query keeps `UNRESOLVED`. Dashed edges are rejected commands, not state transitions: a late credit is rejected against a tombstone, and a late cancel is rejected against a committed credit. Neither dashed edge moves B from `CANCELLED` to `CREDITED` or the reverse. Reconciliation compares both ledgers and escalates unexplained divergence.
 
 <ArchitectureWalkthrough
   title="Walk the reservation consistency boundaries"
   stages={[
-    { name: "Reserve", owner: "Source ledger shard", state: "Debit reservation and available balance", boundary: "One local serializable transaction.", failure: "Concurrent spend competes for funds.", recovery: "Only one transaction reserves the remaining balance; retry losers safely." },
-    { name: "Credit", owner: "Destination ledger shard", state: "Transfer-ID-keyed credit", boundary: "Idempotent local commit.", failure: "Confirmation is lost after credit.", recovery: "Retry the same transfer ID and return the stored result." },
-    { name: "Finalize", owner: "Saga coordinator", state: "Confirmed epoch and workflow state", boundary: "Fenced state transition.", failure: "Old coordinator races a timeout release.", recovery: "Ledger rejects stale epoch; reconciliation resolves the durable winner." },
-    { name: "Reconcile", owner: "Financial controls", state: "Cross-shard evidence and alerts", boundary: "No silent money repair.", failure: "Automated retries exhaust.", recovery: "Enter manual review with immutable evidence and controlled compensating entries." },
+    { name: "Reserve", owner: "Source ledger shard", state: "A RESERVED; available balance reduced", boundary: "Atomic unique insert of one transfer_id reservation.", failure: "Concurrent spend competes for funds, or two reserves share the same id.", recovery: "Insert-if-absent or a unique constraint keeps a single RESERVED row; other funds races abort and retry with that same transfer_id." },
+    { name: "Credit or cancel", owner: "Destination ledger shard", state: "B ABSENT until one winner", boundary: "Serializable compare-and-set on transfer_id.", failure: "Credit and cancel race, or a duplicate arrives.", recovery: "One command commits CREDITED or CANCELLED; all others return that committed outcome." },
+    { name: "Resolve timeout", owner: "Saga coordinator", state: "Durable UNRESOLVED workflow", boundary: "Act only on B's committed row, never on RPC silence.", failure: "Query times out or B is still ABSENT.", recovery: "Remain UNRESOLVED and retry; do not release." },
+    { name: "Finalize or release", owner: "Source ledger shard", state: "A FINALIZED or A RELEASED", boundary: "Conditional update from RESERVED only.", failure: "Stale coordinator retries the opposite terminal.", recovery: "The second update affects zero rows; the first committed terminal stands." },
+    { name: "Reconcile", owner: "Financial controls", state: "Cross-shard evidence and alerts", boundary: "No silent money repair.", failure: "Automated retries exhaust.", recovery: "Enter manual review with immutable transfer_id evidence." },
   ]}
 />
 
@@ -85,7 +104,7 @@ Shard A owns the spendable-balance reservation; shard B owns the credited entry 
 
 <RealExamples title="Atomicity where needed, workflows where visible">
 
-**TokenX.** Prefer co-location and one transaction for common transfers. For cross-shard flow, reservation plus idempotent credit exposes `PENDING` honestly. If product requires an instantaneous all-or-nothing balance across shards, use a database that supports the required distributed transaction or redesign ownership rather than disguising a saga.
+**TokenX.** Prefer co-location and one transaction for common transfers. For cross-shard flow, A inserts one unique `RESERVED` row, B commits `CREDITED` or `CANCELLED`, and A then `FINALIZED` or `RELEASED`. Expose `PENDING` and `UNRESOLVED` honestly. If product requires instantaneous all-or-nothing balances across shards, use a database that supports that distributed transaction or redesign ownership rather than disguising a saga.
 
 **Ad Click billing.** Closing a campaign period, producing an invoice, and charging a provider is a saga. The closed aggregate version is immutable; invoice creation uses a unique period key; provider calls carry an idempotency key. A correction produces an adjustment, not deletion of an already issued invoice.
 
@@ -95,7 +114,7 @@ Shard A owns the spendable-balance reservation; shard B owns the credited entry 
   choices={[
     { label: "2PC participant prepared", impact: "It cannot safely choose a different outcome and may hold locks while waiting for the recorded decision.", recovery: "Query the replicated coordinator decision and apply only that durable result." },
     { label: "Saga step timed out", impact: "Timeout means unknown outcome, so starting compensation immediately may race a successful step.", recovery: "Retry or query by stable command ID, then compensate only from confirmed durable state." },
-    { label: "Reservation expires", impact: "A late old coordinator could try to finalize rights already returned to available balance.", recovery: "Use an epoch or reservation version that the ledger validates on finalize." },
+    { label: "Reservation deadline fires", impact: "Timeout does not mean the destination failed; releasing immediately can race a delayed credit commit.", recovery: "Enter UNRESOLVED and query B. Release A only if B has committed CANCELLED; finalize if CREDITED; retry if ABSENT or the query is unknown." },
   ]}
 />
 
@@ -106,10 +125,12 @@ Shard A owns the spendable-balance reservation; shard B owns the credited entry 
 1. **“2PC rolls back after prepare.”** A YES voter promised not to abort independently; unilateral rollback can violate atomicity.
 2. **“Sagas are eventually consistent transactions.”** They expose real intermediate states and require business compensation, not database rollback.
 3. **“Retry the remote call.”** Timeout is an unknown outcome; retry only with stable identity and queryable durable result.
-4. **“Compensation always succeeds.”** Model retry exhaustion, irreversible actions, changed prices, and manual resolution.
-5. **“Reserve with a cache TTL.”** The authoritative ledger must own reservation amount, version, and release transition atomically.
-6. **“Consensus solves cross-shard atomicity.”** Each shard may have consensus internally; atomic agreement across groups is still another protocol.
-7. **“Dual write then repair.”** That is acceptable only if the invariant tolerates the inconsistent interval and repair semantics are explicit.
+4. **“Release the reservation when the deadline fires.”** Deadline expiry is still unknown. Release only after B's durable `CANCELLED` tombstone; absence of a credit row is not cancellation.
+5. **“No credit means cancel.”** Cancel must persist `CANCELLED` even when B was `ABSENT`. Otherwise a delayed credit still commits.
+6. **“Compensation always succeeds.”** Model retry exhaustion, irreversible actions, changed prices, and manual resolution.
+7. **“Reserve with a cache TTL.”** The authoritative ledger must own reservation amount and the exclusive `FINALIZED`/`RELEASED` transition atomically.
+8. **“Consensus solves cross-shard atomicity.”** Each shard may have consensus internally; atomic agreement across groups is still another protocol.
+9. **“Dual write then repair.”** That is acceptable only if the invariant tolerates the inconsistent interval and repair semantics are explicit.
 
 </InterviewTraps>
 
@@ -117,7 +138,7 @@ Shard A owns the spendable-balance reservation; shard B owns the credited entry 
 
 - 2PC provides atomic commit across compatible participants but adds synchronous latency, lock duration, and blocking recovery.
 - Sagas scale organizationally and allow independent commits, but users observe pending states and compensation can be incomplete.
-- Reservations bound overspend while permitting asynchronous completion, at the cost of temporarily unavailable capacity and expiry races.
+- Reservations bound overspend while permitting asynchronous completion, at the cost of temporarily unavailable capacity and an explicit `UNRESOLVED` wait until B's terminal state is known.
 - Escrow enables local availability for divisible invariants, but rights allocation can become skewed and rebalancing needs coordination.
 - Co-locating an invariant often beats every distributed protocol, but may create hot shards or constrain placement.
 
@@ -130,23 +151,43 @@ Shard A owns the spendable-balance reservation; shard B owns the credited entry 
   explanation="After voting YES, the participant cannot independently abort. It must learn and apply the single durable global decision."
 />
 
+<KnowledgeCheck
+  question="A TokenX cross-shard reservation deadline fires and shard B has not confirmed. Why is releasing the reservation immediately unsafe?"
+  options={["The coordinator epoch is always expired at the deadline", "A delayed destination credit can still commit, minting money if source funds are already spendable again", "Reservations must never be released", "2PC requires the deadline to abort both shards"]}
+  correct={1}
+  explanation="Timeout is an unknown outcome. Query B's durable transfer_id row. Release A only after B has committed CANCELLED; if B is CREDITED, finalize A; if B is ABSENT or the query is unknown, remain UNRESOLVED."
+/>
+
 <ScenarioCheck
-  scenario="Shard B committed a TokenX credit, but its confirmation timed out. Shard A still holds the debit reservation."
+  scenario="Shard B committed CREDITED for transfer T, but its confirmation timed out. Shard A is still RESERVED."
   question="What should the coordinator do next?"
   options={[
-    { label: "Release immediately and create a new transfer ID", feedback: "That can leave the destination credited while the source funds become spendable again." },
-    { label: "Retry or query shard B with the same transfer ID, then finalize from the stored outcome", feedback: "Stable identity resolves the unknown result without double crediting." },
-    { label: "Credit shard B again with a random ID", feedback: "A new identity defeats deduplication and can mint value." },
+    { label: "Release A immediately and create a new transfer ID", feedback: "B already credited T; releasing A mints money and a new id can credit again." },
+    { label: "Stay UNRESOLVED, query B for T, and conditionally update A from RESERVED to FINALIZED because B is CREDITED", feedback: "The destination terminal is already CREDITED, so the matching source terminal is FINALIZED, never RELEASED." },
+    { label: "Send cancel for T so B can reverse the credit, then release A", feedback: "CANCELLED cannot overwrite CREDITED; reversing a committed destination credit violates conservation." },
     { label: "Edit both ledgers from the coordinator database", feedback: "The coordinator does not own either ledger's authoritative state." },
   ]}
   correct={1}
-  explanation="Unknown outcomes require idempotent resolution. Once B confirms its existing credit, A can finalize the matching reservation under the current epoch."
+  explanation="Query the durable transfer_id row. CREDITED on B authorizes only FINALIZED on A. Cancel is rejected after CREDITED and must not drive a source release."
+/>
+
+<ScenarioCheck
+  scenario="The coordinator's deadline fired with no confirmation. It wrote CANCELLED on B while B was ABSENT, then a delayed credit for the same transfer_id arrives. A is still RESERVED."
+  question="What preserves the transfer invariant?"
+  options={[
+    { label: "Apply the delayed credit because it was sent first", feedback: "Send order is not commit order. CANCELLED already won the destination compare-and-set." },
+    { label: "Reject the delayed credit, keep B CANCELLED, and conditionally update A from RESERVED to RELEASED", feedback: "The tombstone is the exclusive destination terminal; release is the matching source terminal." },
+    { label: "Release A because the original credit RPC timed out, then apply the delayed credit", feedback: "Timeout is not cancellation of a not-yet-tombstoned id, and credit after RELEASED mints money." },
+    { label: "Leave B ABSENT so operators can choose later", feedback: "ABSENT is not a terminal; a later credit would still commit." },
+  ]}
+  correct={1}
+  explanation="Credit and cancel race in one destination transaction. After CANCELLED, duplicates and delayed credits return that tombstone. Only then may A move RESERVED to RELEASED."
 />
 
 <InterviewAnswer>
 
 “I first try to keep the invariant in one transaction. When participants must commit independently, 2PC gives atomic agreement but can block after prepare and holds resources across failures. A saga instead persists a workflow of idempotent local commits and domain compensations, exposing pending states honestly.
 
-For cross-shard TokenX I use a source-ledger reservation, destination credit keyed by transfer ID, fenced finalize or release, and reconciliation. Timeout is an unknown outcome, so I query or retry the same identity rather than assume failure. Escrow is useful when a divisible global limit can be preallocated. See [transactions across boundaries](/learn/transactions-across-boundaries), [consensus](/learn/consensus-and-leader-election), and [idempotency](/learn/idempotency-and-deduplication).”
+For cross-shard TokenX I keep conservation with exclusive terminals: B is `ABSENT → CREDITED | CANCELLED` under one serializable decision on `transfer_id`; A inserts one `RESERVED` row uniquely on `transfer_id`, then `RESERVED → FINALIZED | RELEASED` by conditional update. Timeout is `UNRESOLVED`: I query B's committed row, finalize if `CREDITED`, release only if `CANCELLED`, and retry if unknown. A tombstone is required even when no credit existed, because absence is not a fence. Escrow is useful when a divisible global limit can be preallocated. See [transactions across boundaries](/learn/transactions-across-boundaries), [consensus](/learn/consensus-and-leader-election), and [idempotency](/learn/idempotency-and-deduplication).”
 
 </InterviewAnswer>

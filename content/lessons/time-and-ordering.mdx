@@ -48,7 +48,21 @@ Vector clocks track counters per participant. One vector dominating another prov
 
 ### Clock uncertainty and commit wait
 
-Some externally consistent databases expose a time interval `[earliest, latest]` that bounds current time. If a transaction chooses commit timestamp `t`, it can wait until the uncertainty interval's earliest possible current time exceeds `t` before acknowledging, ensuring later transactions observe real-time order. If uncertainty is 7 ms, this can add up to roughly 7 ms of commit wait, not counting replication.
+Some externally consistent databases expose a TrueTime-style interval `[earliest, latest]` that bounds current time. Define the symbols: **epsilon (ε)** is the **half-width** of that interval, so `[earliest, latest] = [now − ε, now + ε]` and the **full interval width is 2ε**. If a measured bound is “uncertainty 7 ms,” treat that as ε = 7 ms unless the vendor documents otherwise; two hosts' intervals can then overlap by up to 14 ms.
+
+If a transaction assigns commit timestamp `t = latest` (the conservative end), it must wait until `earliest > t` before acknowledging so a later transaction that starts after the ack cannot overlap `t`. Worst-case **commit wait is about 2ε** (14 ms when ε = 7 ms), not ε.
+
+Replication can **overlap** that wait: extra client-visible delay is `max(0, remaining_commit_wait − replication_time)`, not 2ε stacked on top of replication every time. Assumptions: the advertised ε bound holds for the commit, the wait is not skipped, and later work starts only after observing the acknowledgement.
+
+<Calculation label="TrueTime commit wait with ε = 7 ms">
+Interval = [now − 7 ms, now + 7 ms]; width = 14 ms = 2ε
+
+t = latest = now + 7 ms
+
+Wait until earliest' > t ⇒ (now' − 7 ms) > (now + 7 ms) ⇒ now' − now > 14 ms
+
+If replication already used 10 ms in parallel: extra wait ≈ max(0, 14 − 10) = 4 ms
+</Calculation>
 
 For leases, suppose estimated maximum clock error is 100 ms, network delay budget 200 ms, and process pause budget 1 second. A client must stop well before server expiry by at least that uncertainty envelope. Even then, fencing is required because assumptions can be exceeded.
 
@@ -68,15 +82,15 @@ Retain: record business time and processing order separately, carry dependencies
 
 <ArchitectureDiagram
   title="Business time, causal dependency, and replay order"
-  chart={"flowchart LR\n  CFG[Campaign service] --> CDB[(Config version 81)]\n  CDB --> OUT[(Outbox with HLC)]\n  OUT --> EDGE[Edge collector]\n  EDGE --> CLICK[Click with event time and config 81]\n  CLICK --> LOG[(Partition log offset)]\n  LOG --> PROC[Window processor]\n  CDB --> PROC\n  PROC --> AGG[(Versioned aggregate)]\n  LATE[Late event] -. correction .-> PROC\n  CLOCK[Clock uncertainty monitor] -. unhealthy clock .-> STOP[Stop lease or commit path]"}
+  chart={"flowchart LR\n  CFG[Campaign service] --> CDB[(Config version 81)]\n  CDB --> OUT[(Outbox with HLC)]\n  OUT --> EDGE[Edge collector]\n  EDGE --> CLICK[Click with event time and config 81]\n  CLICK --> LOG[(Partition log offset)]\n  LOG --> PROC[Window processor]\n  CDB --> PROC\n  PROC --> AGG[(Versioned aggregate)]\n  TT[TrueTime earliest latest] --> WAIT[Commit wait until earliest exceeds t]\n  WAIT --> ACK[Ack after ~2ε minus overlap]\n  LATE[Late event] -. correction .-> PROC\n  CLOCK[Clock uncertainty monitor] -. unhealthy clock .-> STOP[Stop lease or commit path]"}
 >
 
-The configuration database owns version 81. The log owns per-partition replay order. The click owns source-reported event time plus an explicit configuration dependency. The aggregate is derived and versioned. Clock health can gate protocols that assume bounded uncertainty, but it does not replace version or fencing checks.
+The configuration database owns version 81. The log owns per-partition replay order. The click owns source-reported event time plus an explicit configuration dependency. The aggregate is derived and versioned. TrueTime's `[earliest, latest]` gates externally consistent commit acks: wait until `earliest > t` (worst case ~2ε, overlapping replication). Clock health can gate protocols that assume bounded ε, but it does not replace version or fencing checks.
 
 <ArchitectureWalkthrough
   title="Choose the right notion of order"
   stages={[
-    { name: "Physical time", owner: "Clock service and host", state: "Timestamp plus uncertainty", boundary: "Measured synchronization assumptions.", failure: "Clock steps or exceeds bound.", recovery: "Quarantine time-dependent paths and use logical/version evidence." },
+    { name: "Physical time", owner: "Clock service and host", state: "Interval [earliest, latest]; ε is half-width", boundary: "Advertised ε bound must hold.", failure: "Clock steps, ε is treated as full width, or commit wait is skipped.", recovery: "Wait until earliest > t (~2ε worst case), overlap with replication, quarantine if ε is exceeded." },
     { name: "Causality", owner: "Message and version protocol", state: "Dependency version or logical clock", boundary: "Happened-before relation.", failure: "Consumer lacks prerequisite state.", recovery: "Buffer, fetch dependency, or reject rather than invent order." },
     { name: "Total order", owner: "Sequencer or consensus log", state: "Term and sequence position", boundary: "One order inside the chosen scope.", failure: "Quorum unavailable.", recovery: "Stop ordered commits or degrade only operations whose invariants allow it." },
     { name: "Event time", owner: "Domain event envelope", state: "Source time and ingestion time", boundary: "Watermark and correction policy.", failure: "Late or skewed timestamp.", recovery: "Bound accepted skew, retain raw evidence, and emit corrections." },
@@ -100,6 +114,7 @@ The configuration database owns version 81. The log owns per-partition replay or
     { label: "Clock steps backward", impact: "A later local event can appear before an earlier one.", recovery: "Use a monotonic source for durations and a logical sequence for state transitions." },
     { label: "Concurrent regions", impact: "Timestamp order invents causality between independent events or reverses a real dependency.", recovery: "Carry causal versions and use a sequencer only where total order is required." },
     { label: "Offline client", impact: "Old event time arrives after current windows closed.", recovery: "Keep ingestion time, apply a lateness policy, and publish a correction rather than trust arrival or event time alone." },
+    { label: "Ack at t without commit wait", impact: "Another region's interval still overlaps t, so a later start can commit a timestamp before t.", recovery: "Wait until earliest > t (about 2ε when t = latest) and overlap that wait with replication." },
   ]}
 />
 
@@ -111,9 +126,10 @@ The configuration database owns version 81. The log owns per-partition replay or
 2. **“Lamport order proves happened-before both ways.”** Causality implies increasing Lamport time; increasing time does not imply causality.
 3. **“Vector clocks scale to every client.”** Metadata grows with participant identity and needs compaction or scoped membership.
 4. **“HLC removes clock uncertainty.”** It preserves causal monotonicity near physical time; external-time claims still depend on bounded clocks.
-5. **“Kafka orders events.”** It orders records within one partition, not across the topic.
-6. **“Event time is trustworthy.”** Device clocks can be wrong or adversarial; retain ingestion evidence and bound accepted skew.
-7. **“Global order simplifies everything.”** It also adds a global coordination path; name the invariant that pays for it.
+5. **“7 ms uncertainty means 7 ms of commit wait.”** If 7 ms is ε (half-width), worst-case wait until `earliest > t` is about 2ε. Replication can overlap that wait.
+6. **“Kafka orders events.”** It orders records within one partition, not across the topic.
+7. **“Event time is trustworthy.”** Device clocks can be wrong or adversarial; retain ingestion evidence and bound accepted skew.
+8. **“Global order simplifies everything.”** It also adds a global coordination path; name the invariant that pays for it.
 
 </InterviewTraps>
 
@@ -135,22 +151,22 @@ The configuration database owns version 81. The log owns per-partition replay or
 />
 
 <ScenarioCheck
-  scenario="TokenX nodes have a measured clock uncertainty of up to 7 ms. A design assigns commit timestamp t and responds immediately, then another region starts a transaction after observing the response."
+  scenario="TokenX nodes publish TrueTime intervals with ε = 7 ms (half-width). A design assigns commit timestamp t = latest and responds immediately, then another region starts a transaction after observing the response."
   question="What is needed to claim external real-time ordering from timestamps?"
   options={[
-    { label: "Nothing; timestamp t is already global truth", feedback: "The second region's clock interval may still overlap t." },
-    { label: "Wait until the uncertainty interval proves real time has passed t, while also using the database's replication protocol", feedback: "Commit wait closes the uncertainty window; replication still establishes durable ordered state." },
-    { label: "Round all timestamps to seconds", feedback: "Lower precision increases ties and does not remove uncertainty." },
+    { label: "Nothing; timestamp t is already global truth because ε is only 7 ms", feedback: "The second region's interval may still overlap t; worst-case wait is about 2ε, not ε." },
+    { label: "Wait until earliest exceeds t (up to about 14 ms), overlapping that wait with replication rather than stacking them", feedback: "Commit wait closes the 2ε uncertainty window; replication still establishes durable ordered state and can run concurrently." },
+    { label: "Wait 7 ms after every commit, then wait again for replication", feedback: "That confuses ε with full interval width and double-counts work that can overlap." },
     { label: "Use the client device clock", feedback: "An uncontrolled client clock provides weaker evidence." },
   ]}
   correct={1}
-  explanation="External consistency needs both the ordered commit protocol and a wait that places the acknowledgement after the chosen timestamp under the stated uncertainty bound."
+  explanation="Treat ε as half-width, wait until earliest > t (worst case ~2ε), and count only the wait that does not overlap replication."
 />
 
 <InterviewAnswer>
 
 “I separate physical time, causality, and total order. Wall clocks estimate business time and carry uncertainty; Lamport clocks preserve causal implication; vectors detect concurrency; hybrid clocks remain near physical time while adding logical order. None removes the need to state clock assumptions.
 
-TokenX uses account sequence numbers or consensus positions for authoritative order, not timestamp comparison. Ad clicks carry event time, ingestion time, campaign version, and partition offset because each answers a different question. I avoid a global sequencer unless a global invariant requires it. See [time-series storage](/learn/time-series-and-append-only-storage), [conflict resolution](/learn/conflict-resolution), and [distributed locks](/learn/distributed-locks-and-leases).”
+TokenX uses account sequence numbers or consensus positions for authoritative order, not timestamp comparison. If a product claims external consistency from TrueTime, I define ε as half-width, wait until earliest > t (~2ε worst case), and overlap that wait with replication. Ad clicks carry event time, ingestion time, campaign version, and partition offset because each answers a different question. I avoid a global sequencer unless a global invariant requires it. See [time-series storage](/learn/time-series-and-append-only-storage), [conflict resolution](/learn/conflict-resolution), and [distributed locks](/learn/distributed-locks-and-leases).”
 
 </InterviewAnswer>
