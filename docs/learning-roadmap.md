@@ -54,14 +54,14 @@ Status key: **Hardened** means the lesson meets the full learning standard, incl
 ## Module 5 — Networking
 
 1. **Networking for System Design** — DNS, TCP/TLS, HTTP, load balancing, connection pools, timeouts, and retries. **Hardened**
-2. **DNS and Service Discovery** — resolution, TTL, caching, registration, health, and failover behavior. **Planned**
-3. **TCP, QUIC, and Connection Lifecycle** — handshakes, congestion, head-of-line blocking, reuse, and keepalive. **Planned**
-4. **HTTP APIs and Protocol Choice** — REST, gRPC, streaming, payload evolution, compression, and error contracts. **Planned**
-5. **CDNs and Edge Architecture** — points of presence, cache keys, purge, origin shielding, and edge compute. **Planned**
-6. **Service Mesh and Proxies** — sidecars, mTLS, policy, retries, observability, and operational cost. **Planned**
-7. **Rate Limiting** — token bucket, leaky bucket, sliding windows, distributed counters, and fairness. **Planned**
-8. **Network Security Boundaries** — TLS identity, zero trust, segmentation, denial-of-service defense, and secret rotation. **Planned**
-9. **Real-Time Connections** — WebSockets, server-sent events, long polling, presence, reconnect, and fan-out. **Planned**
+2. **DNS and Service Discovery** — resolution, TTL, caching, registration, health, and failover behavior. **Hardened**
+3. **TCP, QUIC, and Connection Lifecycle** — handshakes, congestion, head-of-line blocking, reuse, and keepalive. **Hardened**
+4. **HTTP APIs and Protocol Choice** — REST, gRPC, streaming, payload evolution, compression, and error contracts. **Hardened**
+5. **CDNs and Edge Architecture** — points of presence, cache keys, purge, origin shielding, and edge compute. **Hardened**
+6. **Service Mesh and Proxies** — sidecars, mTLS, policy, retries, observability, and operational cost. **Hardened**
+7. **Rate Limiting** — token bucket, leaky bucket, sliding windows, distributed counters, and fairness. **Hardened**
+8. **Network Security Boundaries** — TLS identity, zero trust, segmentation, denial-of-service defense, and secret rotation. **Hardened**
+9. **Real-Time Connections** — WebSockets, server-sent events, long polling, presence, reconnect, and fan-out. **Hardened**
 
 ## Module 6 — CAP & Consistency
 
@@ -91,11 +91,11 @@ Status key: **Hardened** means the lesson meets the full learning standard, incl
 
 ## Recommended learning path
 
-Complete the hardened foundation lesson in each module once to establish breadth. Modules 1, 2, 3, 4, and 6 are now complete, providing the storage, scalability, event-driven reliability, performance, and distributed-correctness spine. Continue with Module 5 for networking, then Module 7 for repeated timed practice. Every mock interview should produce a short gap list that points back to a specific curriculum topic.
+Complete the hardened foundation lesson in each module once to establish breadth. Modules 1, 2, 3, 4, 5, and 6 are now complete, providing the storage, scalability, event-driven reliability, performance, networking, and distributed-correctness spine. Continue with Module 7 for repeated timed practice. Every mock interview should produce a short gap list that points back to a specific curriculum topic.
 
 ## Delivery phases
 
 - **Phase 0 — Complete:** the seven foundation lessons have corrected technical boundaries, explicit failure and recovery paths, challenging scenario checks, and reusable interactive learning components. Content validation covers frontmatter, section order, quiz counts, and Mermaid syntax.
 - **Phase 1A — Complete:** all nine Storage & Data lessons and all nine CAP & Consistency lessons are hardened, cross-linked, interactive, and validated.
-- **Phase 1B — In progress:** Modules 2, 3, and 4 are complete (8/8, 9/9, and 9/9). The academy contains 46 of 64 planned lessons. Resume operating lessons in Modules 5 and 7.
+- **Phase 1B — In progress:** Modules 2, 3, 4, and 5 are complete (8/8, 9/9, 9/9, and 9/9). The academy contains 54 of 64 planned lessons. Resume Module 7 mock-interview lessons.
 - **Phase 2 — Future, not implemented:** add an Architecture Reference Library of reusable patterns, decision guides, failure modes, and canonical diagrams cross-linked to lessons and mock interviews. The first scoped feature inside that library is **Technology Landscape & Architecture Reference** (full-stack diagram, seven module landscapes, comparison matrices, request/failure walkthroughs, IC6 selection guides, TokenX overlay, lesson cross-links, and reusable library components). It does not add lessons to this 64-topic curriculum. See [phase-2-architecture-reference.md](./phase-2-architecture-reference.md).
