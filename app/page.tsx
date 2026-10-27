@@ -22,6 +22,7 @@ export default function DashboardPage() {
             <div className="mt-7 flex flex-wrap gap-3">
               <Link href={`/learn/${featured.slug}`} className="inline-flex items-center gap-2 rounded-xl bg-white px-5 py-3 text-sm font-semibold text-ink transition hover:bg-blue-50">Start learning <ArrowRight className="h-4 w-4" /></Link>
               <Link href="#curriculum" className="inline-flex items-center rounded-xl border border-white/20 px-5 py-3 text-sm font-semibold text-white transition hover:bg-white/10">Explore curriculum</Link>
+              <Link href="/reference" className="inline-flex items-center rounded-xl border border-white/20 px-5 py-3 text-sm font-semibold text-white transition hover:bg-white/10">Architecture reference</Link>
             </div>
           </div>
           <ProgressSummary total={lessons.length} />

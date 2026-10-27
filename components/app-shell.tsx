@@ -20,6 +20,18 @@ function Sidebar({ modules, onNavigate }: { modules: ModuleSummary[]; onNavigate
         <span><span className="block font-semibold tracking-tight text-white">System Design</span><span className="block text-xs font-medium uppercase tracking-[0.2em] text-slate-400">Academy</span></span>
       </Link>
       <nav className="flex-1 overflow-y-auto px-3 py-6" aria-label="Learning modules">
+        <p className="mb-3 px-3 text-[10px] font-semibold uppercase tracking-[0.22em] text-slate-500">Reference</p>
+        <Link
+          href="/reference"
+          onClick={onNavigate}
+          className={`mb-4 flex items-center gap-3 rounded-xl px-3 py-2.5 text-sm transition ${pathname.startsWith("/reference") ? "bg-white/10 text-white" : "text-slate-400 hover:bg-white/5 hover:text-white"}`}
+        >
+          <span className="grid h-8 w-8 shrink-0 place-items-center rounded-lg bg-white/10 text-xs font-bold">AR</span>
+          <span className="min-w-0 flex-1">
+            <span className="block truncate">Architecture reference</span>
+            <span className="block text-[10px] uppercase tracking-wider text-slate-500">Phase 2A · Storage</span>
+          </span>
+        </Link>
         <p className="mb-3 px-3 text-[10px] font-semibold uppercase tracking-[0.22em] text-slate-500">Curriculum</p>
         <div className="space-y-1">
           {modules.map((module) => {
