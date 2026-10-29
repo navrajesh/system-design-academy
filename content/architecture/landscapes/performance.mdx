@@ -21,6 +21,10 @@ Authoritative vs derived:
 
 Synchronous wait is the caller timeout. Queues convert load into delay; they do not create durability. Hedged requests and retries multiply work unless bounded. SLO miss budget is a named event, window, and percentile — not “we are 99.9%.”
 
+### What fails independently
+
+A hedge storm or a CDN miss storm can fail while the commit is already **durable**. Extra hedged GETs, origin stampedes, and retry amplification hit derived hops; they do not un-commit a WAL or object PUT that already acknowledged. Walk the [overload](/reference/failures/overload) and [cache outage](/reference/failures/cache-outage) steps. Mechanism: <LessonCrossLink slug="tail-latency-control" />, <LessonCrossLink slug="backpressure-and-overload" />.
+
 Start with the [layered explorer](/reference/architecture), storage's [cache vs replica vs CDN](/reference/landscapes/storage) matrix (derived-read options), and the [overload](/reference/failures/overload) plus [cache outage](/reference/failures/cache-outage) walkthroughs.
 
 Mechanism lessons: <LessonCrossLink slug="latency-throughput-and-queues" />, <LessonCrossLink slug="caching-patterns-and-invalidation" />, <LessonCrossLink slug="tail-latency-control" />, <LessonCrossLink slug="performance-budgets-and-slos" />, <LessonCrossLink slug="backpressure-and-overload" />.

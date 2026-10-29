@@ -1,7 +1,16 @@
 import type { Metadata } from "next";
 import "./globals.css";
 import { AppShell } from "@/components/app-shell";
-import { getDeepDives, getFailureWalkthroughs, getLandscapes, getMatrices } from "@/lib/architecture";
+import {
+  getArchitectureCatalog,
+  getDeepDives,
+  getFailureWalkthroughs,
+  getGuides,
+  getLandscapes,
+  getMatrices,
+  getSettlementGraph,
+  hasSettlementGraph,
+} from "@/lib/architecture";
 import { getAllLessons, getModules } from "@/lib/content";
 
 export const metadata: Metadata = {
@@ -61,7 +70,30 @@ export default function RootLayout({ children }: Readonly<{ children: React.Reac
       tags: ["reference", "matrix"],
       searchText: matrix.assumptions.join(" "),
     })),
+    ...getGuides().map((page) => ({
+      slug: page.slug,
+      href: `/reference/guides/${page.slug}`,
+      title: page.title,
+      description: page.description,
+      module: 0,
+      moduleTitle: "Architecture reference",
+      tags: ["reference", "guide"],
+      searchText: page.content,
+    })),
   ];
+  if (hasSettlementGraph()) {
+    const graph = getSettlementGraph();
+    libraryRecords.push({
+      slug: graph.id,
+      href: getArchitectureCatalog().settlementExplorerHref ?? "/reference/architecture/tokenx",
+      title: graph.title,
+      description: graph.description,
+      module: 0,
+      moduleTitle: "Architecture reference",
+      tags: ["reference", "tokenx", "settlement"],
+      searchText: `${graph.title} ${graph.description}`,
+    });
+  }
   const searchRecords = [...lessonRecords, ...libraryRecords];
   return (
     <html lang="en">

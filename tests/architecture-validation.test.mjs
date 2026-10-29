@@ -6,10 +6,16 @@ import {
   extractLessonCrossLinkSlugs,
   validateArchitectureGraph,
   validateDeepDiveText,
+  validateGuideText,
   validateMatrix,
   validateFailover,
+  validateSettlementGraph,
   LIBRARY_DEEP_DIVE_SECTIONS,
+  LIBRARY_GUIDE_SECTIONS,
   MATRIX_COLUMN_IDS,
+  REQUIRED_LIBRARY_FILES,
+  SETTLEMENT_INDEXER_FAILURE_SCENARIO_ID,
+  SETTLEMENT_GRAPH_RELATIVE_PATH,
 } from "../scripts/architecture-validation.mjs";
 import { REQUIRED_SECTIONS } from "../scripts/content-validation.mjs";
 
@@ -169,4 +175,158 @@ test("curriculum still has exactly 64 lesson files and is not expanded by the li
   assert.equal(files.length, 64);
   const architectureLessons = (await readdir(lessonDirectory)).filter((file) => file.includes("architecture-reference"));
   assert.equal(architectureLessons.length, 0);
+});
+
+test("duplicate Phase 2 matrices are not required library files", () => {
+  assert.ok(!REQUIRED_LIBRARY_FILES.includes("matrices/quorum-consensus-crdt.json"));
+  assert.ok(!REQUIRED_LIBRARY_FILES.includes("matrices/tokenx-vs-ads.json"));
+  assert.ok(REQUIRED_LIBRARY_FILES.includes("matrices/consensus-quorum-crdt.json"));
+  assert.ok(REQUIRED_LIBRARY_FILES.includes("matrices/tokenx-ads-chat.json"));
+  assert.equal(SETTLEMENT_GRAPH_RELATIVE_PATH, "graphs/tokenx-settlement.json");
+  assert.equal(SETTLEMENT_INDEXER_FAILURE_SCENARIO_ID, "settlement-succeeds-indexer-fails");
+});
+
+const settlementNode = {
+  id: "ledger",
+  layerId: "ledger",
+  title: "Ledger",
+  product: "TokenX ledger",
+  ownership: "authoritative",
+  optional: false,
+  alternativeGroup: null,
+  defaultSelected: true,
+  paths: ["write"],
+  relatedSlugs: ["transactions-across-boundaries"],
+  href: null,
+  summary: "Authoritative settlement rows.",
+  detail: { consistency: "exclusive terminals", durability: "fsync before ack", failure: "UNKNOWN timeout", recovery: "idempotent lookup" },
+};
+
+const indexerNode = {
+  ...settlementNode,
+  id: "indexer",
+  layerId: "derived",
+  title: "Indexer",
+  product: "Derived index",
+  ownership: "derived",
+  paths: ["read"],
+  relatedSlugs: ["design-tokenx"],
+  summary: "Rebuildable projection.",
+  detail: { consistency: "lagging", durability: "rebuildable", failure: "ingest stall", recovery: "replay from ledger" },
+};
+
+function settlementGraph(overrides = {}) {
+  return {
+    version: 1,
+    id: "tokenx-settlement",
+    title: "TokenX settlement",
+    description: "Ledger versus derived indexer.",
+    assumptions: ["Settlement commit is not indexer freshness."],
+    layers: [
+      { id: "ledger", title: "Ledger", order: 1 },
+      { id: "derived", title: "Derived", order: 2 },
+    ],
+    nodes: [settlementNode, indexerNode],
+    edges: [{ id: "e-ledger-index", from: "ledger", to: "indexer", kind: "async", paths: ["write"], label: "Project" }],
+    scenarios: [
+      {
+        id: SETTLEMENT_INDEXER_FAILURE_SCENARIO_ID,
+        title: "Settlement succeeds, indexer fails",
+        summary: "The ledger commit stands while the derived index is stale.",
+        highlightedNodeIds: ["ledger", "indexer"],
+        dimmedNodeIds: [],
+        callout: "Do not spend from the indexer.",
+      },
+    ],
+    ...overrides,
+  };
+}
+
+test("settlement graph does not require storage layers or failover steps", () => {
+  const known = new Set(["transactions-across-boundaries", "design-tokenx"]);
+  assert.deepEqual(validateSettlementGraph(settlementGraph(), SETTLEMENT_GRAPH_RELATIVE_PATH, known), []);
+});
+
+test("settlement graph requires the indexer-failure scenario and rejects slogans", () => {
+  const known = new Set(["transactions-across-boundaries", "design-tokenx"]);
+  const missing = validateSettlementGraph(settlementGraph({ scenarios: [] }), "tokenx-settlement.json", known);
+  assert.ok(missing.some((error) => error.includes("scenarios required")));
+  const wrongId = validateSettlementGraph(
+    settlementGraph({
+      scenarios: [
+        {
+          id: "other",
+          title: "t",
+          summary: "s",
+          highlightedNodeIds: ["ledger"],
+          callout: "c",
+        },
+      ],
+    }),
+    "tokenx-settlement.json",
+    known,
+  );
+  assert.ok(wrongId.some((error) => error.includes(SETTLEMENT_INDEXER_FAILURE_SCENARIO_ID)));
+  const slogan = validateSettlementGraph(
+    settlementGraph({ description: "linearizable by default after instantaneous failover" }),
+    "tokenx-settlement.json",
+    known,
+  );
+  assert.ok(slogan.some((error) => error.includes("must not claim")));
+  const unknown = validateSettlementGraph(
+    settlementGraph({
+      nodes: [{ ...settlementNode, relatedSlugs: ["not-a-lesson"] }, indexerNode],
+    }),
+    "tokenx-settlement.json",
+    known,
+  );
+  assert.ok(unknown.some((error) => error.includes("unknown lesson slug 'not-a-lesson'")));
+});
+
+const guideFrontmatter = [
+  "---",
+  "kind: guide",
+  'title: "When to choose a quorum store"',
+  'description: "Guide fixture."',
+  "relatedSlugs: [cap-and-consistency-models]",
+  "---",
+  "",
+].join("\n");
+
+const guideSections = LIBRARY_GUIDE_SECTIONS.map((section, index) =>
+  index === 1
+    ? `<${section}><MermaidDiagram title="Tree" chart={"flowchart TD\\n A --> B"} />Options.</${section}>`
+    : `<${section}>Section body.</${section}>`,
+).join("\n");
+
+test("interview guides require five sections in order and reject lesson checks", () => {
+  const known = new Set(["cap-and-consistency-models"]);
+  const ok = validateGuideText(guideFrontmatter + guideSections, "quorum.mdx", known);
+  assert.deepEqual(ok.errors, []);
+  assert.equal(LIBRARY_GUIDE_SECTIONS.length, 5);
+  const badKind = validateGuideText(
+    guideFrontmatter.replace("kind: guide", "kind: deep-dive") + guideSections,
+    "bad.mdx",
+    known,
+  );
+  assert.ok(badKind.errors.some((error) => error.includes("kind must be guide")));
+  const reordered = validateGuideText(
+    guideFrontmatter +
+      LIBRARY_GUIDE_SECTIONS.slice()
+        .reverse()
+        .map((section) => `<${section}>Body.</${section}>`)
+        .join("\n"),
+    "order.mdx",
+    known,
+  );
+  assert.ok(reordered.errors.some((error) => error.includes("out of required library order")));
+  const banned = validateGuideText(
+    guideFrontmatter +
+      guideSections +
+      '\n<KnowledgeCheck question="x" options={["A"]} correct={0} explanation="e" />\n<InterviewAnswer>no</InterviewAnswer>\n',
+    "banned.mdx",
+    known,
+  );
+  assert.ok(banned.errors.some((error) => error.includes("must not include <KnowledgeCheck>")));
+  assert.ok(banned.errors.some((error) => error.includes("must not include <InterviewAnswer>")));
 });

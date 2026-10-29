@@ -1,14 +1,34 @@
 # Phase 2 — Architecture Reference Library
 
-**Status:** Phase 2A is merged to local `main`. Phase 2B (remaining six landscapes, extra matrices, named failures, staff+ interview phrasing in the learner UI) is in progress on `feat/phase-2b-technology-landscapes`. It is **not** merged. Curriculum remains **64/64**. Library state must not be written to `sda:completed-lessons:v1`.
+**Status:** Phase 2A and Phase 2B are merged at `f4267dd`. Curriculum remains **64/64**. Library state must not be written to `sda:completed-lessons:v1`. Phase C is in progress on `feat/phase-c-reference-library` and is not a production deploy.
 
-Phase 2A shipped `/reference` hub, layered explorer, PostgreSQL / Redis / DynamoDB deep dives, two storage matrices, Module 1 summary cards, and a database-failover walkthrough. Phase 2B adds the other six module landscapes and additional walkthroughs on the same explorer.
+Phase 2A shipped `/reference` hub, layered explorer, PostgreSQL / Redis / DynamoDB deep dives, two storage matrices, Module 1 summary cards, and a database-failover walkthrough. Phase 2B added the other six module landscapes, extra matrices, named failures, and staff+ interview phrasing on the same explorer.
 
-This document remains the authoritative full-product plan. TokenX overlay polish and later pattern-catalog follow-ons can still land after Phase 2B product review.
+This document remains the authoritative library plan. Phase C is docs reconciliation and library polish on this branch. Phase D items below are backlog only.
 
 This document is the authoritative Phase 2 architecture plan. It preserves the original Architecture Reference Library and scopes a first feature inside it: **Technology Landscape & Architecture Reference**.
 
 Phase 2 does **not** add lessons to the 64-topic curriculum in [learning-roadmap.md](./learning-roadmap.md). It does not replace Module 7 mock interviews. It does not change V1 boundaries in [AGENTS.md](../AGENTS.md) or [project-handoff.md](./project-handoff.md): Git-backed MDX, local search, browser-local progress under `sda:completed-lessons:v1`, no database or authentication unless a later milestone explicitly changes those boundaries.
+
+## Phase C — this branch (`feat/phase-c-reference-library`)
+
+Phase C does **not** add a 65th lesson and does not change V1 boundaries: Git-backed MDX, local search, `sda:completed-lessons:v1`, no database or authentication.
+
+This branch implements:
+
+1. **Doc reconciliation** — README, project handoff, this plan, the learning roadmap, and AGENTS.md match merged Phase 2A/2B on `main` at `f4267dd`. `/reference` is the library (hub, explorer, landscapes, matrices, failure walkthroughs). Production matched `f4267dd` as of 29 Oct 2026 (GitHub Vercel status plus live HTML; not a Vercel API alias binding). This branch is not a new production deploy.
+2. **Duplicate-matrix consolidation** — collapse overlapping comparison matrices under `content/architecture/matrices/` so each property table has one canonical id.
+3. **Independent-failure sections** — thicken module landscapes so each names hops that fail independently, with the lesson that teaches the mechanism.
+4. **TokenX settlement graph** — `/reference/architecture/tokenx` reuses `ArchitectureExplorer` for reserve / credit / finalize with exclusive terminals. Authoritative ledger versus derived balances, indexes, and analytics. A signed request log is not sufficient evidence for automatic replay of UNKNOWN outcomes.
+5. **Five interview selection guides** — short decision guides (not nine-section lessons) that answer which technology class under which assumption. Content lives in `content/architecture/`, not `content/lessons/`.
+
+## Phase D backlog (not implemented)
+
+These are **not** on this branch. Each is a future reference surface under `content/architecture/`, not a 65th curriculum lesson:
+
+- **Pattern catalog** — reusable architecture patterns cross-linked to existing lessons
+- **Failure-mode index** — named-failure index across landscapes and walkthroughs
+- **Interview diagram pack** — canonical diagrams for Module 7 practice
 
 ## Original Phase 2 (preserved)
 
@@ -23,7 +43,7 @@ cross-linked to existing lessons and mock interviews.
 
 The library is a **reference surface**, not a ninth teaching module. Lesson prose stays in `content/lessons/`. Required nine-section order and [content standards](./content-standards.md) continue to apply only to curriculum lessons.
 
-Later library entries (pattern catalog, failure-mode index, interview diagram pack) remain valid Phase 2 follow-ons after the technology landscape ships.
+Later library entries (pattern catalog, failure-mode index, interview diagram pack) are Phase D backlog under `content/architecture/`; they are not a 65th lesson and are not implemented on this branch.
 
 ## Feature: Technology Landscape & Architecture Reference
 
@@ -229,8 +249,7 @@ The feature is complete only when all of the following hold:
 
 ## Out of scope until a later decision
 
-- After Phase 2B merge: TokenX explorer overlay, first-class interview selection-guide pages, remaining product polish (duplicate matrices, thin landscape independent-failure sections)
+- Phase D backlog (pattern catalog, failure-mode index, interview diagram pack) — not implemented on this branch
 - Rewriting existing lessons to embed matrices
-- Push, merge, or deploy
+- Push, merge, or deploy. Phase C does not deploy; production stays on `f4267dd` until a later approval
 - Applying or dropping `stash@{0}`
-- Claiming the seven-landscape product is complete while only Phase 2A exists

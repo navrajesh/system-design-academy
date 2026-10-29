@@ -97,5 +97,6 @@ Complete the hardened foundation lesson in each module once to establish breadth
 
 - **Phase 0 — Complete:** the seven foundation lessons have corrected technical boundaries, explicit failure and recovery paths, challenging scenario checks, and reusable interactive learning components. Content validation covers frontmatter, section order, quiz counts, and Mermaid syntax.
 - **Phase 1A — Complete:** all nine Storage & Data lessons and all nine CAP & Consistency lessons are hardened, cross-linked, interactive, and validated.
-- **Phase 1B — Complete:** Modules 2, 3, 4, 5, and 7 are complete. The academy contains 64 of 64 planned lessons. Phase 2 remains a future Architecture Reference Library.
-- **Phase 2 — In progress (local):** Architecture Reference Library. Phase 2A (Storage & Data) is on local `main`. Phase 2B (remaining six landscapes) is on `feat/phase-2b-technology-landscapes` and is not merged. The library does not add lessons to this 64-topic curriculum. See [phase-2-architecture-reference.md](./phase-2-architecture-reference.md).
+- **Phase 1B — Complete:** Modules 2, 3, 4, 5, and 7 are complete. The academy contains 64 of 64 planned lessons.
+- **Phase 2 — Complete on `main` `f4267dd`:** Architecture Reference Library. Phase 2A (Storage & Data) and Phase 2B (remaining landscapes) are merged. The library does not add lessons to this 64-topic curriculum.
+- **Phase C — In progress:** docs reconciliation, matrix/landscape polish, TokenX settlement graph, and five interview selection guides on `feat/phase-c-reference-library`. See [phase-2-architecture-reference.md](./phase-2-architecture-reference.md).

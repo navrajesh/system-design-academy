@@ -1,0 +1,72 @@
+---
+kind: guide
+id: choosing-a-consistency-model
+title: "Choosing a consistency model"
+description: "Pick a linearizable consensus log, Dynamo-style quorum, or CRDT/LWW from the invariant, and do not confuse ConsistentRead, QUORUM, and Raft."
+landscape: consistency
+relatedSlugs:
+  - cap-and-consistency-models
+  - consensus-and-leader-election
+  - conflict-resolution
+---
+
+<NonNegotiable title="Name the history, not a two-letter sticker">
+
+CAP is a per-operation policy under a named partition, not a permanent C/A/P badge on a product. Linearizability is a protocol (majority commit plus a read that proves current term), not a default of PostgreSQL `READ COMMITTED`, DynamoDB eventual indexes, or Kafka.
+
+State the assumptions:
+
+- **Consistency:** a consensus log can offer one history for that group when writes commit on a current-term majority and reads use ReadIndex or a bounded-clock lease plus apply wait. Dynamo-style `W+R>N` is overlap under stable membership, not linearizability; sloppy quorums, hints, and concurrent versions need a named repair. CRDTs converge by merge; last-write-wins discards siblings on a timestamp you must trust. Convergence is not business validity.
+- **Durability:** consensus durability is “majority fsync of that command.” Quorum durability is “the W replicas you waited for,” which at `W=ONE` is a single node. CRDT/LWW durability is whatever each replica flushed before the next crash.
+- **Ordering:** consensus is one log order per group. Quorum stores do not pick a single order until repair. CRDT merge is associative and commutative; LWW order is a clock tuple, not physics.
+- **Availability:** `W=ONE` stays writable when a majority of peers are unreachable, and **can lose the copy that had the write**. `W=ALL` waits for every replica and goes unavailable on one loss, in exchange for not acknowledging a write that missed a copy. Consensus minority partitions **cannot commit**; that is the TokenX debit policy, not “the cluster is down.”
+- **Failure:** leader crash needs a new term and fencing. Isolated minority must not become a second ledger. Clock skew rewrites LWW winners. A health-check VIP that removes dead sockets is **not** consensus.
+
+DynamoDB `ConsistentRead` is a same-region latest-committed **item** read. It is not Cassandra `QUORUM`. It is not Raft. Do not use the three names interchangeably.
+
+</NonNegotiable>
+
+<Options title="Three write-coordination classes">
+
+1. **Linearizable consensus log (Raft/Paxos-class).** Single ordered command stream: TokenX ledger mutations, lock/lease metadata, a chat sequencer if you put seq on a Raft group. Three replicas: commit is 2-of-3 (leader plus either follower). One group is one hot leader. Keep the dataset small or shard by key into many groups. Cross-region majority adds WAN RTT to every commit.
+2. **Dynamo-style quorum store.** Partition-key items, tunable W/R, high write availability. Session blobs, shopping carts, Ad Click campaign metadata. `W=ONE` stays available and can lose a minority. `W=ALL` does the opposite. `QUORUM` is still not linearizable. Conditional writes occupy a key; they do not make default quorum a single-copy ledger.
+3. **CRDT / last-write-wins.** Concurrent edits with a meaningful join: grow-only tags, presence last-seen, dashboard labels. Both sides of a partition write; merge or LWW runs after heal. Illegal for conservation, unique allocation, or security revocation that must monotonic-deny.
+
+Property cells: [linearizable consensus vs Dynamo quorum vs CRDT/LWW](/reference/landscapes/consistency). Partition policy: <LessonCrossLink slug="cap-and-consistency-models" />. Elections, fencing, ReadIndex: <LessonCrossLink slug="consensus-and-leader-election" />. Merge versus exclusive terminals: <LessonCrossLink slug="conflict-resolution" />.
+
+<MermaidDiagram
+  title="One history versus quorum overlap versus merge, including W=ONE versus W=ALL"
+  chart={"flowchart TD\n  Q[Must one history exist?] -->|yes conservation| RAFT[Linearizable consensus log]\n  Q -->|overlap enough| DYN[Dynamo-style quorum]\n  Q -->|merge is valid| CRDT[CRDT or LWW]\n  DYN --> WONE[W=ONE: available, can lose a copy]\n  DYN --> WALL[W=ALL: waits, unavailable on one loss]\n  RAFT -.-> ETCD[etcd is not payment QPS]\n  RAFT -.-> VIP[Health-check VIP is not consensus]"}
+/>
+
+</Options>
+
+<InvalidatingFailure title="etcd as the TokenX ledger, or VIP as consensus">
+
+The popular option is “etcd/Raft is linearizable, so put balances there” or “the load balancer only sends traffic to a healthy leader, so we have consensus.” Both fail.
+
+etcd is a small linearizable KV for membership, elections, and fencing tokens. TokenX peak is on the order of thousands of durable transfers per second with multi-row conservation, history, and an outbox. That QPS and that schema overload a lease service: majority RTT on every debit, a log you cannot treat as a warehouse, and a failure domain shared with Kubernetes if you colocated them. etcd is the wrong store for TokenX balances at payment QPS.
+
+A health-check VIP removes closed connections. It does not fence a stale primary, does not assign terms, and does not make a minority partition refuse writes. Two backends can pass HTTP health and both accept debits. That is split-brain with a green dashboard.
+
+If you need one TokenX history, use a fenced ledger group (PostgreSQL-class with fencing, or a consensus/SQL ledger you will actually operate) and exclusive terminals. If you need available metadata, use quorum or CRDT **on objects that may converge**.
+
+</InvalidatingFailure>
+
+<OperationalBurden title="What the interview answer must staff">
+
+- **Consensus:** quorum health, disk, snapshot, membership change as a protocol (joint consensus), epoch fencing. Three or five failure-independent nodes per group. Client timeout is UNKNOWN; retry the same idempotency key. Uncommitted suffix may be overwritten after election.
+- **Dynamo-style quorum:** compaction, repair, tombstones, hinted handoff, capacity for celebrity keys. Managed offerings remove JVM toil, not the model. You must say W, R, N, and the repair policy in the interview.
+- **CRDT/LWW:** permutation tests of merge, tombstone frontiers, replica/device identity growth, and a clock source you are willing to lose money on—which you should not be, for balances.
+
+Leases expire. A lock service is not a mutex across partitions unless every writer checks the epoch.
+
+</OperationalBurden>
+
+<LessonLinks title="Hardened lessons">
+
+- <LessonCrossLink slug="cap-and-consistency-models" /> — per-operation partition policy, and why W+R overlap is not linearizability.
+- <LessonCrossLink slug="consensus-and-leader-election" /> — majority commit, fencing, ReadIndex, and what a VIP does not do.
+- <LessonCrossLink slug="conflict-resolution" /> — CRDT merge, LWW clocks, and why exclusive terminals are not a join.
+
+</LessonLinks>

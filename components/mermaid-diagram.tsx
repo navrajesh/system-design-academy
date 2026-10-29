@@ -40,8 +40,24 @@ export function MermaidDiagram({ chart, title = "Architecture diagram" }: { char
   return (
     <figure className="my-8 overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-sm">
       <figcaption className="border-b border-slate-100 px-5 py-3 text-xs font-semibold uppercase tracking-[0.14em] text-slate-500">{title}</figcaption>
-      <div className="overflow-x-auto p-5 sm:p-8" role="img" aria-label={title}>
-        {error ? <pre className="text-xs text-slate-600">{chart}</pre> : svg ? <div className="mx-auto min-w-[620px] [&_svg]:mx-auto [&_svg]:max-w-full" dangerouslySetInnerHTML={{ __html: svg }} /> : <div className="h-44 animate-pulse rounded-xl bg-slate-100" aria-label="Loading diagram" />}
+      <div
+        className="overflow-x-auto p-5 sm:p-8 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cobalt focus-visible:ring-offset-2"
+        tabIndex={0}
+        role="region"
+        aria-label={`${title}, scrolls horizontally`}
+      >
+        {error ? (
+          <pre className="text-xs text-slate-600">{chart}</pre>
+        ) : svg ? (
+          <div
+            className="mx-auto min-w-[620px] [&_svg]:mx-auto [&_svg]:max-w-full"
+            role="img"
+            aria-label={title}
+            dangerouslySetInnerHTML={{ __html: svg }}
+          />
+        ) : (
+          <div className="h-44 animate-pulse rounded-xl bg-slate-100" aria-label="Loading diagram" />
+        )}
       </div>
     </figure>
   );

@@ -53,7 +53,7 @@ export function TechnologySummaryCard({ item }: { item: TechnologySummary }) {
           Open deep dive
         </Link>
       ) : (
-        <p className="mt-auto pt-4 text-xs font-medium uppercase tracking-wider text-slate-400">Summary only in Phase 2A</p>
+        <p className="mt-auto pt-4 text-xs font-medium uppercase tracking-wider text-slate-400">Class summary</p>
       )}
     </article>
   );

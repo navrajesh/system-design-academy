@@ -22,6 +22,13 @@ import {
   LibraryUnderTheHood,
   SelectionCriteria,
 } from "@/components/architecture/library-sections";
+import {
+  InvalidatingFailure,
+  LessonLinks,
+  NonNegotiable,
+  OperationalBurden,
+  Options,
+} from "@/components/architecture/guide-sections";
 
 export const architectureMdxComponents = {
   LibraryBigPicture,
@@ -31,6 +38,11 @@ export const architectureMdxComponents = {
   FailureModes,
   LibraryInterviewTraps,
   LibraryMentalModel,
+  NonNegotiable,
+  Options,
+  InvalidatingFailure,
+  OperationalBurden,
+  LessonLinks,
   ArchitectureDiagram,
   MermaidDiagram,
   Callout,

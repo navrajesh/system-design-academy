@@ -1,0 +1,368 @@
+{
+  "version": 1,
+  "id": "tokenx-settlement",
+  "title": "TokenX settlement graph",
+  "description": "Transaction lifecycle from signed intent through inclusion, confirmation, derived indexing, reconciliation, and journal-only recovery. Application reservation owns exclusive product terminals; chain inclusion and confirmation own settlement finality; the indexer owns neither.",
+  "assumptions": [
+    "TokenX is the curriculum's custodial ledger example, not a requirement to run a public chain or wallet product.",
+    "Confirmation depth is a named finality threshold (illustrative: wait N subsequent blocks, or the custodial ledger's quorum commit). Deeper confirmation lowers reorg odds; it does not make an indexer authoritative and is not a linearizable application read.",
+    "A reorg shallower than the waited depth is an expected chain risk. After a suspected reorg, settlement reads stay UNKNOWN until the chain tip is read again.",
+    "Application reservation state (RESERVED then FINALIZED or RELEASED; destination CREDITED or CANCELLED) is a separate authority from chain inclusion and confirmation. Do not collapse them.",
+    "Signed request logs are not sufficient evidence for automatic replay. Replay committed chain or journal records only, then fence before new writes.",
+    "Indexer rows, cached balances, search, and analytics are derived application state. They own neither exclusive terminals nor settlement finality."
+  ],
+  "layers": [
+    { "id": "submission", "title": "Submission — signed intent, not settlement", "order": 1 },
+    { "id": "inclusion", "title": "Inclusion — authoritative chain / ledger", "order": 2 },
+    { "id": "confirmation", "title": "Confirmation — finality boundary", "order": 3 },
+    { "id": "indexing", "title": "Indexing — derived balances, search, analytics", "order": 4 },
+    { "id": "reconciliation", "title": "Reconciliation — indexer versus chain tip", "order": 5 },
+    { "id": "recovery", "title": "Recovery — committed journals only", "order": 6 }
+  ],
+  "nodes": [
+    {
+      "id": "signed-intent",
+      "layerId": "submission",
+      "title": "Signed transfer intent",
+      "product": "Client command / request log",
+      "ownership": "derived",
+      "optional": false,
+      "alternativeGroup": null,
+      "defaultSelected": true,
+      "paths": ["write"],
+      "relatedSlugs": ["idempotency-and-deduplication", "design-tokenx"],
+      "href": null,
+      "summary": "A signed transfer command is intent, not settlement. Ownership here is not authoritative chain state. The request log proves a client sent a command, not that a ledger or block committed.",
+      "detail": {
+        "consistency": "No consistency boundary. Tenant-scoped idempotency key plus request hash identify the command; they do not create chain inclusion or a spendable balance.",
+        "durability": "The signed request may be archived. That log is not a committed journal and is not replay evidence after restore or reorg.",
+        "failure": "Timeout, disconnect, or a lost 200 is UNKNOWN, not a failed commit and not confirmed inclusion. Nothing has been included, so a reorg cannot apply yet.",
+        "recovery": "Retry the same tenant-scoped idempotency key. Do not open a second transfer_id. Do not auto-replay this request-only log. Query reservation and chain state; fence before new writes if restore is in play."
+      }
+    },
+    {
+      "id": "reservation",
+      "layerId": "submission",
+      "title": "Application reservation (RESERVED)",
+      "product": "TokenX source ledger",
+      "ownership": "authoritative",
+      "optional": false,
+      "alternativeGroup": null,
+      "defaultSelected": true,
+      "paths": ["read", "write"],
+      "relatedSlugs": ["design-tokenx", "transactions-across-boundaries"],
+      "href": "/learn/design-tokenx",
+      "summary": "Application reservation state owns exclusive product terminals: unique RESERVED insert, then FINALIZED or RELEASED — never both. This is not chain inclusion, not confirmation, and not indexer freshness.",
+      "detail": {
+        "consistency": "One atomic unique insert on transfer_id. After RESERVED, a conditional update takes only FINALIZED or RELEASED. Coordinator timeout stays UNRESOLVED until the destination row is known. This boundary is the application ledger, not confirmation depth.",
+        "durability": "Durable after the application ledger commit (WAL or quorum of the TokenX primary). Chain inclusion is a different authority.",
+        "failure": "Two RESERVED rows would mint dual spends. Releasing on timeout while the destination later credits mints money. A chain reorg does not rewrite these terminals; do not treat a reorg as permission to fork FINALIZED and RELEASED.",
+        "recovery": "Insert-if-absent. Stay UNRESOLVED until destination CREDITED or CANCELLED is queried. Replay committed journals only. Request-only outcomes stay UNKNOWN. Fence before new writes. Exclusive terminals remain FINALIZED or RELEASED."
+      }
+    },
+    {
+      "id": "destination-terminal",
+      "layerId": "submission",
+      "title": "Destination exclusive terminals",
+      "product": "TokenX destination ledger",
+      "ownership": "authoritative",
+      "optional": false,
+      "alternativeGroup": null,
+      "defaultSelected": true,
+      "paths": ["read", "write"],
+      "relatedSlugs": ["design-tokenx", "transactions-across-boundaries"],
+      "href": "/learn/design-tokenx",
+      "summary": "Application destination state owns ABSENT → CREDITED or CANCELLED, never both. Delayed credit after CANCELLED is rejected. This is not chain confirmation and not an indexer row.",
+      "detail": {
+        "consistency": "Serializable compare-and-set on transfer_id. CREDITED and CANCELLED are mutually exclusive. CREDITED drives source FINALIZED; CANCELLED drives RELEASED.",
+        "durability": "The durable destination row is the product terminal. An indexer hit is not this row.",
+        "failure": "RPC timeout is UNKNOWN, not CANCELLED. A late credit after CANCELLED must lose. Indexer lag must not be treated as ABSENT, and a reorg does not authorize a second terminal.",
+        "recovery": "Query the committed destination row. Duplicates return the committed outcome. Replay committed journals only. Exclusive terminals remain CREDITED or CANCELLED. Request-only outcomes stay UNKNOWN."
+      }
+    },
+    {
+      "id": "chain-inclusion",
+      "layerId": "inclusion",
+      "title": "Chain inclusion (this hop succeeded)",
+      "product": "Block / ledger inclusion",
+      "ownership": "authoritative",
+      "optional": false,
+      "alternativeGroup": null,
+      "defaultSelected": true,
+      "paths": ["write"],
+      "relatedSlugs": ["design-tokenx"],
+      "href": null,
+      "summary": "Authoritative chain or ledger inclusion. This hop succeeded in the settlement-succeeds-indexer-fails scenario. Inclusion is settlement authority, not an indexer balance and not a linearizable application read.",
+      "detail": {
+        "consistency": "The included record is the chain/ledger fact for this transfer. Application reservation terminals remain a separate authority. Inclusion is not confirmation depth.",
+        "durability": "Durable as an included transaction or ledger entry. A later reorg can still drop shallow inclusion; confirmation depth is the finality boundary.",
+        "failure": "Mempool drop, rejection, or a reorg that removes a shallow block. Inclusion failure is not indexer failure. In the named scenario this hop succeeded while the indexer hop failed.",
+        "recovery": "Re-read chain or ledger state. Do not infer inclusion from a request log or from a stale index. After a suspected reorg, the outcome stays UNKNOWN until the tip is read again."
+      }
+    },
+    {
+      "id": "confirmation-depth",
+      "layerId": "confirmation",
+      "title": "Confirmation depth (this hop succeeded)",
+      "product": "Named finality threshold",
+      "ownership": "authoritative",
+      "optional": false,
+      "alternativeGroup": null,
+      "defaultSelected": true,
+      "paths": ["read", "write"],
+      "relatedSlugs": ["design-tokenx"],
+      "href": null,
+      "summary": "Confirmation depth is the finality boundary. This hop succeeded in the settlement-succeeds-indexer-fails scenario. A confirmation is not a linearizable application read and is not preserved under reorg. Deeper confirmation lowers reorg odds; it does not make an indexer authoritative.",
+      "detail": {
+        "consistency": "Waiting the named depth reduces reorg probability. It does not provide linearizable application reads, does not replace exclusive terminals, and does not license spendable reads from the indexer.",
+        "durability": "Finality is probabilistic on a reorgable chain until the named depth. TokenX as a custodial ledger example may treat quorum commit as inclusion-equivalent; that still is not indexer authority.",
+        "failure": "A reorg deeper than the waited confirmations invalidates the prior confirmation. That is a chain-tip change, not indexer lag. In the named scenario confirmation still stands while the indexer hop failed.",
+        "recovery": "Wait the named depth again after reorg. Reconciliation stays UNKNOWN until the chain tip is read again. Do not treat surviving index rows as confirmation."
+      }
+    },
+    {
+      "id": "indexer",
+      "layerId": "indexing",
+      "title": "Indexer (this hop failed)",
+      "product": "Derived balances / search",
+      "ownership": "derived",
+      "optional": false,
+      "alternativeGroup": null,
+      "defaultSelected": true,
+      "paths": ["read", "write"],
+      "relatedSlugs": ["design-tokenx"],
+      "href": "/learn/design-tokenx",
+      "summary": "Derived balances, search, and history projections. This hop failed in the settlement-succeeds-indexer-fails scenario. A lagging or dead indexer is not spendable authority. Chain inclusion and confirmation still succeeded.",
+      "detail": {
+        "consistency": "At-least-once ingest with an eventual projection. Never read-your-writes for spendable balances. Not a consistency boundary for money.",
+        "durability": "Rebuildable from committed chain or journal records. Indexer disks are not the ledger.",
+        "failure": "This hop failed: ingest stall, crash, or corrupt projection while inclusion and confirmation still succeeded. Serving spendable reads from this index would treat stale derived state as settlement. A reorg is diagnosed from the chain tip, not from this projection.",
+        "recovery": "Do not serve spendable reads from the index. Replay committed chain or journal records only. Do not auto-replay a request-only log. Fence before new writes. Reconciliation stays UNKNOWN until the chain tip is read again."
+      }
+    },
+    {
+      "id": "cached-balances",
+      "layerId": "indexing",
+      "title": "Cached balances",
+      "product": "Application cache",
+      "ownership": "derived",
+      "optional": true,
+      "alternativeGroup": null,
+      "defaultSelected": true,
+      "paths": ["read"],
+      "relatedSlugs": ["design-tokenx"],
+      "href": null,
+      "summary": "Derived cached balances. Not spendable authority. When the indexer hop has failed, this healthy-path cache is not currently trustworthy.",
+      "detail": {
+        "consistency": "TTL or explicit invalidation. A cache hit is not TokenX available balance and is not chain confirmation.",
+        "durability": "Rebuildable. Flush is not money loss.",
+        "failure": "After the indexer hop fails, this cache can still look healthy while serving stale derived balances. Reorg and UNKNOWN reservation are invisible here.",
+        "recovery": "Fail closed on spendable reads. Rebuild from chain or ledger after the tip is read again. Do not promote cache to authority. Do not auto-replay a request-only log."
+      }
+    },
+    {
+      "id": "analytics",
+      "layerId": "indexing",
+      "title": "Analytics and search",
+      "product": "Warehouse / search index",
+      "ownership": "derived",
+      "optional": true,
+      "alternativeGroup": null,
+      "defaultSelected": true,
+      "paths": ["read"],
+      "relatedSlugs": ["design-tokenx"],
+      "href": null,
+      "summary": "Derived analytics and search. Not settlement. When the indexer hop has failed, this healthy-path view is not currently trustworthy.",
+      "detail": {
+        "consistency": "Near-real-time at best. Dashboards may be labeled stale; they still must not authorize spends.",
+        "durability": "Rebuildable from committed journals.",
+        "failure": "Lag, corrupt mapping, or continuing to look healthy while the indexer feed is dead. A reorg will not be visible here until the chain tip is re-read.",
+        "recovery": "Drop and rebuild from committed chain or journal records only. Request-only outcomes stay UNKNOWN."
+      }
+    },
+    {
+      "id": "reconciliation",
+      "layerId": "reconciliation",
+      "title": "Indexer versus chain tip",
+      "product": "Reconciliation job",
+      "ownership": "derived",
+      "optional": false,
+      "alternativeGroup": null,
+      "defaultSelected": true,
+      "paths": ["read"],
+      "relatedSlugs": ["design-tokenx", "transactions-across-boundaries"],
+      "href": null,
+      "summary": "Compares derived index rows to the authoritative chain tip. Mismatch stays UNKNOWN until chain state is read again. Indexer failure does not unwind inclusion or confirmation.",
+      "detail": {
+        "consistency": "The chain tip is the settlement read. The index is a suspect. A mismatch is UNKNOWN, not CANCELLED and not a new exclusive terminal.",
+        "durability": "Reconciliation writes no new money. It records UNKNOWN until a fresh chain read.",
+        "failure": "If the indexer hop failed, this job cannot prove the derived view; it also must not invent a reorg. Timeout reading the tip keeps UNKNOWN. Serving the last good index as a spendable read is the invalidating mistake.",
+        "recovery": "Read the chain tip again. Do not auto-replay a request-only log to close the gap. Fence before new writes if repair requires restore. Exclusive terminals remain CREDITED/CANCELLED and FINALIZED/RELEASED."
+      }
+    },
+    {
+      "id": "journal-recovery",
+      "layerId": "recovery",
+      "title": "Journal-only recovery",
+      "product": "Committed chain / WAL / outbox",
+      "ownership": "derived",
+      "optional": false,
+      "alternativeGroup": null,
+      "defaultSelected": true,
+      "paths": ["write"],
+      "relatedSlugs": ["design-tokenx", "idempotency-and-deduplication"],
+      "href": "/learn/design-tokenx",
+      "summary": "Replay committed chain or journal records only. Request-only outcomes stay UNKNOWN. Fence before new writes. Exclusive terminals remain CREDITED or CANCELLED and FINALIZED or RELEASED.",
+      "detail": {
+        "consistency": "Recovery must not fork exclusive terminals. A replayed journal row returns the committed outcome; it does not create a second transfer_id. Chain finality is still read from inclusion and confirmation, not from this procedure.",
+        "durability": "Committed journals (included chain records, WAL, outbox rows that committed with the ledger) are the only automatic replay source.",
+        "failure": "Auto-replaying request logs can mint a transfer that never included or double-apply one that did. Reorg after shallow confirmation stays UNKNOWN until the tip is re-read. Indexer failure is not a license to mint from HTTP archives.",
+        "recovery": "Replay committed chain or journal records only. Fence the writer epoch before new writes. Keep CREDITED/CANCELLED and FINALIZED/RELEASED exclusive. Query UNKNOWN by transfer_id."
+      }
+    },
+    {
+      "id": "request-log",
+      "layerId": "recovery",
+      "title": "Request-only log (not replay evidence)",
+      "product": "Signed request archive",
+      "ownership": "derived",
+      "optional": false,
+      "alternativeGroup": null,
+      "defaultSelected": true,
+      "paths": ["read", "write"],
+      "relatedSlugs": ["idempotency-and-deduplication", "design-tokenx"],
+      "href": null,
+      "summary": "Proves a client sent a command. Not inclusion, not confirmation, not an indexer rebuild source. Request-only outcomes stay UNKNOWN.",
+      "detail": {
+        "consistency": "No settlement consistency. Presence in this log does not imply RESERVED, CREDITED, or chain inclusion.",
+        "durability": "May outlive the process. Still not a committed journal.",
+        "failure": "Treating this log as missing-and-must-mint after indexer failure, reorg, or restore invents transfers. A signed request is not proof the original commit happened.",
+        "recovery": "Leave UNKNOWN. Query reservation, destination terminals, and chain tip by transfer_id. Do not auto-replay. Fence before new writes."
+      }
+    }
+  ],
+  "edges": [
+    {
+      "id": "e-intent-reservation",
+      "from": "signed-intent",
+      "to": "reservation",
+      "kind": "sync",
+      "paths": ["write"],
+      "label": "Reserve with idempotency key; not chain inclusion"
+    },
+    {
+      "id": "e-reservation-destination",
+      "from": "reservation",
+      "to": "destination-terminal",
+      "kind": "sync",
+      "paths": ["write"],
+      "label": "Credit RPC; timeout stays UNKNOWN"
+    },
+    {
+      "id": "e-destination-finalize",
+      "from": "destination-terminal",
+      "to": "reservation",
+      "kind": "sync",
+      "paths": ["write"],
+      "label": "CREDITED finalizes; CANCELLED releases"
+    },
+    {
+      "id": "e-reservation-inclusion",
+      "from": "reservation",
+      "to": "chain-inclusion",
+      "kind": "async",
+      "paths": ["write"],
+      "label": "Submit / broadcast; settlement starts at inclusion"
+    },
+    {
+      "id": "e-intent-request-log",
+      "from": "signed-intent",
+      "to": "request-log",
+      "kind": "async",
+      "paths": ["write"],
+      "label": "Archive signed request (not a journal)"
+    },
+    {
+      "id": "e-inclusion-confirmation",
+      "from": "chain-inclusion",
+      "to": "confirmation-depth",
+      "kind": "async",
+      "paths": ["write"],
+      "label": "Wait named confirmation depth"
+    },
+    {
+      "id": "e-inclusion-journal",
+      "from": "chain-inclusion",
+      "to": "journal-recovery",
+      "kind": "async",
+      "paths": ["write"],
+      "label": "Committed chain / journal records"
+    },
+    {
+      "id": "e-confirmation-indexer",
+      "from": "confirmation-depth",
+      "to": "indexer",
+      "kind": "async",
+      "paths": ["write"],
+      "label": "Project derived balances after confirmation"
+    },
+    {
+      "id": "e-confirmation-reconciliation",
+      "from": "confirmation-depth",
+      "to": "reconciliation",
+      "kind": "sync",
+      "paths": ["read"],
+      "label": "Read chain tip"
+    },
+    {
+      "id": "e-indexer-cache",
+      "from": "indexer",
+      "to": "cached-balances",
+      "kind": "async",
+      "paths": ["read"],
+      "label": "Populate cache (not spendable)"
+    },
+    {
+      "id": "e-indexer-analytics",
+      "from": "indexer",
+      "to": "analytics",
+      "kind": "async",
+      "paths": ["write"],
+      "label": "Fan-out search / warehouse"
+    },
+    {
+      "id": "e-indexer-reconciliation",
+      "from": "indexer",
+      "to": "reconciliation",
+      "kind": "async",
+      "paths": ["read"],
+      "label": "Derived side of compare"
+    },
+    {
+      "id": "e-reconciliation-recovery",
+      "from": "reconciliation",
+      "to": "journal-recovery",
+      "kind": "async",
+      "paths": ["write"],
+      "label": "UNKNOWN until committed records replay"
+    },
+    {
+      "id": "e-journal-request-log",
+      "from": "journal-recovery",
+      "to": "request-log",
+      "kind": "sync",
+      "paths": ["read"],
+      "label": "Classify request-only as UNKNOWN"
+    }
+  ],
+  "scenarios": [
+    {
+      "id": "settlement-succeeds-indexer-fails",
+      "title": "Settlement succeeds, indexer fails",
+      "summary": "Chain inclusion and confirmation still succeeded. The indexer hop failed. Derived balances are stale and are not spendable authority.",
+      "highlightedNodeIds": ["chain-inclusion", "confirmation-depth", "indexer"],
+      "dimmedNodeIds": ["cached-balances", "analytics"],
+      "callout": "Chain settlement stands; derived balances are stale; do not serve spendable reads from the index; reconciliation stays UNKNOWN until the chain tip is read again; do not auto-replay a request-only log; fence before new writes."
+    }
+  ]
+}

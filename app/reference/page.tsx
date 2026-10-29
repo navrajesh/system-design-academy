@@ -4,6 +4,7 @@ import {
   getArchitectureCatalog,
   getDeepDives,
   getFailureWalkthroughs,
+  getGuides,
   getMatrices,
 } from "@/lib/architecture";
 
@@ -17,7 +18,9 @@ export default function ReferenceHubPage() {
   const deepDives = getDeepDives();
   const matrices = getMatrices();
   const failures = getFailureWalkthroughs();
+  const guides = getGuides();
   const failureHrefs = new Map((catalog.failures ?? []).map((item) => [item.id, item.href]));
+  const settlementHref = catalog.settlementExplorerHref ?? "/reference/architecture/tokenx";
   return (
     <div className="mx-auto max-w-4xl px-5 py-10 sm:px-8 sm:py-14">
       <p className="text-[10px] font-bold uppercase tracking-[0.2em] text-cobalt">Architecture reference</p>
@@ -29,6 +32,7 @@ export default function ReferenceHubPage() {
 
       <div className="mt-10 grid gap-4 sm:grid-cols-2">
         <HubCard href={catalog.explorerHref} title="Layered explorer" body="Client to stores: sync vs async, read/write path, authoritative vs derived." />
+        <HubCard href={settlementHref} title="TokenX settlement explorer" body="Ledger settlement graph with selectable scenarios. Not a curriculum lesson." />
         {catalog.landscapes
           .filter((item) => item.status === "available" && item.href)
           .map((item) => (
@@ -49,6 +53,22 @@ export default function ReferenceHubPage() {
           ))}
         </div>
       </section>
+
+      {guides.length > 0 ? (
+        <section className="mt-12">
+          <h2 className="font-display text-2xl font-semibold text-ink">Interview guides</h2>
+          <ul className="mt-4 space-y-3">
+            {guides.map((page) => (
+              <li key={page.slug}>
+                <Link href={`/reference/guides/${page.slug}`} className="block rounded-xl border border-slate-200 bg-white px-4 py-3 hover:border-cobalt focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cobalt focus-visible:ring-offset-2">
+                  <span className="font-semibold text-ink">{page.title}</span>
+                  <span className="mt-1 block text-sm text-slate-600">{page.description}</span>
+                </Link>
+              </li>
+            ))}
+          </ul>
+        </section>
+      ) : null}
 
       <section className="mt-12">
         <h2 className="font-display text-2xl font-semibold text-ink">Deep dives</h2>

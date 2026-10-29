@@ -21,6 +21,10 @@ Authoritative vs derived:
 
 Synchronous edges wait. Asynchronous edges (WAL ship, outbox, workers, telemetry) return before the sink commits. Failover of the primary is a named walkthrough: not instantaneous, not lossless under async replicas, not transparent to clients.
 
+### What fails independently
+
+A cache miss storm or replica lag can fail while the primary still **accepts or rejects correctly**. Redis and async replicas are derived: they may go empty, stale, or unreachable without changing the uniqueness boundary. The primary remains authoritative. Walk the [cache outage](/reference/failures/cache-outage) steps. Mechanism: <LessonCrossLink slug="caching-patterns-and-invalidation" />, <LessonCrossLink slug="replication-and-failover" />.
+
 Start with the [layered explorer](/reference/architecture), then the [PostgreSQL](/reference/technologies/postgresql), [Redis](/reference/technologies/redis), and [DynamoDB](/reference/technologies/dynamodb) deep dives, the two matrices on this page, and the [database failover walkthrough](/reference/failures/database-failover).
 
 Mechanism lessons: <LessonCrossLink slug="relational-vs-nosql-selection" />, <LessonCrossLink slug="indexes-and-query-execution" />, <LessonCrossLink slug="caching-patterns-and-invalidation" />, <LessonCrossLink slug="replication-and-failover" />, <LessonCrossLink slug="transactions-across-boundaries" />.

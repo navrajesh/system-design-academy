@@ -1,5 +1,5 @@
 {
-  "phase": "2b",
+  "phase": "2c",
   "title": "Architecture Reference",
   "description": "Technology landscapes for production systems: products, matrices, explorer hops, and named failure walkthroughs. This is not a 65th curriculum lesson.",
   "urlPrefix": "/reference",
@@ -82,6 +82,34 @@
     }
   ],
   "explorerHref": "/reference/architecture",
+  "settlementExplorerHref": "/reference/architecture/tokenx",
+  "guides": [
+    {
+      "id": "choosing-a-consistency-model",
+      "title": "Choosing a consistency model",
+      "href": "/reference/guides/choosing-a-consistency-model"
+    },
+    {
+      "id": "choosing-a-durable-log",
+      "title": "Choosing a durable log",
+      "href": "/reference/guides/choosing-a-durable-log"
+    },
+    {
+      "id": "choosing-a-failure-policy",
+      "title": "Choosing a failure policy",
+      "href": "/reference/guides/choosing-a-failure-policy"
+    },
+    {
+      "id": "choosing-a-primary-store",
+      "title": "Choosing a primary store",
+      "href": "/reference/guides/choosing-a-primary-store"
+    },
+    {
+      "id": "choosing-a-read-path",
+      "title": "Choosing a read path",
+      "href": "/reference/guides/choosing-a-read-path"
+    }
+  ],
   "failureHref": "/reference/failures/database-failover",
   "failures": [
     { "id": "database-failover", "href": "/reference/failures/database-failover" },
