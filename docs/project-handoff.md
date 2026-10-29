@@ -93,8 +93,8 @@ The Modules 1 and 6 audit found **13 items**. All 13 are addressed and merged to
 
 ## Next milestone
 
-1. Phase C is in progress on `feat/phase-c-reference-library`: docs reconciliation, duplicate-matrix consolidation, independent-failure landscape polish, TokenX settlement graph, and five interview selection guides. Do not apply or drop `stash@{0}`. Phase C does not deploy; production stays on `f4267dd` until a later approval.
-2. See [phase-2-architecture-reference.md](./phase-2-architecture-reference.md) for Phase C scope and the Phase D backlog.
+1. Phase C is complete on `feat/phase-c-reference-library` at `0c680d5` and is the current Vercel production deployment (`dpl_2bvfmkdXmvWZZD4LCi3ntaicLB5g` on [system-design-academy-lemon.vercel.app](https://system-design-academy-lemon.vercel.app)). GitHub `main` is still `f4267dd`. Merge waits for explicit authorization. Do not apply or drop `stash@{0}`. Do not deploy again just to publish documentation.
+2. See [phase-2-architecture-reference.md](./phase-2-architecture-reference.md) for the Phase C record and the Phase D backlog.
 
 ## Validation commands
 

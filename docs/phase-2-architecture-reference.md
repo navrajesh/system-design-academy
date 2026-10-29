@@ -1,10 +1,10 @@
 # Phase 2 — Architecture Reference Library
 
-**Status:** Phase 2A and Phase 2B are merged at `f4267dd`. Curriculum remains **64/64**. Library state must not be written to `sda:completed-lessons:v1`. Phase C is in progress on `feat/phase-c-reference-library` and is not a production deploy.
+**Status:** Phase 2A and Phase 2B are merged to GitHub `main` at `f4267dd`. Phase C is complete on `feat/phase-c-reference-library` at `0c680d5` and is deployed to Vercel production (`dpl_2bvfmkdXmvWZZD4LCi3ntaicLB5g`, alias `system-design-academy-lemon.vercel.app`). That branch is not merged to `main`. Curriculum remains **64/64**. Library state must not be written to `sda:completed-lessons:v1`.
 
 Phase 2A shipped `/reference` hub, layered explorer, PostgreSQL / Redis / DynamoDB deep dives, two storage matrices, Module 1 summary cards, and a database-failover walkthrough. Phase 2B added the other six module landscapes, extra matrices, named failures, and staff+ interview phrasing on the same explorer.
 
-This document remains the authoritative library plan. Phase C is docs reconciliation and library polish on this branch. Phase D items below are backlog only.
+This document remains the authoritative library plan. Phase C is implemented on `feat/phase-c-reference-library` and deployed from `0c680d5`. Phase D items below are backlog only.
 
 This document is the authoritative Phase 2 architecture plan. It preserves the original Architecture Reference Library and scopes a first feature inside it: **Technology Landscape & Architecture Reference**.
 
@@ -16,7 +16,7 @@ Phase C does **not** add a 65th lesson and does not change V1 boundaries: Git-ba
 
 This branch implements:
 
-1. **Doc reconciliation** — README, project handoff, this plan, the learning roadmap, and AGENTS.md match merged Phase 2A/2B on `main` at `f4267dd`. `/reference` is the library (hub, explorer, landscapes, matrices, failure walkthroughs). Production matched `f4267dd` as of 29 Oct 2026 (GitHub Vercel status plus live HTML; not a Vercel API alias binding). This branch is not a new production deploy.
+1. **Doc reconciliation** — README, project handoff, this plan, the learning roadmap, and AGENTS.md distinguish GitHub `main` (`f4267dd`, Phase 2B) from Vercel production (Phase C `0c680d5`, deployment `dpl_2bvfmkdXmvWZZD4LCi3ntaicLB5g`). `/reference` is the library (hub, explorer, landscapes, matrices, failure walkthroughs, TokenX settlement graph, interview guides).
 2. **Duplicate-matrix consolidation** — collapse overlapping comparison matrices under `content/architecture/matrices/` so each property table has one canonical id.
 3. **Independent-failure sections** — thicken module landscapes so each names hops that fail independently, with the lesson that teaches the mechanism.
 4. **TokenX settlement graph** — `/reference/architecture/tokenx` reuses `ArchitectureExplorer` for reserve / credit / finalize with exclusive terminals. Authoritative ledger versus derived balances, indexes, and analytics. A signed request log is not sufficient evidence for automatic replay of UNKNOWN outcomes.
@@ -251,5 +251,5 @@ The feature is complete only when all of the following hold:
 
 - Phase D backlog (pattern catalog, failure-mode index, interview diagram pack) — not implemented on this branch
 - Rewriting existing lessons to embed matrices
-- Push, merge, or deploy. Phase C does not deploy; production stays on `f4267dd` until a later approval
+- Merging this branch to `main` until explicitly authorized. Production already serves `0c680d5`; do not deploy again for a documentation-only commit
 - Applying or dropping `stash@{0}`

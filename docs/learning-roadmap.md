@@ -99,4 +99,4 @@ Complete the hardened foundation lesson in each module once to establish breadth
 - **Phase 1A — Complete:** all nine Storage & Data lessons and all nine CAP & Consistency lessons are hardened, cross-linked, interactive, and validated.
 - **Phase 1B — Complete:** Modules 2, 3, 4, 5, and 7 are complete. The academy contains 64 of 64 planned lessons.
 - **Phase 2 — Complete on `main` `f4267dd`:** Architecture Reference Library. Phase 2A (Storage & Data) and Phase 2B (remaining landscapes) are merged. The library does not add lessons to this 64-topic curriculum.
-- **Phase C — In progress:** docs reconciliation, matrix/landscape polish, TokenX settlement graph, and five interview selection guides on `feat/phase-c-reference-library`. See [phase-2-architecture-reference.md](./phase-2-architecture-reference.md).
+- **Phase C — Deployed, not merged:** TokenX settlement graph, interview selection guides, matrix consolidation, and landscape failure sections are on `feat/phase-c-reference-library` at `0c680d5` and on Vercel production. GitHub `main` remains `f4267dd`. See [phase-2-architecture-reference.md](./phase-2-architecture-reference.md).

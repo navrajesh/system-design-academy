@@ -10,7 +10,7 @@ System Design Academy is a standalone educational application built with Next.js
 - `lib/content.ts` owns catalog loading, parsing, and search normalization.
 - `docs/content-standards.md` is the mandatory lesson contract.
 - `docs/learning-roadmap.md` is the authoritative 64-topic roadmap and progress record.
-- `docs/phase-2-architecture-reference.md` is the Architecture Reference Library plan. Phase 2A and Phase 2B are merged to `main` at `f4267dd`. Phase C (docs reconciliation, library polish, TokenX settlement graph, interview guides) is on `feat/phase-c-reference-library`. It must not expand the 64-lesson curriculum.
+- `docs/phase-2-architecture-reference.md` is the Architecture Reference Library plan. Phase 2A and Phase 2B are merged to GitHub `main` at `f4267dd`. Phase C (library polish, TokenX settlement graph, interview guides) is on `feat/phase-c-reference-library` at `0c680d5` and is the Vercel production deployment. It is not merged to `main`. It must not expand the 64-lesson curriculum.
 - `content/architecture/` holds the library graph, deep dives, matrices, and failure walkthroughs. `lib/architecture.ts` loads them. Do not put library pages in `content/lessons/`.
 - `scripts/` and `tests/` enforce content and Mermaid rules.
 

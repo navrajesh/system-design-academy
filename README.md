@@ -76,7 +76,7 @@ Mermaid is dynamically imported only when a lesson diagram mounts, keeping it ou
 
 Phase 0 quality hardening is complete for the seven foundation lessons. Phase 1A completes all nine Storage & Data lessons and all nine CAP & Consistency lessons. Modules 2–7 are complete. The academy contains 64 of 64 planned lessons. Implemented lessons include explicit state ownership, consistency boundaries, failure/recovery paths, challenging scenario checks, and practical TokenX or Ad Click Aggregator reasoning.
 
-The Architecture Reference Library is on `main` at `f4267dd` under `/reference` (hub, explorer, landscapes, matrices, failure walkthroughs). The production alias [https://system-design-academy-lemon.vercel.app](https://system-design-academy-lemon.vercel.app) matched that commit as of 29 Oct 2026 (GitHub Vercel status on SHA `f4267dd`, deployment `8sJMip4uxTCvqtEWSz3dK4WyEHBX`, plus live HTML; not a Vercel API alias binding). This Phase C branch is not a new production deploy. Plan: [docs/phase-2-architecture-reference.md](docs/phase-2-architecture-reference.md).
+Phase C of the Architecture Reference Library is deployed from `feat/phase-c-reference-library` at `0c680d5`. It adds the TokenX settlement explorer and interview selection guides under `/reference`. GitHub `main` is still `f4267dd` until this branch is merged. The production alias [https://system-design-academy-lemon.vercel.app](https://system-design-academy-lemon.vercel.app) is Vercel deployment `dpl_2bvfmkdXmvWZZD4LCi3ntaicLB5g` (target production, Ready, 29 Oct 2026). Plan: [docs/phase-2-architecture-reference.md](docs/phase-2-architecture-reference.md).
 
 ## Authoring content
 
@@ -100,7 +100,7 @@ No environment variables or managed services are required.
 3. Keep the defaults: install command `npm install`, build command `npm run build`, and output managed by Next.js.
 4. Deploy, then verify the dashboard, one lesson, Mermaid rendering, search, and progress persistence.
 
-For CLI deployment, install and authenticate the Vercel CLI, then run `vercel` for a preview and `vercel --prod` only after review. Production matched `main` `f4267dd` as of 29 Oct 2026 (GitHub Vercel status plus live HTML; not a Vercel API alias binding). This Phase C branch is not a new production deploy.
+For CLI deployment, install and authenticate the Vercel CLI, then run `vercel` for a preview and `vercel --prod` only after review. Production currently serves Phase C commit `0c680d5` from `feat/phase-c-reference-library` (deployment `dpl_2bvfmkdXmvWZZD4LCi3ntaicLB5g`). GitHub `main` remains `f4267dd` until merge. A documentation commit on this branch does not by itself update that deployment.
 
 ## V1 boundaries
 
