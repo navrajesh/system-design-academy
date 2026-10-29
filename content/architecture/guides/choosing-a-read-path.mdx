@@ -1,0 +1,72 @@
+---
+kind: guide
+id: choosing-a-read-path
+title: "Choosing a read path"
+description: "Pick Redis cache-aside, a database read replica, or a CDN as a derived hop, and keep spendable TokenX reads on the primary."
+landscape: storage
+relatedSlugs:
+  - caching-patterns-and-invalidation
+  - replication-and-failover
+  - object-storage-and-large-files
+---
+
+<NonNegotiable title="Every popular read hop is derived">
+
+Redis cache-aside, a database read replica, and a CDN are **derived** from some primary. None of them is the TokenX ledger. None of them is the billed-fact log. A hit is a photocopy with a freshness story you must name.
+
+State the assumptions:
+
+- **Consistency:** a cache is stale until TTL or explicit delete. A replica is as fresh as applied WAL/LSN on a named timeline. A CDN is as fresh as `Cache-Control`, surrogate keys, and per-POP purge. Equal numeric LSNs on different timelines are not comparable.
+- **Durability:** these hops do not define durability. The primary COMMIT, object PUT ack, or billed-fact append does. Redis AOF/RDB does not promote a cache to a system of record.
+- **Ordering:** replica apply order follows the primary’s WAL, after lag. CDN purge is a rumor across POPs, not a global memory barrier. Cache invalidation can race a refill.
+- **Availability:** cache miss stampedes the primary. Replica lag is still “up.” Origin miss makes the CDN wait on the object store. Serving a 200 from a dead ledger is a lie, not availability.
+- **Failure:** flush, eviction, WAL recycle, poisoned POP content, and `stale-if-error` are product choices. Failover of the primary still needs fencing; a replica you were reading is not automatically the new writer.
+
+Spendable TokenX reads (authorize a debit, show `available` the user can spend) go to the primary, or wait for a named apply position. Metadata, public bytes, and labeled-stale dashboards may use a derived hop.
+
+</NonNegotiable>
+
+<Options title="Three derived read hops">
+
+Pick one hop per read, from legal staleness, not from “we need to scale reads.”
+
+1. **Redis cache-aside.** Application GET, miss, load primary, SET. Hot derived keys: session, feature flags, campaign metadata, rate-limit counters. A hit can be wrong after a primary write. Stampede control (singleflight) is part of the design. Persistence does not make it a ledger.
+2. **Database read replica.** Same SQL/item model as the primary, offloading reports and stale-tolerant queries. Read-your-writes needs a position token or a trip to the primary. Adding replicas does not scale writes. Accidental dual-primary on promote is an integrity incident, not extra read capacity.
+3. **CDN.** Public or versioned GET bytes close to the user: images, immutable assets, downloadable objects. Origin is often an object store. Authenticated per-user documents need a correct cache key and `Vary`; shared caches leak otherwise. Purge is eventually consistent across POPs. POSTs and spendable balances do not belong here.
+
+The surviving cells are on the [Redis vs replica vs CDN comparison](/reference/landscapes/storage). Fill and invalidation: <LessonCrossLink slug="caching-patterns-and-invalidation" />. Replica lag and fenced promote: <LessonCrossLink slug="replication-and-failover" />. Large GET bytes and origin ownership: <LessonCrossLink slug="object-storage-and-large-files" />.
+
+</Options>
+
+<InvalidatingFailure title="Spendable TokenX from a CDN or a lagging replica">
+
+The popular option is “put the hot balance on the CDN / read replica / Redis so payments scale.” That fails the product.
+
+A CDN hit can authorize a spend against a balance the ledger already reserved. Purge does not catch every POP before the next GET. A lagging replica can show `available` the primary already spent; the debit then conflicts or double-spends if uniqueness is also skipped. Redis can return a flushed or evicted miss that you treat as “wallet does not exist,” then insert a second occupancy.
+
+Ad Click dashboards may be labeled stale. TokenX spendable reads may not. If the ledger is down, fail closed (503 / UNKNOWN), not 200 from a photocopy.
+
+<MermaidDiagram
+  title="Spendable reads stay on the primary; derived hops are for legal staleness"
+  chart={"flowchart TD\n  Q[Is the read spendable?] -->|yes| PRI[Read the primary]\n  Q -->|no| F[How stale is legal?]\n  F -->|shared public GET| CDN[CDN]\n  F -->|same SQL plus lag token| REP[DB read replica]\n  F -->|hot key plus TTL| REDIS[Redis cache-aside]\n  PRI --> LED[(Authoritative ledger)]\n  CDN -.-> BAD[Illegal for TokenX spend]\n  REP -.-> BAD"}
+/>
+
+</InvalidatingFailure>
+
+<OperationalBurden title="What the interview answer must staff">
+
+- **Cache-aside:** key design, TTL versus explicit delete, stampede, eviction policy, and memory cost. A restart that empties Redis is a thundering herd, not a failover of money.
+- **Replica:** apply-lag SLOs, WAL retain so a disconnected replica can catch up, timeline IDs after promote, and never comparing LSNs across timelines. You still vacuum.
+- **CDN:** cache-key and auth leakage, origin shield, purge delay, TLS, and egress bills. `stale-if-error` is a named choice that can serve poisoned or revoked bytes.
+
+None of these burdens replace uniqueness on the primary.
+
+</OperationalBurden>
+
+<LessonLinks title="Hardened lessons">
+
+- <LessonCrossLink slug="caching-patterns-and-invalidation" /> — cache-aside, TTL, stampede, and why a hit is not COMMIT.
+- <LessonCrossLink slug="replication-and-failover" /> — replica apply position, fencing, and what promotion can lose.
+- <LessonCrossLink slug="object-storage-and-large-files" /> — origin bytes the CDN may photocopy, and the PUT ack that actually durably stores them.
+
+</LessonLinks>

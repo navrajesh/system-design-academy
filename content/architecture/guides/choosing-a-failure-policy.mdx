@@ -1,0 +1,74 @@
+---
+kind: guide
+id: choosing-a-failure-policy
+title: "Choosing a failure policy"
+description: "Pick fail-closed TokenX, fail-open billed ingest, or an ordered chat sequencer from the invariant you must not guess, and keep exclusive terminals exclusive."
+landscape: composition
+relatedSlugs:
+  - design-tokenx
+  - design-an-ad-click-aggregator
+  - design-a-chat-system
+  - graceful-degradation
+  - idempotency-and-deduplication
+---
+
+<NonNegotiable title="Guessing must not mint money, invoices, or seq">
+
+Failure policy is product law for one dependency, not a cluster default. Timeout is **UNKNOWN**, not success and not cancel. Retry the same occupancy key. Do not mint a new one.
+
+State the assumptions:
+
+- **Consistency:** TokenX conservation is one serializable ledger transaction, or exclusive cross-shard terminals: source `RESERVED` then `FINALIZED` or `RELEASED`; destination `ABSENT` then `CREDITED` or `CANCELLED`. Those pairs are exclusive. Delayed credit after `CANCELLED` is rejected; delayed cancel after `CREDITED` cannot reverse the credit. Ad Click authority is append plus `UNIQUE(click_id)` inside a horizon that covers replay. Chat total order is `(conversation_id, seq)` assigned in the **same** transaction as the message and outbox.
+- **Durability:** money is durable when the ledger (and uniqueness) commit. Billed identity is durable when the fact log acknowledges the unique append. Chat history is durable when the sequencer row commits. Redis, sockets, and dashboards are not those commits.
+- **Ordering:** TokenX does not LWW balances. Ad Click partition order is not event time; windows are derived. Chat recipients agree on seq, not NTP. Presence is last-heartbeat plus TTL and is allowed to be wrong.
+- **Availability:** TokenX **fail-closes** when authority, uniqueness, or a claimed fraud cap cannot be proven — that burns availability budget and protects supply. Ad Click **fail-opens** admission onto a bounded local cap if limiter Redis dies, and keeps `click_id` on the log — dashboard completeness loses. Chat sequencer/quorum loss rejects **new** seq; committed history reads may continue. That is neither fail-closed money nor fail-open billed ingest.
+- **Failure:** coordinator timeout after `RESERVED` stays `UNRESOLVED` until destination is queried. Hedged writes **without** the same idempotency key double-apply. Redis as the ledger loses occupancy on flush, eviction, or split-brain.
+
+</NonNegotiable>
+
+<Options title="Three cores, three policies">
+
+1. **Fail-closed ledger (TokenX).** Reject the debit if the ledger, uniqueness, or fencing epoch cannot be proven. Cache hits are illegal for spendable reads. Outbox after commit; Kafka is derived. Restore replays committed journals, not signed request logs. Illustrative envelope: hundreds of transfers/s average, thousands at peak — still not an excuse to put money on Redis.
+2. **Fail-open billed ingest (Ad Click).** Keep accepting keyed clicks when derived analytics or limiter Redis is unhealthy, within a local degraded cap. Uniqueness of `click_id` stays on the log. 429 is proven reject; produce timeout is UNKNOWN with the same `click_id`. Dashboards may be labeled stale. Do not park UNKNOWN into TokenX, and do not steal TokenX isolation for ads.
+3. **Ordered chat sequencer.** Assign seq with the message row. Client message id is idempotent occupancy. Retry send with that id. Do not invent seq on the gateway or treat WebSocket arrival order as the log. Presence and receipts are derived. Hot rooms change fan-out copy strategy; they do not switch to wall-clock order.
+
+Cells: [TokenX ledger vs Ad Click log vs chat sequencer](/reference/landscapes/composition). Full prompts: <LessonCrossLink slug="design-tokenx" />, <LessonCrossLink slug="design-an-ad-click-aggregator" />, <LessonCrossLink slug="design-a-chat-system" />. Shed order: <LessonCrossLink slug="graceful-degradation" />. Keys: <LessonCrossLink slug="idempotency-and-deduplication" />.
+
+<MermaidDiagram
+  title="Failure policy follows the invariant: money, billed identity, or conversation seq"
+  chart={"flowchart TD\n  Q[What is lost if we guess?] -->|minted money| TX[Fail-closed ledger]\n  Q -->|dashboard gap| ADS[Fail-open billed ingest]\n  Q -->|reorder chat| CHAT[Ordered sequencer]\n  TX --> T1[CREDITED or CANCELLED]\n  TX --> T2[FINALIZED or RELEASED]\n  ADS --> CID[click_id uniqueness]\n  CHAT --> SEQ[conversation_id plus seq]\n  TX -.-> BAD[Hedged write with a new key]"}
+/>
+
+</Options>
+
+<InvalidatingFailure title="Hedged writes with a new key, or Redis as the ledger">
+
+The popular latency move is to hedge `POST /transfers` to two regions, each with a fresh UUID, or to keep spendable `available` in Redis “because it is fast.” Both fail.
+
+Two hedges without the same tenant-scoped idempotency key are two occupancy rows. Both can commit. That is double-apply, not tail-latency control. A legal hedge carries the **same** key; uniqueness makes the second attempt a replay of the stored result. If uniqueness is down, fail closed — do not hedge to a cache “success.”
+
+Redis is a derived cache. Flush, eviction, replica rewind, or cluster split-brain can drop or fork occupancy. Persistence settings do not create exclusive terminals. Using Redis as the TokenX ledger turns a cache outage into minted or vanished money. Rate-limit counters in Redis may fail-open for ads ingest (local cap) and must fail-closed for a claimed TokenX fraud cap.
+
+Chat has a related trap: assigning seq on the socket gateway, or LWW-ing message bodies across regions. Recipients then disagree on history. That is not conservation, but it is still a forked log.
+
+</InvalidatingFailure>
+
+<OperationalBurden title="What the interview answer must staff">
+
+- **TokenX:** fenced failover, unique-key retention, outbox relay, UNRESOLVED terminal reconciliation, and a client that retries the same key. Cross-shard work is a saga with exclusive terminals, not two independent UPDATEs. Analytics warehouses are extra derived cost.
+- **Ad Click:** uniqueness horizon covering the replay window, watermark lag, hot-key sharding by `click_id` when `campaign_id` is hot, DLQ owner, and a dashboard that is allowed to lag. Sharing TokenX’s ledger pool is an integrity incident.
+- **Chat:** sequencer/quorum health, socket drain, resume tokens, orphan multipart media, fan-out backlog. If E2E, the server stores ciphertext; keys stay on the client. Presence TTL is operated as derived, not as history.
+
+Hedged reads of labeled-stale metadata are allowed. Hedged unkeyed money writes are not.
+
+</OperationalBurden>
+
+<LessonLinks title="Hardened lessons">
+
+- <LessonCrossLink slug="design-tokenx" /> — exclusive terminals, UNKNOWN timeouts, and conservation.
+- <LessonCrossLink slug="design-an-ad-click-aggregator" /> — keyed ingest, uniqueness horizon, fail-open admission.
+- <LessonCrossLink slug="design-a-chat-system" /> — seq with the message, not with the socket.
+- <LessonCrossLink slug="graceful-degradation" /> — fail-closed money versus fail-open derived work, per dependency.
+- <LessonCrossLink slug="idempotency-and-deduplication" /> — same key on retry and hedge; new key is a new command.
+
+</LessonLinks>

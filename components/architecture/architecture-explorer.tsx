@@ -2,31 +2,93 @@
 
 import Link from "next/link";
 import { useMemo, useState } from "react";
-import type { ArchitectureGraph, GraphEdge, GraphNode, PathKind } from "@/lib/architecture-types";
+import type { ArchitectureGraph, GraphEdge, GraphNode, GraphScenario, PathKind } from "@/lib/architecture-types";
 
 type Props = { graph: ArchitectureGraph };
+type AlternativeSelection = Record<string, string>;
 
-function nodeVisible(node: GraphNode, primary: "postgres" | "dynamodb", showOptional: boolean) {
-  if (node.alternativeGroup === "primary-store") {
-    return primary === "postgres" ? node.id === "postgres-primary" : node.id === "dynamodb";
+function alternativeGroups(nodes: GraphNode[]): { id: string; members: GraphNode[] }[] {
+  const map = new Map<string, GraphNode[]>();
+  for (const node of nodes) {
+    if (!node.alternativeGroup) continue;
+    const members = map.get(node.alternativeGroup) ?? [];
+    members.push(node);
+    map.set(node.alternativeGroup, members);
   }
-  if (node.id === "postgres-replica" && primary !== "postgres") return false;
+  return [...map.entries()]
+    .map(([id, members]) => ({ id, members }))
+    .filter((group) => group.members.length > 1);
+}
+
+function initialAlternatives(graph: ArchitectureGraph): AlternativeSelection {
+  const selected: AlternativeSelection = {};
+  for (const node of graph.nodes) {
+    if (!node.alternativeGroup) continue;
+    const current = selected[node.alternativeGroup];
+    if (!current || node.defaultSelected) selected[node.alternativeGroup] = node.id;
+  }
+  return selected;
+}
+
+function initialSelectedId(graph: ArchitectureGraph): string {
+  const grouped = Object.values(initialAlternatives(graph))[0];
+  if (grouped) return grouped;
+  return graph.nodes.find((node) => node.defaultSelected)?.id ?? graph.nodes[0]?.id ?? "";
+}
+
+function humanizeGroup(id: string) {
+  const spaced = id.replace(/[-_]/g, " ");
+  return spaced.charAt(0).toUpperCase() + spaced.slice(1);
+}
+
+function neighborIds(nodeId: string, edges: GraphEdge[]): Set<string> {
+  const ids = new Set<string>();
+  for (const edge of edges) {
+    if (edge.from === nodeId) ids.add(edge.to);
+    if (edge.to === nodeId) ids.add(edge.from);
+  }
+  return ids;
+}
+
+function nodeVisible(node: GraphNode, graph: ArchitectureGraph, alternatives: AlternativeSelection, showOptional: boolean) {
+  if (node.alternativeGroup && alternatives[node.alternativeGroup] !== node.id) return false;
   if (node.optional && !showOptional) return false;
+  if (node.optional && !node.alternativeGroup) {
+    const neighbors = neighborIds(node.id, graph.edges);
+    for (const [group, selectedId] of Object.entries(alternatives)) {
+      const members = graph.nodes.filter((item) => item.alternativeGroup === group);
+      const touchesUnselected = members.some((item) => item.id !== selectedId && neighbors.has(item.id));
+      const touchesSelected = neighbors.has(selectedId);
+      if (touchesUnselected && !touchesSelected) return false;
+    }
+  }
+  if (node.alternativeGroup) return true;
   return node.defaultSelected || !node.optional;
 }
 
+function hasOptionalNodes(nodes: GraphNode[]) {
+  return nodes.some((node) => node.optional);
+}
+
 export function ArchitectureExplorer({ graph }: Props) {
-  const [primary, setPrimary] = useState<"postgres" | "dynamodb">("postgres");
+  const groups = useMemo(() => alternativeGroups(graph.nodes), [graph.nodes]);
+  const [alternatives, setAlternatives] = useState<AlternativeSelection>(() => initialAlternatives(graph));
   const [path, setPath] = useState<PathKind | "both">("both");
   const [showOptional, setShowOptional] = useState(true);
-  const [selectedId, setSelectedId] = useState("postgres-primary");
+  const [selectedId, setSelectedId] = useState(() => initialSelectedId(graph));
+  const scenarios = graph.scenarios ?? [];
+  const [scenarioId, setScenarioId] = useState(scenarios[0]?.id ?? "");
+  const showOptionalControl = hasOptionalNodes(graph.nodes);
 
   const visibleNodes = useMemo(
-    () => graph.nodes.filter((node) => nodeVisible(node, primary, showOptional)),
-    [graph.nodes, primary, showOptional],
+    () => graph.nodes.filter((node) => nodeVisible(node, graph, alternatives, showOptional)),
+    [graph, alternatives, showOptional],
   );
   const visibleIds = useMemo(() => new Set(visibleNodes.map((node) => node.id)), [visibleNodes]);
-  const selected = visibleNodes.find((node) => node.id === selectedId) ?? visibleNodes.find((node) => node.layerId === "primary") ?? visibleNodes[0];
+  const selected =
+    visibleNodes.find((node) => node.id === selectedId) ??
+    visibleNodes.find((node) => node.ownership === "authoritative") ??
+    visibleNodes[0];
 
   const visibleEdges = graph.edges.filter((edge) => {
     if (!visibleIds.has(edge.from) || !visibleIds.has(edge.to)) return false;
@@ -35,6 +97,9 @@ export function ArchitectureExplorer({ graph }: Props) {
   });
 
   const layers = [...graph.layers].sort((a, b) => a.order - b.order);
+  const activeScenario = scenarios.find((scenario) => scenario.id === scenarioId);
+  const highlightedIds = new Set(activeScenario?.highlightedNodeIds ?? []);
+  const dimmedIds = new Set(activeScenario?.dimmedNodeIds ?? []);
 
   function isOnPath(node: GraphNode) {
     if (path === "both") return true;
@@ -54,40 +119,40 @@ export function ArchitectureExplorer({ graph }: Props) {
     }
   }
 
+  function selectAlternative(groupId: string, nodeId: string) {
+    setAlternatives((current) => ({ ...current, [groupId]: nodeId }));
+    setSelectedId(nodeId);
+  }
+
+  const controlCols = 1 + (groups.length ? 1 : 0) + (showOptionalControl ? 1 : 0);
+
   return (
     <div className="space-y-6">
-      <div className="grid scroll-mt-20 gap-3 rounded-2xl border border-slate-200 bg-white p-4 sm:grid-cols-3">
-        <fieldset className="text-sm font-semibold text-slate-700">
-          <legend className="mb-2">Primary store</legend>
-          <div className="flex flex-col gap-2 font-normal">
-            <label className="flex items-center gap-2">
-              <input
-                type="radio"
-                name="primary-store"
-                className="accent-cobalt focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-cobalt"
-                checked={primary === "postgres"}
-                onChange={() => {
-                  setPrimary("postgres");
-                  setSelectedId("postgres-primary");
-                }}
-              />
-              PostgreSQL (default)
-            </label>
-            <label className="flex items-center gap-2">
-              <input
-                type="radio"
-                name="primary-store"
-                className="accent-cobalt focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-cobalt"
-                checked={primary === "dynamodb"}
-                onChange={() => {
-                  setPrimary("dynamodb");
-                  setSelectedId("dynamodb");
-                }}
-              />
-              DynamoDB (alternative)
-            </label>
-          </div>
-        </fieldset>
+      <div
+        className={`grid scroll-mt-20 gap-3 rounded-2xl border border-slate-200 bg-white p-4 ${
+          controlCols >= 3 ? "sm:grid-cols-3" : controlCols === 2 ? "sm:grid-cols-2" : ""
+        }`}
+      >
+        {groups.map((group) => (
+          <fieldset key={group.id} className="text-sm font-semibold text-slate-700">
+            <legend className="mb-2">{humanizeGroup(group.id)}</legend>
+            <div className="flex flex-col gap-2 font-normal">
+              {group.members.map((node) => (
+                <label key={node.id} className="flex items-center gap-2">
+                  <input
+                    type="radio"
+                    name={`alternative-${group.id}`}
+                    className="accent-cobalt focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-cobalt"
+                    checked={alternatives[group.id] === node.id}
+                    onChange={() => selectAlternative(group.id, node.id)}
+                  />
+                  {node.product}
+                  {node.defaultSelected ? " (default)" : " (alternative)"}
+                </label>
+              ))}
+            </div>
+          </fieldset>
+        ))}
         <fieldset className="text-sm font-semibold text-slate-700">
           <legend className="mb-2">Highlight path</legend>
           <div className="flex flex-col gap-2 font-normal">
@@ -111,16 +176,42 @@ export function ArchitectureExplorer({ graph }: Props) {
             ))}
           </div>
         </fieldset>
-        <label className="flex items-center gap-2 pt-6 text-sm font-semibold text-slate-700">
-          <input
-            type="checkbox"
-            className="accent-cobalt focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-cobalt"
-            checked={showOptional}
-            onChange={(event) => setShowOptional(event.target.checked)}
-          />
-          Show optional hops (replica, outbox)
-        </label>
+        {showOptionalControl ? (
+          <label className="flex items-center gap-2 pt-6 text-sm font-semibold text-slate-700">
+            <input
+              type="checkbox"
+              className="accent-cobalt focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-cobalt"
+              checked={showOptional}
+              onChange={(event) => setShowOptional(event.target.checked)}
+            />
+            Show optional hops
+          </label>
+        ) : null}
       </div>
+
+      {scenarios.length > 0 ? (
+        <fieldset className="rounded-2xl border border-slate-200 bg-white p-4 text-sm">
+          <legend className="px-1 font-semibold text-slate-700">Scenarios</legend>
+          <div className="flex flex-col gap-2" role="radiogroup" aria-label="Graph scenarios">
+            {scenarios.map((scenario) => (
+              <label key={scenario.id} className="flex items-start gap-2 font-normal text-slate-700">
+                <input
+                  type="radio"
+                  name="graph-scenario"
+                  className="mt-1 accent-cobalt focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-cobalt"
+                  checked={scenarioId === scenario.id}
+                  onChange={() => setScenarioId(scenario.id)}
+                />
+                <span>
+                  <span className="font-semibold text-ink">{scenario.title}</span>
+                  <span className="mt-0.5 block text-xs leading-5 text-slate-500">{scenario.summary}</span>
+                </span>
+              </label>
+            ))}
+          </div>
+          {activeScenario ? <ScenarioCallout scenario={activeScenario} /> : null}
+        </fieldset>
+      ) : null}
 
       <div className="flex flex-wrap gap-3 text-xs text-slate-600" aria-hidden="false">
         <span className="inline-flex items-center gap-2 rounded-full border border-slate-300 bg-white px-3 py-1">
@@ -131,6 +222,11 @@ export function ArchitectureExplorer({ graph }: Props) {
         </span>
         <span className="rounded-full border border-slate-300 bg-white px-3 py-1">Authoritative vs derived is labeled on each node</span>
         <span className="rounded-full border border-slate-300 bg-white px-3 py-1">Optional / alternative badges use text, not color alone</span>
+        {scenarios.length > 0 ? (
+          <span className="rounded-full border border-slate-300 bg-white px-3 py-1">
+            Scenario focus uses a “Highlighted” label; de-emphasized hops are marked in the node name
+          </span>
+        ) : null}
       </div>
 
       <div className="hidden lg:grid lg:grid-cols-[minmax(0,1fr)_22rem] lg:gap-6">
@@ -147,7 +243,8 @@ export function ArchitectureExplorer({ graph }: Props) {
                       key={node.id}
                       node={node}
                       selected={selected?.id === node.id}
-                      dimmed={!isOnPath(node)}
+                      dimmed={!isOnPath(node) || dimmedIds.has(node.id)}
+                      highlighted={highlightedIds.has(node.id)}
                       onSelect={() => setSelectedId(node.id)}
                       onKeyDown={(event) => onKeySelect(event, nodes, index)}
                     />
@@ -168,6 +265,8 @@ export function ArchitectureExplorer({ graph }: Props) {
           selected={selected}
           setSelectedId={setSelectedId}
           isOnPath={isOnPath}
+          highlightedIds={highlightedIds}
+          dimmedIds={dimmedIds}
           onKeySelect={onKeySelect}
         />
       </div>
@@ -184,16 +283,27 @@ export function ArchitectureExplorer({ graph }: Props) {
   );
 }
 
+function ScenarioCallout({ scenario }: { scenario: GraphScenario }) {
+  return (
+    <aside className="mt-4 rounded-xl border border-slate-200 bg-slate-50 px-4 py-3 text-sm leading-6 text-slate-700" aria-live="polite">
+      <p className="text-[10px] font-bold uppercase tracking-[0.18em] text-slate-400">Scenario callout</p>
+      <p className="mt-1">{scenario.callout}</p>
+    </aside>
+  );
+}
+
 function NodeButton({
   node,
   selected,
   dimmed,
+  highlighted,
   onSelect,
   onKeyDown,
 }: {
   node: GraphNode;
   selected: boolean;
   dimmed: boolean;
+  highlighted: boolean;
   onSelect: () => void;
   onKeyDown: (event: React.KeyboardEvent) => void;
 }) {
@@ -201,6 +311,8 @@ function NodeButton({
     node.ownership === "authoritative" ? "Authoritative" : "Derived",
     node.optional ? "Optional" : null,
     node.alternativeGroup && !node.defaultSelected ? "Alternative" : null,
+    highlighted ? "Highlighted" : null,
+    dimmed && !highlighted ? "De-emphasized" : null,
   ].filter(Boolean) as string[];
 
   return (
@@ -212,7 +324,7 @@ function NodeButton({
       aria-label={`${node.title}. ${badges.join(". ")}. ${node.summary}`}
       className={`min-w-[10.5rem] flex-1 rounded-xl border px-3 py-2 text-left transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cobalt focus-visible:ring-offset-2 ${
         selected ? "border-cobalt bg-blue-50 ring-2 ring-cobalt" : "border-slate-200 bg-slate-50 hover:border-slate-400"
-      } ${dimmed ? "opacity-50" : ""}`}
+      } ${highlighted && !selected ? "border-ink ring-1 ring-ink" : ""} ${dimmed && !highlighted ? "opacity-50" : ""}`}
     >
       <span className="block text-sm font-semibold text-ink">{node.title}</span>
       <span className="mt-1 block text-[11px] text-slate-500">{node.product}</span>
@@ -286,6 +398,8 @@ function MobileExplorer({
   selected,
   setSelectedId,
   isOnPath,
+  highlightedIds,
+  dimmedIds,
   onKeySelect,
 }: {
   layers: ArchitectureGraph["layers"];
@@ -293,6 +407,8 @@ function MobileExplorer({
   selected?: GraphNode;
   setSelectedId: (id: string) => void;
   isOnPath: (node: GraphNode) => boolean;
+  highlightedIds: Set<string>;
+  dimmedIds: Set<string>;
   onKeySelect: (event: React.KeyboardEvent, nodes: GraphNode[], index: number) => void;
 }) {
   const [step, setStep] = useState(0);
@@ -332,7 +448,8 @@ function MobileExplorer({
                   key={node.id}
                   node={node}
                   selected={selected?.id === node.id}
-                  dimmed={!isOnPath(node)}
+                  dimmed={!isOnPath(node) || dimmedIds.has(node.id)}
+                  highlighted={highlightedIds.has(node.id)}
                   onSelect={() => setSelectedId(node.id)}
                   onKeyDown={(event) => onKeySelect(event, list, index)}
                 />

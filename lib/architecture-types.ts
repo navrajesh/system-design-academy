@@ -8,6 +8,20 @@ export const LIBRARY_DEEP_DIVE_SECTIONS = [
   "LibraryMentalModel",
 ] as const;
 
+export const LIBRARY_GUIDE_SECTIONS = [
+  "NonNegotiable",
+  "Options",
+  "InvalidatingFailure",
+  "OperationalBurden",
+  "LessonLinks",
+] as const;
+
+/** Wave 2 TokenX graph path under content/architecture/. Do not invent a stub. */
+export const SETTLEMENT_GRAPH_RELATIVE_PATH = "graphs/tokenx-settlement.json";
+
+/** Required scenario id when the settlement graph file exists. */
+export const SETTLEMENT_INDEXER_FAILURE_SCENARIO_ID = "settlement-succeeds-indexer-fails";
+
 export type PathKind = "read" | "write";
 export type EdgeKind = "sync" | "async";
 export type Ownership = "authoritative" | "derived";
@@ -44,6 +58,15 @@ export type GraphEdge = {
 
 export type GraphLayer = { id: string; title: string; order: number };
 
+export type GraphScenario = {
+  id: string;
+  title: string;
+  summary: string;
+  highlightedNodeIds: string[];
+  dimmedNodeIds?: string[];
+  callout: string;
+};
+
 export type ArchitectureGraph = {
   version: number;
   id: string;
@@ -53,6 +76,7 @@ export type ArchitectureGraph = {
   layers: GraphLayer[];
   nodes: GraphNode[];
   edges: GraphEdge[];
+  scenarios?: GraphScenario[];
 };
 
 export type LandscapeStatus = "available" | "later";
@@ -72,6 +96,8 @@ export type ArchitectureCatalog = {
   }[];
   deepDives: { id: string; title: string; href: string; landscape: string }[];
   explorerHref: string;
+  settlementExplorerHref?: string;
+  guides?: { id: string; title: string; href: string }[];
   failureHref: string;
   failures?: { id: string; href: string }[];
   requiredRelatedSlugs: string[];

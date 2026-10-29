@@ -9,7 +9,8 @@
     "design-a-chat-system",
     "idempotency-and-deduplication",
     "ordering-and-event-keys",
-    "transactions-across-boundaries"
+    "transactions-across-boundaries",
+    "graceful-degradation"
   ],
   "columns": [
     { "id": "workload", "label": "Workload" },
@@ -27,11 +28,11 @@
       "cells": {
         "workload": "Custodial transfers: debit/credit, spendable balance, cursor history. Illustrative envelope ~231 transfers/s average, ~4,630/s at 20× peak, ~46k peak authoritative reads/s. Notifications are a different path.",
         "consistency": "One serializable ledger transaction, or exclusive cross-shard terminals (RESERVED→FINALIZED|RELEASED and ABSENT→CREDITED|CANCELLED). 2-of-3 (or equivalent) commit for the ledger group. Linearizable/read-your-writes on a {shard, epoch, position} token. Never LWW balances.",
-        "latency": "Target p99 transfer ack hundreds of ms in-region including WAL/quorum. Cross-shard adds coordinator UNRESOLVED waits. Cache hits are illegal for spendable reads.",
+        "latency": "Target p99 transfer ack hundreds of ms in-region including WAL/quorum. Cross-shard adds coordinator UNRESOLVED waits. Cache hits are illegal for spendable reads. Hedged writes are dangerous without idempotency keys.",
         "scaling": "Partition by wallet_bucket when lock wait is measured. One celebrity wallet is a row lock, not an extra Kafka partition. Do not dual-write two regions.",
-        "failure": "Fail closed when authority, uniqueness, or a claimed fraud cap cannot be proven. Timeout is UNKNOWN: retry the same tenant-scoped key. Fence old epochs. Restore replays committed journals only — not signed request logs.",
+        "failure": "Fail closed when authority, uniqueness, or a claimed fraud cap cannot be proven. Timeout is UNKNOWN: retry the same tenant-scoped key. Do not infer rollback. Fence old epochs. Restore replays committed journals only — not signed request logs.",
         "costOps": "You staff fenced failover, unique-key retention, outbox relay, and reconciliation of UNRESOLVED terminals. Analytics warehouses are extra derived cost.",
-        "whenNot": "When the product is billed ingest, chat append, or a redirect map. Do not put spendable money on a CRDT, a socket, or a CDN."
+        "whenNot": "When the product is billed ingest, chat append, or a redirect map. Do not put spendable money on a CRDT, a socket, or a CDN. Redis is not the ledger; ads-style windowed counts are not settlement."
       }
     },
     {
@@ -42,7 +43,7 @@
         "consistency": "Authoritative fact is the append plus UNIQUE(click_id) inside a horizon ≥ replay. Partition order is not event time. Aggregates are versioned upserts. Dashboards may be labeled stale.",
         "latency": "Ingest ack is produce+uniqueness, not window close. Dashboard p99 can be seconds behind a watermark. Hedged dashboard reads are allowed; hedged unkeyed POSTs are not.",
         "scaling": "Shard uniqueness by click_id when campaign_id is hot. Collectors scale independently of window jobs. Consumer parallelism caps at partition count.",
-        "failure": "Fail open admission onto a bounded local cap if limiter Redis dies; keep click_id on the log. 429 is proven reject; produce timeout is UNKNOWN with the same click_id. DLQ has an owner. Do not park UNKNOWN into TokenX.",
+        "failure": "Fail open admission onto a bounded local cap if limiter Redis dies; keep click_id on the log. Shed, sample, or delay derived windows. 429 is proven reject; produce timeout is UNKNOWN with the same click_id. DLQ has an owner. Do not park UNKNOWN into TokenX.",
         "costOps": "Retention, uniqueness horizon, watermark lag, and hot-key ops. Replay rebuilds windows from the log. Sharing TokenX's ledger pool is an integrity incident.",
         "whenNot": "Spendable balances, chat message order, or any path where a duplicate is minted money. A dashboard total is not an invoice."
       }
@@ -67,6 +68,7 @@
     "Ad Click Kafka-class log uses the same producer durability names; uniqueness horizon covers the replay window you promise.",
     "Chat seq lives with the message row; sockets never assign seq.",
     "Fail-closed money versus fail-open ads is product policy on admission and uniqueness stores, not a library default.",
+    "Ads can lose a window under named overload; money cannot.",
     "Single-region unless a cell names multi-region. Multi-region TokenX is one write region plus fencing, not LWW."
   ]
 }

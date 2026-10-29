@@ -1,0 +1,74 @@
+---
+kind: guide
+id: choosing-a-primary-store
+title: "Choosing a primary store"
+description: "Pick PostgreSQL-class, Dynamo-style KV, or Cassandra-class wide column from access pattern and named invariants, not from popularity."
+landscape: storage
+relatedSlugs:
+  - relational-vs-nosql-selection
+  - data-modeling-from-access-patterns
+  - transactions-across-boundaries
+---
+
+<NonNegotiable title="Access pattern and invariants pick the engine">
+
+The primary store is the **authoritative** hop for that fact. Caches, replicas, search, and logs are derived until you name a different owner.
+
+Name the five assumptions before the product:
+
+- **Consistency:** PostgreSQL-class default is `READ COMMITTED` on one writable primary, not cluster-wide linearizability. Dynamo-style default reads are eventual; `ConsistentRead` is a same-region latest-committed **item**, not Cassandra `QUORUM` and not Raft. Cassandra-class `QUORUM` is overlap arithmetic, not a single history.
+- **Durability:** a commit is durable on the servers you waited for (WAL flush, item ack, commitlog plus the named replica set). Async replicas, hints, and GSIs can lag that ack.
+- **Ordering:** one primary serializes conflicting row locks; a KV store serializes per item or transact set; a wide-column store serializes per partition replica-set, then repairs.
+- **Availability:** a PostgreSQL-class primary crash stops sync writes until a **fenced** promote. Dynamo-style stays up under node loss and throttles hot keys. Cassandra-class `W=ONE` stays writable and can lose a minority copy; `W=ALL` waits for every replica and goes unavailable on one loss.
+- **Failure:** promotion without fencing can create two writers. Hot partitions throttle while the table looks idle. Repair, hinted handoff, and last-write-wins can fork spendable balances.
+
+TokenX spendable balances need unique occupancy of `(tenant, transfer_id)` and conservation inside one lock domain, or exclusive cross-shard terminals. That is a constraint, not a popularity vote.
+
+</NonNegotiable>
+
+<Options title="Three primary classes">
+
+Defend one of these, then stop. Do not add a fourth engine to dodge the constraint.
+
+1. **PostgreSQL-class (row store, one writable primary).** Joins, unique constraints, and multi-row transactions **in one database**. TokenX same-region debit/credit plus outbox in one transaction belongs here until measured lock wait forces a shard protocol. Write scale is vertical, then explicit sharding you operate. Replica lag is expected; read-your-writes goes to the primary or waits for a position token.
+2. **Dynamo-style KV (partition key plus optional sort key).** Access patterns are designed first. Conditional writes occupy an item. Transactions are bounded item sets, not SQL. Default reads may miss a write that already returned 200. Global tables that last-write-wins are a poor ledger.
+3. **Cassandra-class wide column.** High ingest, query tables up front, tunable per-request consistency, multi-master writes. Node loss is normal. You operate compaction, repair, and tombstones. Spendable money is a poor default: `QUORUM` still allows concurrent versions and later repair.
+
+Property cells, not slogans, live on the [PostgreSQL vs DynamoDB vs Cassandra comparison](/reference/landscapes/storage). Model the queries before you name the engine: <LessonCrossLink slug="data-modeling-from-access-patterns" />. Selection criteria: <LessonCrossLink slug="relational-vs-nosql-selection" />. Cross-store work still needs an outbox in the **same** commit as the business row: <LessonCrossLink slug="transactions-across-boundaries" />.
+
+<MermaidDiagram
+  title="Primary-store choice from access pattern, not popularity"
+  chart={"flowchart TD\n  AP[Access pattern?] --> JOIN[Multi-row SQL invariants]\n  AP --> KEY[Partition-key item]\n  AP --> WIDE[Wide-row high ingest]\n  JOIN --> PG[PostgreSQL-class]\n  KEY --> DY[Dynamo-style KV]\n  WIDE --> CS[Cassandra-class]\n  PG --> LED[(TokenX ledger fits)]\n  CS -.-> NO[Not the default ledger]"}
+/>
+
+</Options>
+
+<InvalidatingFailure title="Wide-column as the TokenX ledger, or rank by popularity">
+
+The popular interview move is to put money on a quorum wide-column cluster because it “scales writes” and “survives node loss.” That fails TokenX.
+
+A Cassandra-class `QUORUM` write can still race another `QUORUM` write. Repair and last-write-wins then pick a timestamp, not `CREDITED` versus `CANCELLED`. There is no foreign key that keeps debit, credit, uniqueness, and outbox in one atomic outcome. A celebrity wallet becomes one hot vnode: the cluster is up, that balance is not. Hinted handoff after a partition can apply a debit the coordinator already treated as rejected.
+
+Ranking engines by GitHub stars or “what FAANG uses” is the same failure with a different costume. Popularity does not name consistency, durability, ordering, availability, or the failure you will actually run.
+
+If the invariant is conservation, stay on PostgreSQL-class (or a named consensus/SQL ledger) until a measured bottleneck forces exclusive terminals. If the invariant is a partition-key item with conditional occupancy, Dynamo-style is defensible. Wide-column stays for high-ingest query tables you designed up front—not for spendable balances by default.
+
+</InvalidatingFailure>
+
+<OperationalBurden title="What the interview answer must staff">
+
+- **PostgreSQL-class:** connection pooling, vacuum, WAL, backups, and fenced failover. Async replica promotion can drop acknowledged commits. You still own major upgrades.
+- **Dynamo-style:** partition-key design, hot-key alarms, WCU/RCU or on-demand surprise, GSI lag, and TTL. Ops move off vacuum onto capacity and data modeling. You do not get SQL joins as a consolation prize.
+- **Cassandra-class:** compaction, repair, JVM/disk, tombstone grace, and multi-DC repair fan-out. Managed offerings remove some toil; they do not remove the data model or the repair clock.
+
+Failover of any primary is a named protocol with fencing and UNKNOWN client retries. It is not a silent cutover.
+
+</OperationalBurden>
+
+<LessonLinks title="Hardened lessons">
+
+- <LessonCrossLink slug="relational-vs-nosql-selection" /> — invariants and access paths before the product name.
+- <LessonCrossLink slug="data-modeling-from-access-patterns" /> — keys, query tables, and what you cannot add later.
+- <LessonCrossLink slug="transactions-across-boundaries" /> — one-database transactions versus outbox plus exclusive terminals.
+
+</LessonLinks>

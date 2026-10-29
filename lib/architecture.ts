@@ -13,6 +13,7 @@ import type {
   TechnologyMatrixData,
   TechnologySummary,
 } from "@/lib/architecture-types";
+import { SETTLEMENT_GRAPH_RELATIVE_PATH } from "@/lib/architecture-types";
 
 export type {
   ArchitectureCatalog,
@@ -23,6 +24,7 @@ export type {
   GraphEdge,
   GraphLayer,
   GraphNode,
+  GraphScenario,
   LibraryPage,
   LibraryPageKind,
   MatrixColumnId,
@@ -30,14 +32,22 @@ export type {
   TechnologyMatrixData,
   TechnologySummary,
 } from "@/lib/architecture-types";
-export { LIBRARY_DEEP_DIVE_SECTIONS, MATRIX_COLUMN_IDS } from "@/lib/architecture-types";
+export {
+  LIBRARY_DEEP_DIVE_SECTIONS,
+  LIBRARY_GUIDE_SECTIONS,
+  MATRIX_COLUMN_IDS,
+  SETTLEMENT_GRAPH_RELATIVE_PATH,
+  SETTLEMENT_INDEXER_FAILURE_SCENARIO_ID,
+} from "@/lib/architecture-types";
 
 const ARCH_DIR = path.join(process.cwd(), "content", "architecture");
 const TECHNOLOGIES_DIR = path.join(ARCH_DIR, "technologies");
 const LANDSCAPES_DIR = path.join(ARCH_DIR, "landscapes");
+const GUIDES_DIR = path.join(ARCH_DIR, "guides");
 const MATRICES_DIR = path.join(ARCH_DIR, "matrices");
 const FAILURES_DIR = path.join(ARCH_DIR, "failures");
 const SUMMARIES_FILE = path.join(ARCH_DIR, "summaries.json");
+const SETTLEMENT_GRAPH_FILE = path.join(ARCH_DIR, SETTLEMENT_GRAPH_RELATIVE_PATH);
 
 function readJson<T>(filePath: string): T {
   return JSON.parse(fs.readFileSync(filePath, "utf8")) as T;
@@ -45,6 +55,17 @@ function readJson<T>(filePath: string): T {
 
 export const getArchitectureGraph = cache((): ArchitectureGraph => {
   return readJson<ArchitectureGraph>(path.join(ARCH_DIR, "graph.json"));
+});
+
+export function hasSettlementGraph(): boolean {
+  return fs.existsSync(SETTLEMENT_GRAPH_FILE);
+}
+
+export const getSettlementGraph = cache((): ArchitectureGraph => {
+  if (!fs.existsSync(SETTLEMENT_GRAPH_FILE)) {
+    throw new Error(`Missing content/architecture/${SETTLEMENT_GRAPH_RELATIVE_PATH} (Wave 2 TokenX graph)`);
+  }
+  return readJson<ArchitectureGraph>(SETTLEMENT_GRAPH_FILE);
 });
 
 export const getArchitectureCatalog = cache((): ArchitectureCatalog => {
@@ -86,6 +107,14 @@ export const getLandscapes = cache((): LibraryPage[] => {
 });
 
 export const getLandscape = cache((slug: string) => getLandscapes().find((page) => page.slug === slug));
+
+export const getGuides = cache((): LibraryPage[] => {
+  return listMdx(GUIDES_DIR)
+    .map((file) => parseLibraryPage(GUIDES_DIR, file))
+    .sort((a, b) => a.title.localeCompare(b.title));
+});
+
+export const getGuide = cache((slug: string) => getGuides().find((page) => page.slug === slug));
 
 export const getMatrices = cache((): TechnologyMatrixData[] => {
   if (!fs.existsSync(MATRICES_DIR)) return [];

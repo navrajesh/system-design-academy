@@ -21,6 +21,10 @@ Authoritative vs derived:
 
 Leases expire. Distributed locks are not mutexes across partitions unless the lock service is the consensus boundary and every writer checks the epoch. Cross-boundary transactions need exclusive terminals and idempotency; 2PC without a recovery story is a slogan.
 
+### What fails independently
+
+A lock or lease can expire while a stale replica still **serves**. The lock service is not the row unless it is the named consensus/fencing boundary and every writer checks the epoch. A replica without ReadIndex or a bounded-clock lease can answer after the fence has moved. Walk the [database failover](/reference/failures/database-failover) steps. Mechanism: <LessonCrossLink slug="distributed-locks-and-leases" />, <LessonCrossLink slug="consensus-and-leader-election" />.
+
 Start with the [layered explorer](/reference/architecture), the [quorum vs consensus vs CRDT](/reference/landscapes/consistency) matrix, and [database failover](/reference/failures/database-failover) plus [multi-region failure](/reference/failures/multi-region-failure).
 
 Mechanism lessons: <LessonCrossLink slug="cap-and-consistency-models" />, <LessonCrossLink slug="consensus-and-leader-election" />, <LessonCrossLink slug="distributed-locks-and-leases" />, <LessonCrossLink slug="distributed-transactions" />, <LessonCrossLink slug="idempotency-and-deduplication" />.

@@ -1,0 +1,72 @@
+---
+kind: guide
+id: choosing-a-durable-log
+title: "Choosing a durable log"
+description: "Pick a Kafka-class partitioned log, a managed shard log, or a database outbox-only path, and keep TokenX money on the ledger."
+landscape: kafka-fault-tolerance
+relatedSlugs:
+  - kafka-delivery-and-failure
+  - transactions-across-boundaries
+  - retries-dead-letters-and-replay
+---
+
+<NonNegotiable title="Produce durability is not sink commit">
+
+A durable log stores **records until retention**. It does not store TokenX balances. Produce acknowledgement is “this offset is on the replica set you waited for.” Sink commit is a second boundary. Consumer offsets are **group progress**, not proof the sink applied, and not a settlement record.
+
+State the assumptions:
+
+- **Consistency:** append order is per partition (or per shard), not event time, not causal order, not a linearizable money history. At-least-once delivery to external sinks unless you name a produce-plus-offset transaction **and** an idempotent sink.
+- **Durability:** Kafka-class planning envelope is RF=3, `acks=all` (every replica currently in the ISR), `min.insync.replicas=2`, producer idempotence, ISR-only election. That survives one in-sync broker loss. It does not survive correlated ISR disk loss, `acks=1`, unclean election, or history older than retention. Managed shard logs last for the retention you pay for. An outbox row lasts as long as the primary’s WAL/backup story.
+- **Ordering:** one partition key, one producer waiting for acks, gives broker append order for that key. Independent keys interleave. Windows and watermarks are **job policy** on the consumer.
+- **Availability:** `minISR=2` **rejects** writes when the ISR shrinks too far. Managed shards throttle. An outbox poller crash delays fan-out; the ledger row remains. You cannot promote a lagging consumer as leader of money.
+- **Failure:** dual-write (commit money, then produce) can lose either side. Offset-before-apply loses work. Apply-before-offset repeats work. A dead-letter topic is another log with an owner, not a trash can.
+
+Money stays on the ledger. Kafka, shard logs, and outbox copies are derived integration **after** that commit, except where the product’s authoritative fact **is** the billed append (Ad Click `click_id`).
+
+</NonNegotiable>
+
+<Options title="Three log (or no-log) classes">
+
+Defend one. Pulsar-class segmented logs sit on the same landscape matrix as a sibling of Kafka-class; they are not a fourth interview default here.
+
+1. **Partitioned log (Kafka-class).** Durable append-only facts, independent consumer groups, replay inside retention, partition-key order. Use after a TokenX outbox, or as the Ad Click billed-fact log once `click_id` is unique. Offsets are not ledger proof. Hot keys pin one partition. Adding partitions is a key-mapping change.
+2. **Managed shard log (Kinesis-class).** AWS-centric ingest, partition keys, you do not SSH the broker. Per-shard sequence order. Replay dies when paid retention dies (24 h unless extended). Iterator position is progress, not a SQL commit. Throughput is planned per shard, not “infinite because it is managed.”
+3. **Database outbox-only.** The primary already commits the business row **and** the outbox row in one transaction. A few workers poll or CDC-apply at-least-once to idempotent sinks. No independent multi-reader log, no days-long replay across many groups. Dual-write without an outbox is not this option.
+
+Cells: [Kafka vs Pulsar-class vs Kinesis-class vs outbox](/reference/landscapes/kafka-fault-tolerance). Produce, ISR, and unclean election: <LessonCrossLink slug="kafka-delivery-and-failure" />. Outbox in the same commit: <LessonCrossLink slug="transactions-across-boundaries" />. DLQ ownership and replay: <LessonCrossLink slug="retries-dead-letters-and-replay" />.
+
+<MermaidDiagram
+  title="Ledger commit first; log or outbox fan-out second; offset is not settlement"
+  chart={"flowchart TD\n  Q[Who owns money?] --> LED[(Ledger commit)]\n  LED --> FAN[Need fan-out?]\n  FAN -->|few workers| OB[DB outbox-only]\n  FAN -->|many groups replay| LOG[Partitioned log]\n  FAN -->|managed shards| KIN[Managed shard log]\n  LOG --> ACK[Produce ack not sink commit]\n  KIN --> ACK\n  OB --> ACK\n  ACK -.-> OFF[Offset is not settlement]"}
+/>
+
+</Options>
+
+<InvalidatingFailure title="Offset or request log as the settlement record">
+
+The popular option is “the consumer committed offset 1000, so those transfers settled” or “we have the signed request log, replay it into the ledger after restore.” Both fail.
+
+An offset is where a group will poll next. A crash after sink commit and before offset commit **replays**. A crash after offset commit and before sink commit **skips**. Neither event is `CREDITED` or `CANCELLED`. Replaying a request log after restore can mint a second debit: the request was never a journal. TokenX restore replays **committed journals**, then fences old epochs. UNKNOWN client timeouts retry the same tenant-scoped key against uniqueness, not against a topic end offset.
+
+Ad Click may rebuild windows from the billed-fact log by `click_id`. That still does not make a dashboard total an invoice, and it does not make a TokenX request log a ledger.
+
+</InvalidatingFailure>
+
+<OperationalBurden title="What the interview answer must staff">
+
+- **Kafka-class:** brokers, disks, ISR, controller/KRaft, retention, consumer groups, DLQ owner and age SLO. Replication bytes are roughly produce times RF. You name `acks`, `minISR`, and election policy in the interview, not “Kafka is durable.”
+- **Managed shards:** shard-hour or on-demand cost, PUT and extended retention, iterator expiry, no on-disk hexdump when you need to prove a record. Regional impairment is the vendor’s story plus your UNKNOWN retries.
+- **Outbox-only:** publisher or CDC slot, lag into the primary, idempotent sinks, and backpressure so the slot does not halt WAL. Cheaper than a cluster until you need many independent replayable consumers.
+
+TokenX ACK still waits on the ledger transaction, not on the poller or the produce.
+
+</OperationalBurden>
+
+<LessonLinks title="Hardened lessons">
+
+- <LessonCrossLink slug="kafka-delivery-and-failure" /> — ISR, acks, offsets, and why the broker is not the business effect.
+- <LessonCrossLink slug="transactions-across-boundaries" /> — outbox in the same transaction; dual-write loss.
+- <LessonCrossLink slug="retries-dead-letters-and-replay" /> — at-least-once replay, owned DLQs, and no auto-replay of UNKNOWN money.
+
+</LessonLinks>

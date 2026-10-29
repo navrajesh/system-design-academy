@@ -21,6 +21,10 @@ Authoritative vs derived:
 
 Synchronous edges: client → DNS → balancer → gateway → app → primary (or cache on a read hit). Asynchronous edges: replica apply, outbox, Kafka, autoscaler decisions. Autoscaling does not fence a writer and does not repair split-brain.
 
+### What fails independently
+
+Balancer membership or a draining pod can fail while the authoritative store still **accepts or rejects correctly**. A VIP that dropped a node, a Kubernetes replica in Terminating, or an autoscaler that has not yet added capacity is a derived hop: it can 502, shed, or retry-amplify without promoting a lagging replica as the writer. Walk the [overload](/reference/failures/overload) steps. Mechanism: <LessonCrossLink slug="load-balancing-deep-dive" />, <LessonCrossLink slug="autoscaling-and-capacity-planning" />.
+
 Start with the [layered explorer](/reference/architecture), the [LB vs gateway vs Kubernetes](/reference/landscapes/scalability) matrix on this page, and the [overload walkthrough](/reference/failures/overload).
 
 Mechanism lessons: <LessonCrossLink slug="load-balancing-deep-dive" />, <LessonCrossLink slug="scaling-read-heavy-services" />, <LessonCrossLink slug="write-scaling" />, <LessonCrossLink slug="autoscaling-and-capacity-planning" />, <LessonCrossLink slug="fan-out-architectures" />.

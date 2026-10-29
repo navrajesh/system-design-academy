@@ -13,6 +13,18 @@ export const LIBRARY_DEEP_DIVE_SECTIONS = [
   "LibraryMentalModel",
 ];
 
+export const LIBRARY_GUIDE_SECTIONS = [
+  "NonNegotiable",
+  "Options",
+  "InvalidatingFailure",
+  "OperationalBurden",
+  "LessonLinks",
+];
+
+/** Must match SETTLEMENT_INDEXER_FAILURE_SCENARIO_ID in lib/architecture-types.ts */
+export const SETTLEMENT_INDEXER_FAILURE_SCENARIO_ID = "settlement-succeeds-indexer-fails";
+export const SETTLEMENT_GRAPH_RELATIVE_PATH = "graphs/tokenx-settlement.json";
+
 export const MATRIX_COLUMN_IDS = [
   "workload",
   "consistency",
@@ -82,7 +94,7 @@ export const LANDSCAPE_REQUIRED_SLUGS = {
   ],
 };
 
-const REQUIRED_LIBRARY_FILES = [
+export const REQUIRED_LIBRARY_FILES = [
   "graph.json",
   "catalog.json",
   "summaries.json",
@@ -101,9 +113,7 @@ const REQUIRED_LIBRARY_FILES = [
   "matrices/lb-gateway-k8s.json",
   "matrices/kafka-streams-flink.json",
   "matrices/http-grpc-mesh.json",
-  "matrices/quorum-consensus-crdt.json",
   "matrices/consensus-quorum-crdt.json",
-  "matrices/tokenx-vs-ads.json",
   "matrices/tokenx-ads-chat.json",
   "failures/database-failover.json",
   "failures/cache-outage.json",
@@ -166,6 +176,87 @@ export function validateArchitectureGraph(graph, knownSlugs = new Set()) {
     if (edge.to && nodeIds.size && !nodeIds.has(edge.to)) errors.push("graph.json: edge '" + edge.id + "' unknown to");
   }
   return errors;
+}
+
+function validateGraphNodesAndEdges(graph, filename, knownSlugs, errors) {
+  const nodeIds = new Set();
+  if (!Array.isArray(graph.nodes) || !graph.nodes.length) errors.push(filename + ": nodes required");
+  for (const node of graph.nodes ?? []) {
+    if (!node?.id) {
+      errors.push(filename + ": node missing id");
+      continue;
+    }
+    if (nodeIds.has(node.id)) errors.push(filename + ": duplicate node '" + node.id + "'");
+    nodeIds.add(node.id);
+    if (!OWNERSHIP.has(node.ownership)) errors.push(filename + ": node '" + node.id + "' ownership must be authoritative or derived");
+    if (!node.detail || ["consistency", "durability", "failure", "recovery"].some((field) => !node.detail[field])) {
+      errors.push(filename + ": node '" + node.id + "' detail must name consistency, durability, failure, and recovery");
+    }
+    for (const slug of node.relatedSlugs ?? []) {
+      if (knownSlugs.size && !knownSlugs.has(slug)) errors.push(filename + ": node '" + node.id + "' unknown lesson slug '" + slug + "'");
+    }
+  }
+  for (const edge of graph.edges ?? []) {
+    if (!EDGE_KIND.has(edge.kind)) errors.push(filename + ": edge '" + (edge.id ?? "?") + "' kind must be sync or async");
+    if (edge.from && nodeIds.size && !nodeIds.has(edge.from)) errors.push(filename + ": edge '" + (edge.id ?? "?") + "' unknown from");
+    if (edge.to && nodeIds.size && !nodeIds.has(edge.to)) errors.push(filename + ": edge '" + (edge.id ?? "?") + "' unknown to");
+  }
+  return nodeIds;
+}
+
+export function validateSettlementGraph(graph, filename = SETTLEMENT_GRAPH_RELATIVE_PATH, knownSlugs = new Set()) {
+  const errors = [];
+  if (!graph || typeof graph !== "object") return [filename + ": must be an object"];
+  if (!graph.id || !graph.title || !graph.description) errors.push(filename + ": missing id, title, or description");
+  if (!Array.isArray(graph.assumptions) || !graph.assumptions.length) errors.push(filename + ": assumptions required");
+  if (!Array.isArray(graph.layers) || !graph.layers.length) errors.push(filename + ": layers required");
+  const nodeIds = validateGraphNodesAndEdges(graph, filename, knownSlugs, errors);
+  if (FORBIDDEN_CLAIM.test(JSON.stringify(graph ?? {}))) {
+    errors.push(filename + ": must not claim instantaneous, lossless, or transparent failover, or linearizable-by-default");
+  }
+  const scenarios = graph.scenarios ?? [];
+  if (!Array.isArray(scenarios) || !scenarios.length) {
+    errors.push(filename + ": scenarios required");
+  } else if (!scenarios.some((scenario) => scenario?.id === SETTLEMENT_INDEXER_FAILURE_SCENARIO_ID)) {
+    errors.push(filename + ": missing required scenario '" + SETTLEMENT_INDEXER_FAILURE_SCENARIO_ID + "'");
+  }
+  const scenarioIds = new Set();
+  for (const scenario of scenarios) {
+    if (!scenario?.id) {
+      errors.push(filename + ": scenario missing id");
+      continue;
+    }
+    if (scenarioIds.has(scenario.id)) errors.push(filename + ": duplicate scenario '" + scenario.id + "'");
+    scenarioIds.add(scenario.id);
+    if (!scenario.title || !scenario.summary || !scenario.callout) {
+      errors.push(filename + ": scenario '" + scenario.id + "' needs title, summary, and callout");
+    }
+    if (!Array.isArray(scenario.highlightedNodeIds) || !scenario.highlightedNodeIds.length) {
+      errors.push(filename + ": scenario '" + scenario.id + "' highlightedNodeIds required");
+    }
+    for (const id of scenario.highlightedNodeIds ?? []) {
+      if (nodeIds.size && !nodeIds.has(id)) errors.push(filename + ": scenario '" + scenario.id + "' unknown highlighted node '" + id + "'");
+    }
+    for (const id of scenario.dimmedNodeIds ?? []) {
+      if (nodeIds.size && !nodeIds.has(id)) errors.push(filename + ": scenario '" + scenario.id + "' unknown dimmed node '" + id + "'");
+    }
+  }
+  return errors;
+}
+
+function assertSectionOrder(content, sections, filename, errors) {
+  let previousIndex = -1;
+  for (const section of sections) {
+    const matches = [...content.matchAll(new RegExp("<" + section + "(?:\\s|>)", "g"))];
+    if (!matches.length) {
+      errors.push(filename + ": missing required library section <" + section + ">");
+      continue;
+    }
+    const index = matches[0].index ?? -1;
+    if (index < previousIndex) errors.push(filename + ": <" + section + "> is out of required library order");
+    previousIndex = Math.max(previousIndex, index);
+    if (matches.length !== 1) errors.push(filename + ": expected exactly one <" + section + ">, found " + matches.length);
+  }
 }
 
 export function validateDeepDiveText(raw, filename = "deep-dive.mdx") {
@@ -269,6 +360,34 @@ export function validateLandscapeText(raw, filename, knownSlugs = new Set()) {
   return { errors, data, content };
 }
 
+export function validateGuideText(raw, filename = "guide.mdx", knownSlugs = new Set()) {
+  const errors = [];
+  let parsed;
+  try {
+    parsed = matter(raw);
+  } catch (error) {
+    return { errors: [filename + ": invalid frontmatter (" + error.message + ")"], data: {}, content: "", charts: [] };
+  }
+  const { data, content } = parsed;
+  for (const field of ["kind", "title", "description"]) {
+    if (data[field] === undefined || data[field] === "") errors.push(filename + ": missing frontmatter field '" + field + "'");
+  }
+  if (data.kind && data.kind !== "guide") errors.push(filename + ": kind must be guide");
+  if (!Array.isArray(data.relatedSlugs)) errors.push(filename + ": relatedSlugs must be an array");
+  if (content.includes("<KnowledgeCheck")) errors.push(filename + ": library pages must not include <KnowledgeCheck>");
+  if (content.includes("<InterviewAnswer")) errors.push(filename + ": library pages must not include <InterviewAnswer>");
+  assertSectionOrder(content, LIBRARY_GUIDE_SECTIONS, filename, errors);
+  if (FORBIDDEN_CLAIM.test(content)) {
+    errors.push(filename + ": must not claim instantaneous, lossless, or transparent failover, or linearizable-by-default");
+  }
+  const slugs = new Set([...(data.relatedSlugs ?? []), ...extractLessonCrossLinkSlugs(content)]);
+  for (const slug of slugs) {
+    if (knownSlugs.size && !knownSlugs.has(String(slug))) errors.push(filename + ": unknown related slug '" + slug + "'");
+  }
+  const charts = [...extractLibraryMermaid(content), ...extractMermaidCharts(content)].filter((chart) => chart !== undefined);
+  return { errors, data, content, charts };
+}
+
 export async function validateArchitectureLibrary({ architectureDirectory, lessonsDirectory }) {
   const errors = [];
   const knownSlugs = lessonSlugSet(lessonsDirectory);
@@ -342,6 +461,37 @@ export async function validateArchitectureLibrary({ architectureDirectory, lesso
       errors.push(
         ...validateFailover(JSON.parse(fs.readFileSync(path.join(failuresDir, file), "utf8")), file, knownSlugs),
       );
+    }
+  }
+
+  const settlementPath = path.join(architectureDirectory, SETTLEMENT_GRAPH_RELATIVE_PATH);
+  if (fs.existsSync(settlementPath)) {
+    try {
+      errors.push(
+        ...validateSettlementGraph(JSON.parse(fs.readFileSync(settlementPath, "utf8")), SETTLEMENT_GRAPH_RELATIVE_PATH, knownSlugs),
+      );
+    } catch (error) {
+      errors.push(SETTLEMENT_GRAPH_RELATIVE_PATH + ": invalid JSON (" + error.message + ")");
+    }
+  }
+
+  const guidesDir = path.join(architectureDirectory, "guides");
+  if (fs.existsSync(guidesDir)) {
+    for (const file of fs.readdirSync(guidesDir).filter((name) => name.endsWith(".mdx")).sort()) {
+      const result = validateGuideText(fs.readFileSync(path.join(guidesDir, file), "utf8"), "guides/" + file, knownSlugs);
+      errors.push(...result.errors);
+      for (const chart of result.charts ?? []) {
+        if (chart === null) {
+          errors.push("guides/" + file + ": Mermaid chart must be a valid JSON string expression");
+          continue;
+        }
+        charts.push(chart);
+        try {
+          await mermaid.parse(chart, { suppressErrors: true });
+        } catch (error) {
+          errors.push("guides/" + file + ": Mermaid diagram failed to parse (" + error.message + ")");
+        }
+      }
     }
   }
 

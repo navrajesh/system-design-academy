@@ -19,12 +19,17 @@ System Design Academy is a standalone, hostable learning product for engineers p
 The main boundaries are:
 
 ```text
-content/lessons/*.mdx
-        |
-        v
-lib/content.ts ----> static lesson routes and local search index
-        |                         |
-        v                         v
+content/lessons/*.mdx              content/architecture/
+        |                                  |
+        v                                  v
+lib/content.ts                     lib/architecture.ts
+        |                                  |
+        v                                  v
+static lesson routes               /reference routes
+and local search index             (hub, explorer, landscapes,
+        |                           matrices, failure walkthroughs)
+        |                                  |
+        v                                  v
 MDX component registry      responsive application shell
         |                         |
         +---- Mermaid and learning interactions
@@ -33,7 +38,7 @@ MDX component registry      responsive application shell
                      browser-local completion progress
 ```
 
-Authoritative curriculum state lives in `content/lessons/`. Search data and rendered pages are derived and rebuildable. Completion state is device-local and is not synchronized.
+Authoritative curriculum state lives in `content/lessons/`. Library content lives in `content/architecture/` and is loaded by `lib/architecture.ts` into `/reference`. Search data and rendered pages are derived and rebuildable. Completion state is device-local and is not synchronized.
 
 ## Seven-module roadmap
 
@@ -56,7 +61,7 @@ Modules 1–7 are complete in topic coverage on `feat/module-7-mock-interviews`.
 - Phase 1A authored all nine lessons in Module 1 and all nine lessons in Module 6.
 - The repository contains **64 of 64 lessons** after completing Module 7 on this branch.
 - All seven modules are complete in topic coverage.
-- The Architecture Reference Library is Phase 2. **Phase 2A (Storage & Data)** is in progress on `feat/phase-2a-technology-landscape` under `/reference`. It does not change the 64-lesson curriculum. The full seven-landscape product is not complete. See [phase-2-architecture-reference.md](./phase-2-architecture-reference.md).
+- The Architecture Reference Library is Phase 2. **Phase 2A (Storage & Data) and Phase 2B (remaining landscapes)** are merged to `main` at `f4267dd`. They do not change the 64-lesson curriculum. See [phase-2-architecture-reference.md](./phase-2-architecture-reference.md).
 
 ## Technical audit status
 
@@ -88,8 +93,8 @@ The Modules 1 and 6 audit found **13 items**. All 13 are addressed and merged to
 
 ## Next milestone
 
-1. Phase 2A (Storage & Data vertical slice) is implemented on `feat/phase-2a-technology-landscape` from `main` `93888e7`. Pause for human approval of this slice. Do not push, merge, or deploy until a later decision. Do not apply or drop `stash@{0}`.
-2. Phase 2B+ (remaining six landscapes, remaining named failures, TokenX overlay) stays out of scope until that approval. See [phase-2-architecture-reference.md](./phase-2-architecture-reference.md).
+1. Phase C is complete on `feat/phase-c-reference-library` at `0c680d5` and is the current Vercel production deployment (`dpl_2bvfmkdXmvWZZD4LCi3ntaicLB5g` on [system-design-academy-lemon.vercel.app](https://system-design-academy-lemon.vercel.app)). GitHub `main` is still `f4267dd`. Merge waits for explicit authorization. Do not apply or drop `stash@{0}`. Do not deploy again just to publish documentation.
+2. See [phase-2-architecture-reference.md](./phase-2-architecture-reference.md) for the Phase C record and the Phase D backlog.
 
 ## Validation commands
 

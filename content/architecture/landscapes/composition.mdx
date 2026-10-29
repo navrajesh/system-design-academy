@@ -7,6 +7,7 @@ landscape: composition
 relatedSlugs:
   - design-tokenx
   - design-an-ad-click-aggregator
+  - design-a-chat-system
   - driving-a-system-design-interview
   - architecture-review-practice
   - graceful-degradation
@@ -26,6 +27,10 @@ Ad Click Aggregator (high-volume, fail-open ingest):
 - Derived: windows, leaderboards, “almost real-time” dashboards.
 - Illegal: stealing TokenX isolation for ads, or ads' lossy windows for money.
 
-Start with the [layered explorer](/reference/architecture), the [TokenX vs ads](/reference/landscapes/composition) matrix, and [multi-region failure](/reference/failures/multi-region-failure). Progress stays in `sda:completed-lessons:v1` and is not written by this library.
+### What fails independently
 
-Mechanism lessons: <LessonCrossLink slug="design-tokenx" />, <LessonCrossLink slug="design-an-ad-click-aggregator" />, <LessonCrossLink slug="driving-a-system-design-interview" />, <LessonCrossLink slug="architecture-review-practice" />, <LessonCrossLink slug="graceful-degradation" />.
+Derived TokenX balances or Ad Click window jobs can fail while the ledger or billed uniqueness store still **accepts or rejects correctly**. Redis caches, dashboards, and Kafka copies are not settlement. The chat sequencer row now lives only on the TokenX vs ads vs chat matrix (`tokenx-ads-chat`) on this page: `(conversation_id, seq)` can reject new appends while committed history still reads. Walk the [multi-region failure](/reference/failures/multi-region-failure) steps. Mechanism: <LessonCrossLink slug="design-tokenx" />, <LessonCrossLink slug="design-an-ad-click-aggregator" />, <LessonCrossLink slug="design-a-chat-system" />, <LessonCrossLink slug="graceful-degradation" />.
+
+Start with the [layered explorer](/reference/architecture), the [TokenX vs ads vs chat](/reference/landscapes/composition) matrix, and [multi-region failure](/reference/failures/multi-region-failure). Progress stays in `sda:completed-lessons:v1` and is not written by this library.
+
+Mechanism lessons: <LessonCrossLink slug="design-tokenx" />, <LessonCrossLink slug="design-an-ad-click-aggregator" />, <LessonCrossLink slug="design-a-chat-system" />, <LessonCrossLink slug="driving-a-system-design-interview" />, <LessonCrossLink slug="architecture-review-practice" />, <LessonCrossLink slug="graceful-degradation" />.

@@ -21,7 +21,12 @@ export function TechnologyMatrix({ matrix }: { matrix: TechnologyMatrixData }) {
         {matrix.title}
       </h3>
       {matrix.description ? <p className="mt-2 text-sm leading-6 text-slate-600">{matrix.description}</p> : null}
-      <div className="mt-4 overflow-x-auto rounded-2xl border border-slate-200 bg-white shadow-sm">
+      <div
+        className="mt-4 overflow-x-auto rounded-2xl border border-slate-200 bg-white shadow-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cobalt focus-visible:ring-offset-2"
+        tabIndex={0}
+        role="region"
+        aria-label={`${matrix.title}, scrolls horizontally`}
+      >
         <table className="min-w-[56rem] w-full border-collapse text-left text-sm">
           <caption className="sr-only">
             {matrix.title}. Compare products across workload, consistency, latency, scaling, failure, cost, and when not to choose.
